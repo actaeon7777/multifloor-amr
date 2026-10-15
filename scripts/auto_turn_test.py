@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """While AUTO is enabled, repeat right 2 s then left 2 s.
 
-Run with: python3 src/auto_turn_test.py
+Run with: python3 scripts/auto_turn_test.py
 Publishes only /cmd_vel_auto (Twist); control_mux owns the final /cmd_vel.
 RB OFF cancels the sequence. RB ON starts a new sequence from the right turn.
 """

@@ -198,7 +198,7 @@ def test_manual_pipeline():
         # Exercise the actual standalone script through mux and CAN preview.
         expect(drive(False), (0.0, 0.0))
         script = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve().parents[3] / 'auto_turn_test.py')],
+            [sys.executable, str(Path(__file__).resolve().parents[4] / 'scripts/auto_turn_test.py')],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
         )
         deadline = time.monotonic() + 10.0

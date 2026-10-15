@@ -74,7 +74,7 @@ def stm32_convert(tmp_path_factory):
     compiler = shutil.which('gcc')
     if compiler is None:
         pytest.skip('Host gcc is required for STM32 conversion checks')
-    source = (Path(__file__).resolve().parents[4] / 'stm32_main_code.c').read_text()
+    source = (Path(__file__).resolve().parents[4] / 'firmware/stm32/main.c').read_text()
 
     def function(name):
         match = re.search(r'static (?:float|void) ' + name + r'\([^;]*?\)\s*\{', source)

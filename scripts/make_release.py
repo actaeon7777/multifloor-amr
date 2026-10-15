@@ -19,7 +19,7 @@ release=out/'amr-source.tar.gz'
 # Git archive includes only versioned source/config. Runtime and data are ignored.
 archive=subprocess.check_output(['git','-C',str(ROOT),'archive','--format=tar','--prefix=amr_ws/','HEAD',
                                  'src','scripts','tests','sim/config','sim/scripts','sim/native','sim/tools','sim/layers','sim/reference',
-                                 'sim/capstone_amr_4_floor.usda','reports/source_snapshot.json','docs','README.md','PORTING_JAZZY.md',
+                                 'sim/capstone_amr_4_floor.usda','reports/source_snapshot.json','docs','README.md',
                                  '.gitignore','env.sh','python.sh','build_scene.sh','run_amr.sh','isaac-sim.sh'])
 with tarfile.open(fileobj=io.BytesIO(archive)) as source, tarfile.open(release,'w:gz') as dest:
     for member in source:

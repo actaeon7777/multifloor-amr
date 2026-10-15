@@ -718,3 +718,24 @@ x86 바이너리는 묶지 않는다. 릴리스 manifest의 `candidate_gate_pass
 - [Jazzy AMCL 소스](https://github.com/ros-navigation/navigation2/blob/jazzy/nav2_amcl/src/amcl_node.cpp)
 
 자동 비교의 품질 기준: scan age 0.3 s, odometry age 0.25 s, 실제 관측한 Nav2 명령 간격 75 ms 초과, 실시간 비율 0.9 미만, 추정 pose 누락, 0.1 s 안에 0.2 m/0.35 rad를 넘는 추정 pose 점프를 확인한다. 로컬 개발용 기준이며 실제 센서 기록으로 정교화해야 한다. 현재 실물 보정은 완료를 주장하지 않고 후속 작업으로 남긴다.
+
+
+## 부록: 시뮬레이션 주행 기록 (2026-10-13)
+
+### 4층 호실 주행 (sim)
+- 호실 좌표: `sim/config/floor4_rooms.json` (401~406, 남쪽 벽 철문, 동쪽 끝부터 401)
+- 실행: `python3 scripts/sim_demo.py --room 401 402 ...` (Isaac 창 + AUTO 유지, RViz는 `--rviz`)
+- 웹 UI 조작: `ROS_DOMAIN_ID=107 ros2 launch amr_web_ui web_ui.launch.py use_sim_time:=true port:=8080`
+- 2026-10-13 결과: 401~406 모두 도착, 실제 위치 오차 0.10~0.22m / 5~7°
+- 403 첫 시도에서 긴 복도 제자리 회전 중 AMCL/TF 불일치로 localization READY가 약 3초 해제되어 목표가 중단됨(재시도에서는 재현되지 않음). 실차에서도 관찰할 항목.
+
+### 전역 경로 평활화 (2026-10-13)
+- 변경: `navigation.yaml` Smac2D smoother `w_smooth 0.3→0.95, w_data 0.2→0.02,
+  max_iterations 1000→4000, refinement_num 4→6`. 플래너·inflation(1.6 m)·travel multiplier는 그대로.
+- 원인: 8방향 격자 계단 + 벽이 꺾이는 세로 복도에서 경로가 정중앙(medial axis)을 그대로 따라 흔들림.
+- 오프라인 경로 비교 `scripts/benchmark_global_planner.py NAME [overrides.yaml]` (domain 142, Isaac 불필요):
+  6개 경로 합계 방향 반전 29→0회, 회전량 약 60% 감소, 길이 약 1% 감소, 최소 벽 거리 0.80→0.75 m
+  (세로 복도 폭 1.6 m 병목 지점). Theta*, Lattice(diff 0.5 m)는 더 나빴음.
+- Isaac 실주행 비교(floor4, run_sim_trial): 세로 복도 진입 회전량 150→76°, 401호 127→94°, 반전 2→0,
+  소요 시간 동일, 최소 벽 거리 0.74→0.68 m(코너 안쪽), 가로 복도 중앙 편차 2.0→4.5 cm.
+- 이 파일은 Jetson 실차와 공용이다. 실차 반영 시 코너 안쪽 여유를 확인할 것.

@@ -1,3 +1,0 @@
-AMR 실행 기준은 docs/README.md로 통합했습니다.
-검증 절차와 결과는 docs/VALIDATION.md를 확인하세요.
-기존 이전 안내는 docs/archive/20261007/root/AMR_실물_이전_실행방법_20261006.txt에 보존했습니다.

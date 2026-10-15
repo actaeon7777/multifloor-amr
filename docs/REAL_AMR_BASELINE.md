@@ -2,8 +2,7 @@
 
 ROS 2 Jazzy용 차동구동 AMR 작업공간입니다. F1TENTH와 같은 역할 구분을 유지합니다.
 
-JetPack 7.2.1 / Ubuntu 24.04 / arm64 포팅 내용과 검증 결과는
-[PORTING_JAZZY.md](PORTING_JAZZY.md)에 기록합니다. 기존 압축본은 `/home/acus03/2204_amr`에 보존합니다.
+JetPack 7.2.1 / Ubuntu 24.04 / arm64로 포팅했습니다. 기존 압축본은 `/home/acus03/2204_amr`에 보존합니다.
 
 ## 현재 구현 범위
 
@@ -70,13 +69,13 @@ USB 등 연결 방식에 따라 이름이 다르면 `ros2 run joy joy_enumerate_
   `M > U`이면 `(v, ω)` 모두에 `U / M`을 곱하고, 그 외에는 그대로 전달합니다.
   기본값에서 직진 최대 출력은 약 0.973 m/s이며, `(v=1.0, ω=0.8)` 요청은 약 `(0.811, 0.649)`로 전달됩니다.
   스틱의 원래 요청은 `/cmd_vel_manual`, 제한 후 값은 `/cmd_vel`과 CAN 미리보기에서 확인합니다.
-- `stm32_main_code.c`는 받은 `(v, ω)`에 역기구학과 모터 장착 방향만 적용합니다.
+- `firmware/stm32/main.c`는 받은 `(v, ω)`에 역기구학과 모터 장착 방향만 적용합니다.
   바퀴별 클리핑과 선속도·각속도·좌우 바퀴의 별도 gain은 제거했습니다. STM32의 통신 타임아웃과 모터 오류 정지는 유지합니다.
 - STM32의 `drive_wheel_diameter_m`·`drive_track_width_m`는 상위 설정과 일치해야 하며,
   `drive_node0_direction`·`drive_node1_direction`은 방향 부호(±1)로 사용합니다.
   바퀴 속도 상한은 이제 상위 `max_wheel_rev_s`에서 변경합니다. 다른 CAN 송신 경로를 사용하면 그 경로에서도 상한을 적용해야 합니다.
 
-상위 변경은 bringup 재시작 후 적용됩니다. 하위 변경은 수정한 `stm32_main_code.c`를 STM32 프로젝트의
+상위 변경은 bringup 재시작 후 적용됩니다. 하위 변경은 수정한 `firmware/stm32/main.c`를 STM32 프로젝트의
 `Core/Src/main.c`에 반영하여 빌드·업로드해야 적용됩니다. `stm32_code.zip`은 기존 원본으로 보존했습니다.
 일반·고속 모드는 구분하지 않고 선속도 요청 상한 1.00 m/s, 각속도 요청 상한 0.80 rad/s를 사용합니다.
 상위에는 가감속 제한을 추가하지 않으며 가감속은 ODrive의 기존 `VEL_RAMP` 설정에서 처리합니다.
@@ -114,7 +113,7 @@ ros2 topic echo /cmd_vel
 
 필요하면 별도 터미널에서 `/joy`와 `/cmd_vel_manual`을 확인합니다.
 `amr` 별칭이 없는 셸은 작업공간에서 `source scripts/env.sh`를 실행합니다.
-`can0.service`는 부팅 시 500 kbit/s 일반 CAN으로 설정합니다.
+`deploy/jetson/can0.service`(`/etc/systemd/system/`에 설치)는 부팅 시 500 kbit/s 일반 CAN으로 설정합니다.
 현재 상태는 `systemctl status can0.service`와 `ip -details link show can0`로 확인합니다.
 
 ## 주행 실험 기록
@@ -187,7 +186,7 @@ cd /home/acus03/amr_ws
 ros2 launch amr_stack bringup.launch.py can_dry_run:=true start_lidar:=false start_can_telemetry:=false
 
 # 터미널 2: 테스트 자율주행 노드
-python3 src/auto_turn_test.py
+python3 scripts/auto_turn_test.py
 
 # 터미널 3: 자율 입력
 ros2 topic echo /cmd_vel_auto
@@ -202,7 +201,7 @@ ros2 topic echo /control_mux/mode --qos-durability transient_local
 ros2 topic echo /cmd_vel_to_can/tx_preview
 ```
 
-`src/auto_turn_test.py`는 AUTO 상태에서 **우회전 2초 → 좌회전 2초**를 계속 반복합니다.
+`scripts/auto_turn_test.py`는 AUTO 상태에서 **우회전 2초 → 좌회전 2초**를 계속 반복합니다.
 선속도는 항상 0, 각속도는 우회전 -0.20 rad/s, 좌회전 +0.20 rad/s입니다.
 20 Hz로 발행하며, AUTO가 아니면 0을 계속 발행합니다. RB OFF는 반복을 중단하고,
 다시 ON 하면 우회전부터 시작합니다. 스크립트를 AUTO 상태에서 시작해도 즉시 시작합니다.
@@ -457,7 +456,7 @@ Xacro 수정 시 확장본도 재생성해야 합니다. 원본의 상대 mesh �
 EKF는 `/odometry/filtered`와 `odom → base_footprint` TF를 발행합니다. 별도 `/odom` 토픽은 없으며 Nav2는 `/odometry/filtered`를 사용합니다. AMCL은 `localization.launch.py`, 경로 계획·제어는 `navigation.launch.py`로 별도 실행합니다. 원본 휠 토픽은 `/wheel/odometry`입니다.
 
 바퀴 중심 간격은 URDF·상위 제한 설정·STM32 소스 모두 **0.499 m**입니다.
-STM32 보드에 적용하려면 수정된 `stm32_main_code.c`를 실제 펌웨어 프로젝트에 반영해
+STM32 보드에 적용하려면 수정된 `firmware/stm32/main.c`를 실제 펌웨어 프로젝트에 반영해
 빌드·업로드해야 합니다. 이 작업공간의 `colcon build`가 STM32 펌웨어를 업로드하지는 않습니다.
 
 
@@ -731,7 +730,7 @@ RViz /navigate_to_pose 또는 /goal_pose
 `/navigate_to_pose`는 표준 `nav2_msgs/action/NavigateToPose`입니다. `/goal_pose`는
 `geometry_msgs/msg/PoseStamped`이며 동일한 관리 경로로 전달됩니다. 목표는 `map` 기준의
 유한한 평면 위치·방향을 사용합니다. 내부 액션과 `/cmd_vel_navigation`은 Nav2 연결용입니다.
-`src/auto_turn_test.py` 등 다른 `/cmd_vel_auto` 발행 프로그램은 navigation과 동시에 실행하지 않습니다.
+`scripts/auto_turn_test.py` 등 다른 `/cmd_vel_auto` 발행 프로그램은 navigation과 동시에 실행하지 않습니다.
 
 | 상황 | 동작 |
 |---|---|

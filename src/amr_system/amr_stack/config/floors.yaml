@@ -12,7 +12,7 @@ default_floor: "4F"
 
 elevators:
   E1:
-    car_interior_m: [1.87, 2.23]     # [문 벽 방향 폭, 깊이]  Elevator_size.jpg
+    car_interior_m: [1.87, 2.23]     # [문 벽 방향 폭, 깊이]  docs/images/Elevator_size.jpg
     door_width_m: 1.10
     door_offset_from_left_m: 0.385   # 홀에서 카를 바라볼 때 카 왼쪽 안벽 ~ 출입구
     threshold_depth_m: 0.66          # 층 벽(홀 문 평면) ~ 카 안쪽 벽

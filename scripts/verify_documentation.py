@@ -17,8 +17,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 ACTIVE = ['docs/README.md','docs/VALIDATION.md','README.md','실행법.md','PORTING_JAZZY.md',
           'src/amr_system/amr_web_ui/README.md','src/amr_system/amr_remote_bridge/README.md',
-          'src/amr_system/amr_vehicle_status/README.md','Control_Server/README.md',
-          'Control_Server/vendor/amr_web_ui/README.md','Control_Server/vendor/amr_remote_bridge/README.md']
+          'src/amr_system/amr_vehicle_status/README.md','Control_Server/README.md']
 LINK = re.compile(r'!?\[[^\]\n]+\]\(([^)\n]+)\)')
 BLOCK = re.compile(r'^```([^\n]*)\n(.*?)^```\s*$',re.M|re.S)
 

@@ -9,7 +9,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'vendor/amr_remote_bridge'))
+sys.path.insert(0, str(ROOT.parent / 'src/amr_system/amr_remote_bridge'))
 from amr_remote_bridge.common import HttpClient, loads, read_token
 
 

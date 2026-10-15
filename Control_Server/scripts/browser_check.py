@@ -10,8 +10,9 @@ from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-for directory in (ROOT, ROOT / 'vendor/amr_remote_bridge', ROOT / 'vendor/amr_web_ui',
-                  ROOT / 'vendor/amr_control'):
+PACKAGES = ROOT.parent / 'src/amr_system'
+for directory in (ROOT, PACKAGES / 'amr_remote_bridge', PACKAGES / 'amr_web_ui',
+                  PACKAGES / 'amr_control'):
     sys.path.insert(0, str(directory))
 os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(ROOT / '.playwright-browsers'))
 

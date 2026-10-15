@@ -1,6 +1,8 @@
 # AMR 중앙 관제 서버
 
 중앙 서버 PC에서 실행한다.
+웹 화면과 중계 코드는 저장소의 `src/amr_system/`(amr_web_ui, amr_remote_bridge, amr_control)을
+그대로 쓰므로 `Control_Server/`만 따로 복사하지 말고 저장소 전체를 받아 둔다.
 
 ```bash
 cd /home/kim/Control_Server

@@ -2,7 +2,8 @@
 set -euo pipefail
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
-export PYTHONPATH="$project_root:$project_root/vendor/amr_remote_bridge:$project_root/vendor/amr_web_ui:$project_root/vendor/amr_control${PYTHONPATH:+:$PYTHONPATH}"
+packages="$project_root/../src/amr_system"
+export PYTHONPATH="$project_root:$packages/amr_remote_bridge:$packages/amr_web_ui:$packages/amr_control${PYTHONPATH:+:$PYTHONPATH}"
 if [[ -f config/server.env ]]; then
   set -a
   source config/server.env

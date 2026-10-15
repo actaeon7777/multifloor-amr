@@ -8,13 +8,15 @@ from amr_remote_bridge.server import find_assets
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# ROS packages are shared with the robot from the monorepo's src/, not copied.
+PACKAGES = ROOT.parent / 'src/amr_system'
 
 
 @dataclass(frozen=True)
 class Settings:
     token_file: Path = Path.home() / '.config/amr_remote_bridge/token'
-    assets_dir: Path = ROOT / 'vendor/amr_web_ui/web'
-    fleet_dir: Path = ROOT / 'vendor/amr_remote_bridge/web'
+    assets_dir: Path = PACKAGES / 'amr_web_ui/web'
+    fleet_dir: Path = PACKAGES / 'amr_remote_bridge/web'
     robot_id: str = 'amr-01'
     stale_after: float = 2
     command_timeout: float = 3

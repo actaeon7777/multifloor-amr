@@ -1,0 +1,22 @@
+[Unit]
+Description=Configure CAN interface can0
+BindsTo=sys-subsystem-net-devices-can0.device
+After=sys-subsystem-net-devices-can0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/sbin/ip link set can0 down
+ExecStart=/usr/sbin/ip link set can0 type can \
+    bitrate 500000 \
+    sample-point 0.857 \
+    loopback off \
+    listen-only off \
+    fd off \
+    restart-ms 100 \
+    berr-reporting on
+ExecStart=/usr/sbin/ip link set can0 up
+ExecStop=-/usr/sbin/ip link set can0 down
+
+[Install]
+WantedBy=multi-user.target

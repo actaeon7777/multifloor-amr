@@ -1,0 +1,13 @@
+.venv/
+.venv.backup-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.playwright-browsers/
+.run/
+config/server.env
+*.token
+token
+diagnostics/*.log
+diagnostics/*.png
+diagnostics/playwright/

@@ -1,0 +1,29 @@
+{
+  "passed": true,
+  "lidar_backend": "physx_scene_query_cpp_v1",
+  "render_loading": "headless",
+  "coverage": "DDS command, PhysX motion, wheel odometry, IMU, rolling scan, command-loss stop",
+  "calibration_status": "rates_aligned; noise_and_delay_uncalibrated",
+  "nav2_closed_loop_verified": false,
+  "sensor_rates_sim_time_hz": {
+    "wheel": 100.08340507275668,
+    "imu": 10.008340507275669,
+    "scan": 10.0
+  },
+  "generated_sensor_counts": {
+    "wheel": 601,
+    "imu": 61,
+    "scan": 60,
+    "truth": 121
+  },
+  "counts": {
+    "wheel": 601,
+    "truth": 121,
+    "imu": 61,
+    "scan": 59
+  },
+  "travel_m": 0.4351219143926581,
+  "min_finite_scan_points": 3240,
+  "final_wheel_speed_m_s": 0.0007993069458752869,
+  "real_time_factor": 0.9779320075032731
+}

@@ -1,0 +1,7 @@
+{
+  "source": "AMR_MASTER v28.step",
+  "source_assembly_brep_valid": false,
+  "usage": "Reference visualization only; not used by URDF",
+  "unchanged_vendor_components_repaired": false,
+  "export_warning": "24 faces skipped due to null triangulation; reference mesh only"
+}

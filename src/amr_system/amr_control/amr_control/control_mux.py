@@ -1,0 +1,139 @@
+"""Select held-LB manual commands or RB-toggled autonomous commands."""
+
+from math import isfinite
+from time import monotonic
+
+import rclpy
+from geometry_msgs.msg import Twist
+from rclpy.clock import Clock, ClockType
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Joy
+from std_msgs.msg import String
+
+from amr_control.control_gate import ControlGate
+from amr_control.time_guard import HealthLease
+
+
+class ControlMux(Node):
+    def __init__(self, **kwargs):
+        super().__init__('control_mux', **kwargs)
+        defaults = {
+            'deadman_button': 6, 'required_axes': [1, 2],
+            'joy_timeout': 0.50, 'command_timeout': 0.50, 'release_debounce': 0.10,
+            'max_linear_speed': 0.20, 'max_angular_speed': 0.40,
+            'wheel_diameter': 0.172, 'track_width': 0.499, 'max_wheel_rev_s': 1.8,
+            'auto_toggle_button': 7, 'auto_timeout': 0.50,
+            'toggle_release_debounce': 0.10, 'mode_stop_duration': 0.10,
+        }
+        parameters = {key: self.declare_parameter(key, value).value
+                      for key, value in defaults.items()}
+        self.gate = ControlGate(**parameters)
+        self.require_time_health = self.declare_parameter('require_time_health', False).value
+        self.time_health = HealthLease()
+        self.create_subscription(String, '/system/time_health', self.on_time_health,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        rate = self.declare_parameter('publish_rate', 20.0).value
+        if not isfinite(rate) or rate <= 0:
+            raise ValueError('publish_rate must be finite and positive')
+        self.publisher = self.create_publisher(Twist, '/cmd_vel', 1)
+        self.status_publisher = self.create_publisher(
+            String, '~/status', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self.last_status = None
+        self.mode_publisher = self.create_publisher(
+            String, '~/mode', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self.last_mode = None
+        self.joy_subscription = self.create_subscription(
+            Joy, '/joy', self.on_joy,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
+        self.command_subscription = self.create_subscription(
+            Twist, '/cmd_vel_manual', self.on_command, 1,
+        )
+        self.auto_subscription = self.create_subscription(
+            Twist, '/cmd_vel_auto', self.on_auto_command, 1,
+        )
+        # Timeouts must still run if ROS simulation time stops or jumps.
+        self.timer = self.create_timer(
+            1.0 / rate, self.publish_command, clock=Clock(clock_type=ClockType.STEADY_TIME),
+        )
+        self.get_logger().info(
+            'MANUAL: release LB once, then hold to drive. RB toggles AUTO; '
+            'AUTO ignores manual commands. AUTO exit stops and requires a new LB release/press. '
+            'Joy loss disables AUTO; command-only delays recover on fresh input.'
+        )
+        self.publish_status()
+
+    def on_joy(self, message):
+        self.gate.receive_joy(message.axes, message.buttons, monotonic())
+        self.publish_command()
+
+    def on_command(self, message):
+        self.gate.receive_command((
+            message.linear.x, message.linear.y, message.linear.z,
+            message.angular.x, message.angular.y, message.angular.z,
+        ), monotonic())
+        # Track manual input immediately; the timer also refreshes output and
+        # checks expiry/debounce even when no callbacks arrive.
+        self.publish_command()
+
+    def on_auto_command(self, message):
+        self.gate.receive_auto_command((
+            message.linear.x, message.linear.y, message.linear.z,
+            message.angular.x, message.angular.y, message.angular.z,
+        ), monotonic())
+        self.publish_command()
+
+    def publish_zero(self):
+        self.publisher.publish(Twist())
+
+    def on_time_health(self, message):
+        self.time_health.receive(message.data)
+        self.publish_command()
+
+    def publish_command(self):
+        linear, angular = self.gate.output(monotonic())
+        if self.require_time_health and self.gate.auto_enabled and not self.time_health.healthy():
+            linear = angular = 0.
+            self.gate.auto_command = self.gate.auto_time = None
+            self.gate.auto_reason = 'time_data_invalid'
+        message = Twist()
+        message.linear.x = linear
+        message.angular.z = angular
+        self.publisher.publish(message)
+        self.publish_status()
+
+    def publish_status(self):
+        mode = self.gate.mode
+        if mode != self.last_mode:
+            self.last_mode = mode
+            self.mode_publisher.publish(String(data=mode))
+            self.get_logger().info(f'Control mode: {mode}')
+        reason = self.gate.reason
+        if reason == self.last_status:
+            return
+        self.last_status = reason
+        self.status_publisher.publish(String(data=reason))
+        if reason in ('joy_timeout', 'command_timeout', 'invalid_joy', 'invalid_command',
+                      'auto_command_timeout', 'auto_invalid_command'):
+            self.get_logger().warning(f'Control output paused: {reason}')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = ControlMux()
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if node is not None:
+            if rclpy.ok():
+                node.publish_zero()
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

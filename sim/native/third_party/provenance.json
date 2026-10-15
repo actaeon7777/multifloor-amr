@@ -1,0 +1,25 @@
+[
+  {
+    "path": "physx/include/omni/physx/IPhysxSceneQuery.h",
+    "url": "https://raw.githubusercontent.com/NVIDIA-Omniverse/PhysX/3ca45ad36e9755f7c8c5bea9f7c57d308d9f0c54/ovphysx/ovruntime/include/omni/physx/IPhysxSceneQuery.h",
+    "sha256": "15e4da387502cc6b393933ee714c64d812e10860bd888ba3ffcf4130cb34293e"
+  },
+  {
+    "path": "physx/include/omni/physx/PhysxConvexMesh.h",
+    "url": "https://raw.githubusercontent.com/NVIDIA-Omniverse/PhysX/3ca45ad36e9755f7c8c5bea9f7c57d308d9f0c54/ovphysx/ovruntime/include/omni/physx/PhysxConvexMesh.h",
+    "sha256": "8d78307e6c11c016e3e5ef93c79e8d8204a1a30cba729fbdd3091a052fd0ba70"
+  },
+  {
+    "path": "physx/LICENSE.md",
+    "url": "https://raw.githubusercontent.com/NVIDIA-Omniverse/PhysX/3ca45ad36e9755f7c8c5bea9f7c57d308d9f0c54/LICENSE.md",
+    "sha256": "eb3e67b17b48c56ef26d8bf6634c0837503fefc28a916f98d4f02272eda50011"
+  },
+  {
+    "path": "pybind11",
+    "url": "https://codeload.github.com/pybind/pybind11/tar.gz/refs/tags/v2.13.6",
+    "version": "2.13.6",
+    "archive_sha256": "e08cb87f4773da97fa7b5f035de8763abc656d87d5773e62f6da0587d1f0ec20",
+    "license": "BSD-3-Clause",
+    "reason": "Isaac omni.physx uses pybind11 internals v5, GCC C++ ABI 1016."
+  }
+]

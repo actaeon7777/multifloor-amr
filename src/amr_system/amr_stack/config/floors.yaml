@@ -1,0 +1,126 @@
+# 층·지도·장면·엘리베이터 지점 설정 (층간 이동). 설계: docs/ELEVATOR_DESIGN.md
+#
+# 지도를 교체할 때는 이 파일만 고친다. 파서: amr_stack/floor_config.py
+# 경로 기준
+#   map, annotations, sim_map : amr_stack 패키지 기준 (소스 src/amr_system/amr_stack, 설치 share/amr_stack 동일)
+#   sim_layer                 : AMR 워크스페이스 기준 (시뮬레이션 전용)
+# 좌표는 각 층 지도의 map 프레임 [x, y] 또는 [x, y, yaw] (m, rad).
+# provisional_copy_of: 다른 층 지도를 복사한 임시본이면 원본 층 이름. 실측 지도로 바꾸면 지운다.
+schema_version: 1
+building: G
+default_floor: "4F"
+
+elevators:
+  E1:
+    car_interior_m: [1.87, 2.23]     # [문 벽 방향 폭, 깊이]  Elevator_size.jpg
+    door_width_m: 1.10
+    door_offset_from_left_m: 0.385   # 홀에서 카를 바라볼 때 카 왼쪽 안벽 ~ 출입구
+    threshold_depth_m: 0.66          # 층 벽(홀 문 평면) ~ 카 안쪽 벽
+    door_open_time_s: [6.0, 10.0]
+
+floors:
+  "3F":
+    level: 3
+    beacon_floor_code: 3
+    provisional_copy_of: "4F"
+    real_enabled: false              # 실측 지도 전까지 실차 층간 이동 금지
+    map: maps/G_3_floor/3_floor_tmp_from_4F.yaml
+    annotations: maps/G_3_floor/3_floor_tmp_from_4F(영역지정).png
+    sim_map: maps/sim_floor3/floor3.yaml
+    sim_layer: sim/layers/3_floor_tmp_from_4F_map.usda
+    spawn: [11.5, 3.31, 0.0]
+    elevators:
+      E1:
+        door_center: [9.975, 3.31]
+        car_inward_yaw: 3.141593     # 홀 → 카 진입 방향
+        hall_wait_pose: [10.575, 3.31, 3.141593]
+        hall_exit_pose: [10.775, 3.31, 0.0]
+    # 호실: 401~406 남쪽 벽, 407~412 북쪽 벽(동→서), 413 세로 복도 서쪽 벽(앞문 북쪽·뒷문 남쪽), 414 세로 복도 북쪽 끝.
+    # goal은 문 앞 복도에서 문을 바라보는 정차 자세. "413-앞문"·"413-뒷문"은 같은 호실의 두 문.
+    rooms:
+      "301": {goal: [41.08, -0.2, -1.5708], door: [41.08, -1.17]}
+      "302": {goal: [33.73, -0.2, -1.5708], door: [33.73, -1.17]}
+      "303": {goal: [26.18, -0.2, -1.5708], door: [26.18, -1.17]}
+      "304": {goal: [18.62, -0.2, -1.5708], door: [18.62, -1.17]}
+      "305": {goal: [11.08, -0.2, -1.5708], door: [11.08, -1.17]}
+      "306": {goal: [7.83, -0.2, -1.5708], door: [7.83, -1.17]}
+      "307": {goal: [36.75, 0.72, 1.5708], door: [36.75, 1.69]}
+      "308": {goal: [32.95, 0.72, 1.5708], door: [32.95, 1.69]}
+      "309": {goal: [29.05, 0.72, 1.5708], door: [29.05, 1.69]}
+      "310": {goal: [25.25, 0.72, 1.5708], door: [25.25, 1.69]}
+      "311": {goal: [21.65, 0.72, 1.5708], door: [21.65, 1.69]}
+      "312": {goal: [17.55, 0.72, 1.5708], door: [17.55, 1.69]}
+      "313-앞문": {goal: [15.0, 19.66, 3.141593], door: [14.03, 19.66]}
+      "313-뒷문": {goal: [15.2, 9.16, 3.141593], door: [14.23, 9.16]}
+      "314": {goal: [15.58, 20.52, 1.5708], door: [15.58, 21.49]}
+
+  "4F":
+    level: 4
+    beacon_floor_code: 4
+    real_enabled: true
+    map: maps/G_4_floor/4_floor_0522.yaml
+    annotations: maps/G_4_floor/4_floor_0522(영역지정).png
+    sim_map: maps/sim_floor4/floor4.yaml
+    sim_layer: sim/layers/4_floor_0522_map.usda
+    spawn: [11.5, 3.31, 0.0]
+    elevators:
+      E1:
+        door_center: [9.975, 3.31]
+        car_inward_yaw: 3.141593
+        hall_wait_pose: [10.575, 3.31, 3.141593]
+        hall_exit_pose: [10.775, 3.31, 0.0]
+    rooms:
+      "401": {goal: [41.08, -0.2, -1.5708], door: [41.08, -1.17]}
+      "402": {goal: [33.73, -0.2, -1.5708], door: [33.73, -1.17]}
+      "403": {goal: [26.18, -0.2, -1.5708], door: [26.18, -1.17]}
+      "404": {goal: [18.62, -0.2, -1.5708], door: [18.62, -1.17]}
+      "405": {goal: [11.08, -0.2, -1.5708], door: [11.08, -1.17]}
+      "406": {goal: [7.83, -0.2, -1.5708], door: [7.83, -1.17]}
+      "407": {goal: [36.75, 0.72, 1.5708], door: [36.75, 1.69]}
+      "408": {goal: [32.95, 0.72, 1.5708], door: [32.95, 1.69]}
+      "409": {goal: [29.05, 0.72, 1.5708], door: [29.05, 1.69]}
+      "410": {goal: [25.25, 0.72, 1.5708], door: [25.25, 1.69]}
+      "411": {goal: [21.65, 0.72, 1.5708], door: [21.65, 1.69]}
+      "412": {goal: [17.55, 0.72, 1.5708], door: [17.55, 1.69]}
+      "413-앞문": {goal: [15.0, 19.66, 3.141593], door: [14.03, 19.66]}
+      "413-뒷문": {goal: [15.2, 9.16, 3.141593], door: [14.23, 9.16]}
+      "414": {goal: [15.58, 20.52, 1.5708], door: [15.58, 21.49]}
+
+  "5F":
+    level: 5
+    beacon_floor_code: 5
+    provisional_copy_of: "4F"
+    real_enabled: false
+    map: maps/G_5_floor/5_floor_tmp_from_4F.yaml
+    annotations: maps/G_5_floor/5_floor_tmp_from_4F(영역지정).png
+    sim_map: maps/sim_floor5/floor5.yaml
+    sim_layer: sim/layers/5_floor_tmp_from_4F_map.usda
+    spawn: [11.5, 3.31, 0.0]
+    elevators:
+      E1:
+        door_center: [9.975, 3.31]
+        car_inward_yaw: 3.141593
+        hall_wait_pose: [10.575, 3.31, 3.141593]
+        hall_exit_pose: [10.775, 3.31, 0.0]
+    rooms:
+      "501": {goal: [41.08, -0.2, -1.5708], door: [41.08, -1.17]}
+      "502": {goal: [33.73, -0.2, -1.5708], door: [33.73, -1.17]}
+      "503": {goal: [26.18, -0.2, -1.5708], door: [26.18, -1.17]}
+      "504": {goal: [18.62, -0.2, -1.5708], door: [18.62, -1.17]}
+      "505": {goal: [11.08, -0.2, -1.5708], door: [11.08, -1.17]}
+      "506": {goal: [7.83, -0.2, -1.5708], door: [7.83, -1.17]}
+      "507": {goal: [36.75, 0.72, 1.5708], door: [36.75, 1.69]}
+      "508": {goal: [32.95, 0.72, 1.5708], door: [32.95, 1.69]}
+      "509": {goal: [29.05, 0.72, 1.5708], door: [29.05, 1.69]}
+      "510": {goal: [25.25, 0.72, 1.5708], door: [25.25, 1.69]}
+      "511": {goal: [21.65, 0.72, 1.5708], door: [21.65, 1.69]}
+      "512": {goal: [17.55, 0.72, 1.5708], door: [17.55, 1.69]}
+      "513-앞문": {goal: [15.0, 19.66, 3.141593], door: [14.03, 19.66]}
+      "513-뒷문": {goal: [15.2, 9.16, 3.141593], door: [14.23, 9.16]}
+      "514": {goal: [15.58, 20.52, 1.5708], door: [15.58, 21.49]}
+
+# 시뮬레이션 전용 임시값 (실측 아님)
+sim:
+  floor_height_m: 3.6
+  car_speed_m_s: 1.0
+  car_accel_m_s2: 0.5

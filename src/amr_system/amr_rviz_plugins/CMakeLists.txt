@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.8)
+project(amr_rviz_plugins)
+find_package(ament_cmake REQUIRED)
+find_package(pluginlib REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rviz_common REQUIRED)
+find_package(rviz_default_plugins REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+add_library(amr_rviz_tf SHARED src/single_threaded_tf.cpp)
+target_compile_features(amr_rviz_tf PUBLIC cxx_std_17)
+target_include_directories(amr_rviz_tf PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(amr_rviz_tf
+  pluginlib rclcpp rviz_common rviz_default_plugins tf2_geometry_msgs tf2_ros)
+pluginlib_export_plugin_description_file(rviz_common plugins.xml)
+install(TARGETS amr_rviz_tf EXPORT export_amr_rviz_tf
+  ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+install(DIRECTORY include/ DESTINATION include)
+ament_export_targets(export_amr_rviz_tf HAS_LIBRARY_TARGET)
+ament_export_dependencies(rviz_common rviz_default_plugins tf2_geometry_msgs tf2_ros)
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(sensor_msgs REQUIRED)
+  ament_add_gtest(test_single_threaded_tf test/test_single_threaded_tf.cpp TIMEOUT 45)
+  target_link_libraries(test_single_threaded_tf amr_rviz_tf)
+  ament_target_dependencies(test_single_threaded_tf sensor_msgs)
+  set_tests_properties(test_single_threaded_tf PROPERTIES
+    ENVIRONMENT "ROS_DOMAIN_ID=194;ROS_LOCALHOST_ONLY=1")
+endif()
+ament_package()

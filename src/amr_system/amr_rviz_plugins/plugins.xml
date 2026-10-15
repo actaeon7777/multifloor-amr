@@ -1,0 +1,7 @@
+<library path="amr_rviz_tf">
+  <class name="amr_rviz_plugins/SingleThreadedTF"
+         type="amr_rviz_plugins::SingleThreadedTF"
+         base_class_type="rviz_common::transformation::FrameTransformer">
+    <description>TF transforms using RViz's single executor to avoid Humble geometry2 #992.</description>
+  </class>
+</library>

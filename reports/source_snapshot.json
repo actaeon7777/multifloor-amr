@@ -1,0 +1,26 @@
+{
+  "source": "src/amr_description",
+  "files_sha256": {
+    "CMakeLists.txt": "f9bb2319755450137ff59d114a67741f5f7232b2068b0f750a294a929e1eef12",
+    "README_ISAAC_SIM.md": "ac9c3577d9b972dc2db9e7436d14089f44af95f488f79ceb30237e1947e4fc60",
+    "meshes/reference/amr_master.stl": "e56f2e6294a2e906d169b4b169696a2cf69543126034a0a363de04159c6f8a9e",
+    "meshes/reference/caster_assembly_reference.stl": "d4629390fdc1520bf3b241c82a2954364ff96b6aa0088f9ee09543a3495687fb",
+    "meshes/visual/caster_mount_fixed.stl": "bd906213e8194530a6dac1f4f4702f38486bd57b5f3201cdd22185f91aa8c92e",
+    "meshes/visual/caster_swivel_frame.stl": "7822f6a2f650d20895bc82dfc993c15886eba0940b60835e5c276f18bbe5bce6",
+    "meshes/visual/caster_wheel.stl": "91d6d9eefba6d0d3c40e8a2341bc72959ed9d547259d378943f18dcf6a36e542",
+    "meshes/visual/chassis.stl": "d1e1b4abd25e1f0ccdb8f14c2e166e7323c78035c8d211c880f07df3da52d0f8",
+    "meshes/visual/lidar_body.stl": "02d2c2e7790cb7e7639d881871c3ddd5c340a40e6e4338bf7fd653dd58bdeb94",
+    "meshes/visual/lidar_mount.stl": "1c5ddbbe961e45dcbf933368ee936461b4ffc9e7b2558e17919e7a6f6c21ce1c",
+    "meshes/visual/mounting_plate.stl": "91b1b8c292c0d686a055fe88b3e078ceb630399a7db0b178ff49853f115c0058",
+    "meshes/visual/nurirobot_wa171_3d_v5.stl": "012a2f1a8bf85e9c0b1c80184b21a4f0526320e3232b13fc5cbdec5f4cc4ff3f",
+    "package.xml": "f570129ff474fc87f1a21a8a90caabdf131ec7b097f2d0fe942f300243127321",
+    "reports/UPDATE_V28.md": "2e765cc4de37ac91a4d191385db9f8df102969456fd6c9b518bf8fe5c2891b7c",
+    "reports/input_sha256.json": "fb5056ddd9b0caff148797703c922f96a4e7a5f14ba5f994bd40f53fb1a3019e",
+    "reports/reference_mesh.json": "c48c235aabbe3290f2ed5ad346ca10d951a1931f7586fa3bee6150b8f3e56b4c",
+    "reports/standalone_assembly_agreement.json": "65ba1731c0ec08d0b21be936eceaff237b97c62941a30b7f05a8d310153e88be",
+    "reports/v28_geometry_comparison.png": "2e1d9a9952b9d676f8d24dca847d2cf282775f9ab37b6b7b6f24ce60d5beb25b",
+    "reports/validation_v28.json": "544ecdac83e0f1584a91ba0ace0aed3734e2983b49e383922c45394ded03d10f",
+    "urdf/capstone_amr.urdf": "5bd9fb512e3eb2b465fa70ce851e269bd9d4c083a45f8309cf6a1846972fbb35",
+    "urdf/capstone_amr.urdf.xacro": "782e69e0002ad290734adf036acc2c2a3a5e4cf96173cfe6637560837c3d062e"
+  }
+}

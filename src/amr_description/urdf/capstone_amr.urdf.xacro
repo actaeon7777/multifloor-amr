@@ -1,0 +1,293 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="capstone_amr">
+
+  <!--
+    Isaac Sim source description.
+    Coordinate convention: +X forward, +Y left, +Z up.
+    base_link is the midpoint of the left/right drive-wheel axle.
+    Mesh files use millimetres; mesh scale converts millimetres to metres.
+    Geometry revision: AMR_MASTER v28.step, LiDAR Mount v3.step,
+    Mounting_Plate v3.step (2026-09-28). Existing measured mass budget retained.
+
+    Direct Isaac Sim import uses the expanded capstone_amr.urdf beside this file.
+    Import as Robot Type=Wheeled, Base Type=Mobile, with self-collision disabled.
+  -->
+
+  <xacro:arg name="mesh_prefix" default="../meshes/visual"/>
+  <xacro:property name="mesh_prefix" value="$(arg mesh_prefix)"/>
+
+  <xacro:property name="wheel_radius" value="0.086"/>
+  <xacro:property name="wheel_width" value="0.0446"/>
+  <xacro:property name="wheel_track" value="0.499"/>
+  <xacro:property name="drive_axle_x" value="0.0"/>
+  <xacro:property name="drive_wheel_mesh_scale" value="0.001004086"/>
+  <xacro:property name="drive_wheel_mesh_y" value="0.029118494"/>
+
+  <xacro:property name="chassis_mesh_length" value="0.640"/>
+  <xacro:property name="chassis_mesh_width" value="0.520"/>
+  <xacro:property name="chassis_mesh_height" value="0.085"/>
+  <xacro:property name="chassis_mesh_origin_z" value="-0.044"/>
+  <xacro:property name="chassis_mesh_center_z" value="-0.0115"/>
+
+  <!--
+    15.0 kg measured total mass budget:
+      base_link remainder 9.8 kg (battery, frame, plate, electronics, LiDAR and mount)
+      two drive wheels 2 x 2.2 kg, four complete casters 4 x 0.2 kg.
+    Each caster's measured 0.2 kg is provisionally split across its three links.
+  -->
+  <xacro:property name="chassis_mass" value="9.8"/>
+  <xacro:property name="drive_wheel_mass" value="2.2"/>
+  <xacro:property name="caster_mount_mass" value="0.05"/>
+  <xacro:property name="caster_frame_mass" value="0.10"/>
+  <xacro:property name="caster_wheel_mass" value="0.05"/>
+
+  <!-- Placement rechecked against AMR_MASTER v28.step; unchanged from v23. -->
+  <xacro:property name="lidar_mount_origin_z" value="-0.029"/>
+  <xacro:property name="lidar_from_mount_z" value="0.137605"/>
+
+  <material name="aluminium">
+    <color rgba="0.55 0.60 0.66 1"/>
+  </material>
+  <material name="dark_metal">
+    <color rgba="0.28 0.33 0.39 1"/>
+  </material>
+  <material name="mounting_plate_surface">
+    <color rgba="0.74 0.72 0.66 1"/>
+  </material>
+  <material name="rubber">
+    <color rgba="0.04 0.045 0.055 1"/>
+  </material>
+
+  <xacro:macro name="box_inertial" params="mass x y z origin_xyz">
+    <inertial>
+      <origin xyz="${origin_xyz}" rpy="0 0 0"/>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${mass * (y*y + z*z) / 12.0}" ixy="0" ixz="0"
+        iyy="${mass * (x*x + z*z) / 12.0}" iyz="0"
+        izz="${mass * (x*x + y*y) / 12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="wheel_inertial" params="mass radius width">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${mass * (3*radius*radius + width*width) / 12.0}" ixy="0" ixz="0"
+        iyy="${mass * radius*radius / 2.0}" iyz="0"
+        izz="${mass * (3*radius*radius + width*width) / 12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <link name="base_footprint"/>
+
+  <link name="base_link">
+    <xacro:box_inertial
+      mass="${chassis_mass}"
+      x="${chassis_mesh_length}" y="${chassis_mesh_width}" z="${chassis_mesh_height}"
+      origin_xyz="0 0 ${chassis_mesh_center_z}"/>
+    <visual>
+      <origin xyz="0 0 ${chassis_mesh_origin_z}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/chassis.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="aluminium"/>
+    </visual>
+    <!-- The plate STL is already expressed in the base_link CAD frame. -->
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/mounting_plate.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="mounting_plate_surface"/>
+    </visual>
+    <!-- LiDAR geometry is lumped into base_link together with its mass. -->
+    <visual>
+      <origin xyz="0 0 ${lidar_mount_origin_z}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/lidar_mount.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="aluminium"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 ${lidar_mount_origin_z + lidar_from_mount_z}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/lidar_body.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="dark_metal"/>
+    </visual>
+    <!-- PhysX-friendly collision; visual STL contains 597,040 triangles. -->
+    <collision>
+      <origin xyz="0 0 ${chassis_mesh_center_z}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_mesh_length} ${chassis_mesh_width} ${chassis_mesh_height}"/>
+      </geometry>
+    </collision>
+    <!-- v3 mount: two extended walls, two upper side walls, and top plate.
+         Small counterbored screw holes are omitted from collision geometry. -->
+    <collision>
+      <origin xyz="0 -0.035 ${lidar_mount_origin_z + 0.0475}" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.010 0.105"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 0.035 ${lidar_mount_origin_z + 0.0475}" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.010 0.105"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.035 0 ${lidar_mount_origin_z + 0.075}" rpy="0 0 0"/>
+      <geometry><box size="0.010 0.060 0.050"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.035 0 ${lidar_mount_origin_z + 0.075}" rpy="0 0 0"/>
+      <geometry><box size="0.010 0.060 0.050"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 0 ${lidar_mount_origin_z + 0.105}" rpy="0 0 0"/>
+      <geometry><box size="0.080 0.080 0.010"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0 0 ${lidar_mount_origin_z + lidar_from_mount_z - 0.008345}" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.0385" length="0.038884"/></geometry>
+    </collision>
+  </link>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:macro name="drive_wheel" params="side y mesh_y mesh_roll">
+    <link name="${side}_drive_wheel_link">
+      <xacro:wheel_inertial mass="${drive_wheel_mass}" radius="${wheel_radius}" width="${wheel_width}"/>
+      <visual>
+        <origin xyz="0 ${mesh_y} 0" rpy="${mesh_roll} 0 0"/>
+        <geometry>
+          <mesh filename="${mesh_prefix}/nurirobot_wa171_3d_v5.stl"
+                scale="${drive_wheel_mesh_scale} ${drive_wheel_mesh_scale} ${drive_wheel_mesh_scale}"/>
+        </geometry>
+        <material name="rubber"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="1.57079632679 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
+    </link>
+    <joint name="${side}_drive_wheel_joint" type="continuous">
+      <parent link="base_link"/>
+      <child link="${side}_drive_wheel_link"/>
+      <origin xyz="${drive_axle_x} ${y} 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.1" friction="0.05"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- Configure only these joints as Velocity Drive in Isaac Sim. -->
+  <xacro:drive_wheel side="left" y="${wheel_track / 2.0}" mesh_y="${-drive_wheel_mesh_y}" mesh_roll="0"/>
+  <xacro:drive_wheel side="right" y="${-wheel_track / 2.0}" mesh_y="${drive_wheel_mesh_y}" mesh_roll="3.14159265359"/>
+
+  <xacro:macro name="passive_caster" params="prefix x y">
+    <link name="${prefix}_caster_mount_link">
+      <xacro:box_inertial mass="${caster_mount_mass}"
+        x="0.064" y="0.046" z="0.0069" origin_xyz="0 0 -0.00095"/>
+      <visual>
+        <origin xyz="0 0 0.0025" rpy="0 0 0"/>
+        <geometry><mesh filename="${mesh_prefix}/caster_mount_fixed.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="aluminium"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 -0.00095" rpy="0 0 0"/>
+        <geometry><box size="0.064 0.046 0.0069"/></geometry>
+      </collision>
+    </link>
+    <joint name="${prefix}_caster_mount_joint" type="fixed">
+      <parent link="base_link"/>
+      <child link="${prefix}_caster_mount_link"/>
+      <origin xyz="${x} ${y} -0.0215" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}_caster_swivel_link">
+      <xacro:box_inertial mass="${caster_frame_mass}"
+        x="0.048031" y="0.032" z="0.042576" origin_xyz="0.003485 0 -0.025688"/>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><mesh filename="${mesh_prefix}/caster_swivel_frame.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="dark_metal"/>
+      </visual>
+    </link>
+    <joint name="${prefix}_caster_swivel_joint" type="continuous">
+      <parent link="${prefix}_caster_mount_link"/>
+      <child link="${prefix}_caster_swivel_link"/>
+      <origin xyz="0 0 0" rpy="0 0 3.14159265359"/>
+      <axis xyz="0 0 1"/>
+      <dynamics damping="0.08" friction="0.02"/>
+    </joint>
+
+    <link name="${prefix}_caster_wheel_link">
+      <xacro:wheel_inertial mass="${caster_wheel_mass}" radius="0.0225" width="0.025"/>
+      <visual>
+        <origin xyz="-0.020 0 0.042" rpy="0 0 0"/>
+        <geometry><mesh filename="${mesh_prefix}/caster_wheel.stl" scale="0.001 0.001 0.001"/></geometry>
+        <material name="rubber"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="1.57079632679 0 0"/>
+        <geometry><cylinder radius="0.0225" length="0.025"/></geometry>
+      </collision>
+    </link>
+    <joint name="${prefix}_caster_wheel_joint" type="continuous">
+      <parent link="${prefix}_caster_swivel_link"/>
+      <child link="${prefix}_caster_wheel_link"/>
+      <origin xyz="0.020 0 -0.042" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.02" friction="0.01"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- Keep all caster swivel and wheel joints passive (Drive=None) in Isaac Sim. -->
+  <xacro:passive_caster prefix="front_left" x="0.190" y="0.220"/>
+  <xacro:passive_caster prefix="front_right" x="0.190" y="-0.220"/>
+  <xacro:passive_caster prefix="rear_left" x="-0.190" y="0.220"/>
+  <xacro:passive_caster prefix="rear_right" x="-0.190" y="-0.220"/>
+
+  <!--
+    Fixed LiDAR assembly. The lidar_link origin is the CAD sensor origin and
+    scan centre: base_link xyz = 0 0 0.108605 m, rpy = 0 0 0.
+    Visuals, collisions and physical mass are lumped into base_link. These
+    empty fixed links preserve the mounting and scan coordinate frames for
+    an Isaac Sim RTX LiDAR prim.
+  -->
+  <link name="lidar_mount_link"/>
+  <joint name="lidar_mount_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lidar_mount_link"/>
+    <origin xyz="0 0 ${lidar_mount_origin_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="lidar_link"/>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="lidar_mount_link"/>
+    <child link="lidar_link"/>
+    <origin xyz="0 0 ${lidar_from_mount_z}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Real S2 scan axes: +X points backwards relative to the robot. -->
+  <link name="laser"/>
+  <joint name="laser_joint" type="fixed">
+    <parent link="lidar_link"/>
+    <child link="laser"/>
+    <origin xyz="0 0 0" rpy="0 0 3.141592653589793"/>
+  </joint>
+
+  <!-- LSM6DSV16X chip centre measured in CAD; axes match base_link. -->
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0.160 0.0035 0.016" rpy="0 0 0"/>
+  </joint>
+
+</robot>

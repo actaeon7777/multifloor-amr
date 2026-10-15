@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "detailed_scene": "sim/capstone_amr_4_floor.usda",
+  "single_floor_collider": true,
+  "dynamic_robot_bodies": 15,
+  "wheels": [
+    {
+      "path": "/World/AMR/Geometry/base_footprint/base_link/left_drive_wheel_link/cylinder",
+      "outer_radius_m": 0.08600000004749744,
+      "outer_width_m": 0.0446000000949949
+    },
+    {
+      "path": "/World/AMR/Geometry/base_footprint/base_link/right_drive_wheel_link/cylinder",
+      "outer_radius_m": 0.08600000004749744,
+      "outer_width_m": 0.0446000000949949
+    },
+    {
+      "path": "/World/AMR/Geometry/base_footprint/base_link/front_left_caster_mount_link/front_left_caster_swivel_link/front_left_caster_wheel_link/cylinder",
+      "outer_radius_m": 0.02250000004749745,
+      "outer_width_m": 0.025000000094994902
+    },
+    {
+      "path": "/World/AMR/Geometry/base_footprint/base_link/front_right_caster_mount_link/front_right_caster_swivel_link/front_right_caster_wheel_link/cylinder",
+      "outer_radius_m": 0.02250000004749745,
+      "outer_width_m": 0.025000000094994902
+    },
+    {
+      "path": "/World/AMR/Geometry/base_footprint/base_link/rear_left_caster_mount_link/rear_left_caster_swivel_link/rear_left_caster_wheel_link/cylinder",
+      "outer_radius_m": 0.02250000004749745,
+      "outer_width_m": 0.025000000094994902
+    },
+    {
+      "path": "/World/AMR/Geometry/base_footprint/base_link/rear_right_caster_mount_link/rear_right_caster_swivel_link/rear_right_caster_wheel_link/cylinder",
+      "outer_radius_m": 0.02250000004749745,
+      "outer_width_m": 0.025000000094994902
+    }
+  ],
+  "steel_doors": 15,
+  "elevator_panels": 2,
+  "door_open_close_attributes_verified": true,
+  "project_layers_internal": true,
+  "layer_count": 11,
+  "static_map_obstacles": 70
+}

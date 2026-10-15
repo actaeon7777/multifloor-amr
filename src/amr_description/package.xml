@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>amr_description</name>
+  <version>0.1.0</version>
+  <description>Capstone AMR description assets for ROS 2 and NVIDIA Isaac Sim.</description>
+  <maintainer email="maintainer@example.com">AMR Team</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

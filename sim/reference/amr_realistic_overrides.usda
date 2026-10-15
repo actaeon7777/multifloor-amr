@@ -1,0 +1,372 @@
+#usda 1.0
+(
+    doc = """Physics and keyboard-control tuning for the 15 kg capstone AMR.
+
+Open capstone_amr_realistic.usda instead of the generated binary stage.
+The values here are deliberately authored in a stronger layer so the source
+stage remains recoverable and the tuning can be reviewed as plain text.
+"""
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+over "World"
+{
+    def Scope "PhysicsMaterials"
+    {
+        # Rubber drive wheel on a typical dry indoor floor.  "max" prevents
+        # an unconfigured floor material from averaging traction downward.
+        def Material "DriveWheel" (
+            prepend apiSchemas = ["PhysicsMaterialAPI", "PhysxMaterialAPI"]
+        )
+        {
+            float physics:dynamicFriction = 0.8
+            float physics:restitution = 0
+            float physics:staticFriction = 1
+            uniform token physxMaterial:frictionCombineMode = "max"
+            uniform token physxMaterial:restitutionCombineMode = "multiply"
+        }
+
+        # The real caster tread is smooth, glossy hard plastic rather than
+        # rubber. Keep its isotropic contact friction low so four rigid
+        # casters do not shove the chassis while aligning for an in-place turn.
+        def Material "CasterWheel" (
+            prepend apiSchemas = ["PhysicsMaterialAPI", "PhysxMaterialAPI"]
+        )
+        {
+            float physics:dynamicFriction = 0.10
+            float physics:restitution = 0
+            float physics:staticFriction = 0.15
+            uniform token physxMaterial:frictionCombineMode = "min"
+            uniform token physxMaterial:restitutionCombineMode = "multiply"
+        }
+    }
+
+    over "capstone_amr"
+    {
+        over "Geometry"
+        {
+            over "base_footprint"
+            {
+                over "base_link" (
+                    prepend apiSchemas = ["PhysxArticulationAPI"]
+                )
+                {
+                    # The simplified chassis collision box overlaps the caster
+                    # envelopes.  Internal collision would make the chassis
+                    # continuously eject its own wheels.
+                    bool physxArticulation:enabledSelfCollisions = 0
+                    int physxArticulation:solverPositionIterationCount = 32
+                    int physxArticulation:solverVelocityIterationCount = 4
+
+                    over "left_drive_wheel_link"
+                    {
+                        over "cylinder" (
+                            prepend apiSchemas = ["MaterialBindingAPI"]
+                        )
+                        {
+                            rel material:binding:physics = </World/PhysicsMaterials/DriveWheel> (
+                                bindMaterialAs = "strongerThanDescendants"
+                            )
+                        }
+                    }
+
+                    over "right_drive_wheel_link"
+                    {
+                        over "cylinder" (
+                            prepend apiSchemas = ["MaterialBindingAPI"]
+                        )
+                        {
+                            rel material:binding:physics = </World/PhysicsMaterials/DriveWheel> (
+                                bindMaterialAs = "strongerThanDescendants"
+                            )
+                        }
+                    }
+
+                    over "front_left_caster_mount_link"
+                    {
+                        double3 xformOp:translate = (0.190, 0.220, -0.0215)
+
+                        over "front_left_caster_swivel_link"
+                        {
+                            over "front_left_caster_wheel_link"
+                            {
+                                double3 xformOp:translate = (0.020, 0.001, -0.042)
+
+                                over "cylinder" (
+                                    prepend apiSchemas = ["MaterialBindingAPI"]
+                                )
+                                {
+                                    rel material:binding:physics = </World/PhysicsMaterials/CasterWheel> (
+                                        bindMaterialAs = "strongerThanDescendants"
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    over "front_right_caster_mount_link"
+                    {
+                        double3 xformOp:translate = (0.190, -0.220, -0.0215)
+
+                        over "front_right_caster_swivel_link"
+                        {
+                            over "front_right_caster_wheel_link"
+                            {
+                                double3 xformOp:translate = (0.020, -0.001, -0.042)
+
+                                over "cylinder" (
+                                    prepend apiSchemas = ["MaterialBindingAPI"]
+                                )
+                                {
+                                    rel material:binding:physics = </World/PhysicsMaterials/CasterWheel> (
+                                        bindMaterialAs = "strongerThanDescendants"
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    over "rear_left_caster_mount_link"
+                    {
+                        double3 xformOp:translate = (-0.190, 0.220, -0.0215)
+
+                        over "rear_left_caster_swivel_link"
+                        {
+                            over "rear_left_caster_wheel_link"
+                            {
+                                double3 xformOp:translate = (0.020, 0.001, -0.042)
+
+                                over "cylinder" (
+                                    prepend apiSchemas = ["MaterialBindingAPI"]
+                                )
+                                {
+                                    rel material:binding:physics = </World/PhysicsMaterials/CasterWheel> (
+                                        bindMaterialAs = "strongerThanDescendants"
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    over "rear_right_caster_mount_link"
+                    {
+                        double3 xformOp:translate = (-0.190, -0.220, -0.0215)
+
+                        over "rear_right_caster_swivel_link"
+                        {
+                            over "rear_right_caster_wheel_link"
+                            {
+                                double3 xformOp:translate = (0.020, -0.001, -0.042)
+
+                                over "cylinder" (
+                                    prepend apiSchemas = ["MaterialBindingAPI"]
+                                )
+                                {
+                                    rel material:binding:physics = </World/PhysicsMaterials/CasterWheel> (
+                                        bindMaterialAs = "strongerThanDescendants"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        over "Physics"
+        {
+            # All wheel bottoms are coplanar.  The previous -20.5 mm caster
+            # mount height left each 22.5 mm caster 1 mm above a flat floor,
+            # removing the contact force needed to swivel it.
+            over "front_left_caster_mount_joint"
+            {
+                point3f physics:localPos0 = (0.190, 0.220, -0.0215)
+            }
+
+            over "front_right_caster_mount_joint"
+            {
+                point3f physics:localPos0 = (0.190, -0.220, -0.0215)
+            }
+
+            over "rear_left_caster_mount_joint"
+            {
+                point3f physics:localPos0 = (-0.190, 0.220, -0.0215)
+            }
+
+            over "rear_right_caster_mount_joint"
+            {
+                point3f physics:localPos0 = (-0.190, -0.220, -0.0215)
+            }
+
+            over "left_drive_wheel_joint" (
+                prepend apiSchemas = ["PhysxDrivePerformanceEnvelopeAPI:angular"]
+            )
+            {
+                # ODrive uses PI velocity control (vel_gain=3,
+                # vel_integrator_gain=25), while PhysicsDriveAPI has no
+                # integral state. Use a 5 N*m/(rad/s) effective closed-loop
+                # surrogate. USD angular gains are per degree/s, hence
+                # 5*pi/180 = 0.087266463. The old authored value 5 was 57.3x
+                # larger than its intended SI gain.
+                float drive:angular:physics:damping = 0.087266463
+                float drive:angular:physics:maxForce = 12.357
+                float drive:angular:physics:stiffness = 0
+                uniform token drive:angular:physics:type = "force"
+                # Motor envelope: KV=8.7 rpm/V at 24 V gives 1252.8 deg/s.
+                # The independent 1080 deg/s joint limit is ODrive's 3 turn/s
+                # hard limit; normal commands are clamped to its 2 turn/s soft
+                # limit in the differential-controller graph below.
+                float physxDrivePerformanceEnvelope:angular:maxActuatorVelocity = 1252.8
+                float physxDrivePerformanceEnvelope:angular:speedEffortGradient = 101.383831
+                float physxDrivePerformanceEnvelope:angular:velocityDependentResistance = 0.009863506
+                float physxJoint:jointFriction = 0.02
+                float physxJoint:maxJointVelocity = 1080
+            }
+
+            over "right_drive_wheel_joint" (
+                prepend apiSchemas = ["PhysxDrivePerformanceEnvelopeAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0.087266463
+                float drive:angular:physics:maxForce = 12.357
+                float drive:angular:physics:stiffness = 0
+                uniform token drive:angular:physics:type = "force"
+                float physxDrivePerformanceEnvelope:angular:maxActuatorVelocity = 1252.8
+                float physxDrivePerformanceEnvelope:angular:speedEffortGradient = 101.383831
+                float physxDrivePerformanceEnvelope:angular:velocityDependentResistance = 0.009863506
+                float physxJoint:jointFriction = 0.02
+                float physxJoint:maxJointVelocity = 1080
+            }
+
+            # Delete the URDF importer's zero-velocity drive so each Z-axis
+            # bearing is genuinely passive. Only tiny Coulomb friction is
+            # retained; caster trail and tire contact provide the flip torque.
+            over "front_left_caster_swivel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.00005
+            }
+
+            over "front_left_caster_wheel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.001
+                point3f physics:localPos0 = (0.020, 0.001, -0.042)
+            }
+
+            over "front_right_caster_swivel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.00005
+            }
+
+            over "front_right_caster_wheel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.001
+                point3f physics:localPos0 = (0.020, -0.001, -0.042)
+            }
+
+            over "rear_left_caster_swivel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.00005
+            }
+
+            over "rear_left_caster_wheel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.001
+                point3f physics:localPos0 = (0.020, 0.001, -0.042)
+            }
+
+            over "rear_right_caster_swivel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.00005
+            }
+
+            over "rear_right_caster_wheel_joint" (
+                delete apiSchemas = ["PhysicsDriveAPI:angular"]
+            )
+            {
+                float drive:angular:physics:damping = 0
+                float drive:angular:physics:maxForce = 0
+                float drive:angular:physics:stiffness = 0
+                float physxJoint:jointFriction = 0.001
+                point3f physics:localPos0 = (0.020, -0.001, -0.042)
+            }
+        }
+    }
+}
+
+over "PhysicsScene"
+{
+    # NVIDIA's Nova Carter mobility example uses physics_dt = 0.005 s.  The
+    # same 200 Hz rate gives the AMR's smaller 22.5 mm casters more contact
+    # samples while crossing collider facets and floor seams.
+    uniform int newton:timeStepsPerSecond = 200
+    bool physxScene:enableStabilization = 1
+    uniform token physxScene:solverType = "TGS"
+    uint physxScene:timeStepsPerSecond = 200
+}
+
+over "Graphs"
+{
+    over "differential_controller"
+    {
+        over "DifferentialController"
+        {
+            # OnPlaybackTick.outputs:deltaSeconds is 0 in Isaac Sim 6.0.1.
+            # The graph runs at the application's fixed 60 Hz timeline rate,
+            # so author that interval directly to keep acceleration limiting
+            # active and remove the "Invalid deltaTime" warning.
+            double inputs:dt = 0.0166666666666667
+            # ODrive ramp limit is 2 turn/s^2 = 12.56637 rad/s^2 per wheel.
+            # With simultaneous linear and yaw commands, 0.8 m/s^2 plus
+            # 1 rad/s^2 requests at most 12.20349 rad/s^2 on either wheel.
+            double inputs:maxAcceleration = 0.8
+            double inputs:maxAngularAcceleration = 1
+            double inputs:maxAngularSpeed = 4.331494
+            double inputs:maxDeceleration = 0.8
+            double inputs:maxLinearSpeed = 1.080708
+            double inputs:maxWheelSpeed = 12.566371
+        }
+
+        # Keyboard A/D yaw command. The imported graph used 0.5 rad/s;
+        # 1.0 rad/s gives a visibly quicker but still controllable in-place turn.
+        over "ScaleAngular"
+        {
+            double inputs:value = 1
+        }
+    }
+}

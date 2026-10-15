@@ -1,0 +1,13 @@
+# Navigate to a pose that may be on another floor, using the elevator when needed.
+string floor                         # floors.yaml name
+string destination_id                # optional room id, e.g. "302"
+geometry_msgs/PoseStamped pose       # in that floor's map frame
+---
+bool success
+string error_code
+string message
+---
+string phase
+string current_floor
+uint8 zone
+string detail

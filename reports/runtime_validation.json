@@ -1,0 +1,137 @@
+{
+  "passed": true,
+  "isaac_sim": "6.1.0",
+  "engine": "physx",
+  "physics_hz": 200,
+  "actual_physics_dt_s": 0.005,
+  "runtime_mass_kg": 15.000001907348633,
+  "rest_drift_m": 0.000352822826243937,
+  "wheel_effort_limit_nm": [
+    12.357000350952148,
+    12.357000350952148
+  ],
+  "wheel_velocity_limit_rad_s": [
+    18.84955596923828,
+    18.84955596923828
+  ],
+  "velocity_drive_gain_si": [
+    [
+      5.0,
+      5.0
+    ]
+  ],
+  "joint_resistance_si": {
+    "left_drive_wheel_joint": [
+      0.0,
+      0.0,
+      0.10000000149011612
+    ],
+    "right_drive_wheel_joint": [
+      0.0,
+      0.0,
+      0.10000000149011612
+    ],
+    "front_left_caster_swivel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "front_left_caster_wheel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "front_right_caster_swivel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "front_right_caster_wheel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rear_left_caster_swivel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rear_left_caster_wheel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rear_right_caster_swivel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rear_right_caster_wheel_joint": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "joint_resistance_order": [
+    "static_nm",
+    "dynamic_nm",
+    "viscous_nm_s_per_rad"
+  ],
+  "motions": {
+    "forward": {
+      "forward_m": 0.40876948833465576,
+      "sideways_m": -1.4133281183603685e-05,
+      "yaw_rad": -5.9822552295680534e-05
+    },
+    "reverse": {
+      "forward_m": -0.4668911099433899,
+      "sideways_m": -0.0001386820076731965,
+      "yaw_rad": 0.00025199503763522683
+    },
+    "turn_left": {
+      "forward_m": -0.0005225018248893321,
+      "sideways_m": 0.0004103810933884233,
+      "yaw_rad": 0.8436958307957473
+    },
+    "turn_right": {
+      "forward_m": 0.0017236266285181046,
+      "sideways_m": -0.0010462448699399829,
+      "yaw_rad": -0.844111452346663
+    }
+  },
+  "stops": [
+    {
+      "travel_m": 0.020064473152160645,
+      "final_wheel_rad_s": [
+        0.0027787480503320694,
+        0.007594467606395483
+      ]
+    },
+    {
+      "travel_m": 0.020585523918271065,
+      "final_wheel_rad_s": [
+        -0.009840365499258041,
+        -0.007171253673732281
+      ]
+    },
+    {
+      "travel_m": 3.634203676483594e-05,
+      "final_wheel_rad_s": [
+        -0.0025764144957065582,
+        -0.0048096561804413795
+      ]
+    },
+    {
+      "travel_m": 0.00015030914801172912,
+      "final_wheel_rad_s": [
+        -0.0012318742228671908,
+        -0.0004294048703741282
+      ]
+    }
+  ],
+  "max_command_rad_s": 2.3255813953488373,
+  "max_command_rate_rad_s2": 12.566370614000007,
+  "command_callback_steps": 3140,
+  "body_velocity_overrides": false,
+  "coverage": "Flat-ground rest, forward, reverse, both in-place turns, ramped stops, runtime SI friction and speed-limit readback. No real-world calibration."
+}

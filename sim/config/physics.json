@@ -1,0 +1,71 @@
+{
+  "profile": "v29_compliant_wheel_contact",
+  "isaac_sim_version": "6.1.0",
+  "physics_hz": 200,
+  "solver": "TGS",
+  "solver_position_iterations": 32,
+  "solver_velocity_iterations": 4,
+  "drive": {
+    "effort_limit_nm": 12.357,
+    "velocity_limit_rad_s": 18.849555922,
+    "command_acceleration_rad_s2": 12.566370614,
+    "velocity_gain_nm_per_rad_s": 5.0,
+    "static_friction": 1.0,
+    "dynamic_friction": 0.8,
+    "no_load_velocity_rad_s": 21.865484869,
+    "velocity_dependent_resistance_nm_per_rad_s": 0.565137251,
+    "speed_effort_gradient_rad_s_per_nm": 1.76948166,
+    "joint_resistance": {
+      "static_friction_nm": 0.0,
+      "dynamic_friction_nm": 0.0,
+      "viscous_damping_nm_s_per_rad": 0.1,
+      "calibration_status": "Coulomb torque unmeasured and disabled (zero); damping is a provisional assumption."
+    },
+    "command_deceleration_rad_s2": 12.566370614
+  },
+  "caster": {
+    "static_friction": 0.15,
+    "dynamic_friction": 0.1,
+    "swivel_resistance": {
+      "static_friction_nm": 0.0,
+      "dynamic_friction_nm": 0.0,
+      "viscous_damping_nm_s_per_rad": 0.0,
+      "calibration_status": "Coulomb torque unmeasured and disabled (zero); damping is a provisional assumption."
+    },
+    "axle_resistance": {
+      "static_friction_nm": 0.0,
+      "dynamic_friction_nm": 0.0,
+      "viscous_damping_nm_s_per_rad": 0.0,
+      "calibration_status": "Coulomb torque unmeasured and disabled (zero); damping is a provisional assumption."
+    }
+  },
+  "provenance": {
+    "paths_relative_to": "workspace root (amr_ws)",
+    "geometry": "src/amr_description",
+    "geometry_description": "AMR_MASTER v28, LiDAR Mount v3, Mounting_Plate v3; includes laser and imu_link",
+    "motor_parameters": "sim/reference/wa172e_actuator_parameters.yaml",
+    "contact_and_solver": "sim/reference/amr_realistic_overrides.usda",
+    "mass_and_inertia": "Retained from latest source URDF: 15 kg budget, approximate CoM/inertias; not a new measurement.",
+    "drive_gain": "5 Nm/(rad/s) is the prior PI-response surrogate, not a measured passive damping coefficient.",
+    "urdf_drive_damping": "Provisional 0.1 Nm s/rad retained; now authored independently as PhysxJointAxisAPI viscous friction, separate from the velocity drive gain.",
+    "motor_envelope": "Prior linear approximation from 24 V, 8.7 KV and 13 A; battery sag, thermal response and regenerative braking are not modeled.",
+    "caster": "Contact friction retains prior tuning; unmeasured joint Coulomb torques disabled. Latest geometry retained.",
+    "legacy_physx_joint_friction_coefficients_not_applied": {
+      "drive": 0.02,
+      "caster_swivel": 5e-05,
+      "caster_axle": 0.001
+    },
+    "joint_resistance": "Legacy dimensionless PhysX coefficients are not torque measurements. Coulomb torque defaults to zero until measured; do not reinterpret the archived coefficients as Nm. URDF exports dynamic Coulomb torque; separate static torque is a PhysX extension.",
+    "wheel_contact": "Rounded analytic cylinders and implicit compliant tire contacts reduce six-wheel contact chatter; dimensions, mass, inertia and actuator envelope retained. See reports/floor4_stability.json and reports/floor4_manual.json."
+  },
+  "control_policy": "src/amr_system/amr_stack/config/control_mux.yaml",
+  "calibration_status": "uncalibrated; real response calibration deferred",
+  "wheel_contact": {
+    "edge_radius_m": 0.001,
+    "drive_stiffness_n_m": 50000.0,
+    "drive_damping_n_s_m": 1000.0,
+    "caster_stiffness_n_m": 20000.0,
+    "caster_damping_n_s_m": 400.0,
+    "calibration_status": "Simulation stability parameters; not measured tire compliance. Rounded core preserves the source wheel outer radius and width."
+  }
+}

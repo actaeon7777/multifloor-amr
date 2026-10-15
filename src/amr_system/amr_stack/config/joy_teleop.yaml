@@ -1,0 +1,27 @@
+# Xbox Series X Controller (SDL): retain the original /joy indices (zero-based).
+joy:
+  ros__parameters:
+    device_id: 0
+    device_name: Xbox Series X Controller  # Exact SDL name; do not open another device.
+    deadzone: 0.05
+    autorepeat_rate: 20.0
+    coalesce_interval: 0.01
+    sticky_buttons: false  # Keep LB held-to-drive; control_mux toggles only RB (7).
+
+joy_teleop:
+  ros__parameters:
+    manual:
+      type: topic
+      interface_type: geometry_msgs/msg/Twist
+      topic_name: /cmd_vel_manual
+      deadman_buttons: [6]  # LB, held to drive
+      axis_mappings:
+        linear-x:
+          axis: 1          # Left stick forward is positive
+          scale: 1.00       # m/s
+          offset: 0.0
+        angular-z:
+          axis: 2          # Right stick left is positive
+          scale: 0.80       # rad/s
+          offset: 0.0
+# joy_teleop stops publishing on LB release. control_mux emits the stop command.

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>amr_elevator</name>
+  <version>0.1.0</version>
+  <description>Elevator door sensing, floor/zone estimation and multi-floor missions (real vehicle and simulation).</description>
+  <maintainer email="amr@example.com">AMR maintainers</maintainer>
+  <license>TODO</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>amr_elevator_interfaces</exec_depend>
+  <exec_depend>amr_stack</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

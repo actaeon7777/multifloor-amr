@@ -1,0 +1,5 @@
+# Operator override when the floor is unknown. Only accepted while the AMR is stationary outside the car.
+string floor
+---
+bool success
+string message

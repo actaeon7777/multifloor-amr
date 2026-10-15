@@ -1,0 +1,32 @@
+can_telemetry:
+  ros__parameters:
+    channel: can0
+    wheel_diameter: 0.172
+    track_width: 0.499
+    # Actual installation: ODrive node 0 = RIGHT (+); node 1 = LEFT (-).
+    left_direction: -1.0
+    right_direction: 1.0
+    # ODrive pos_vel_mapper estimates are assumed to be wheel/output turns.
+    encoder_turns_per_wheel_turn: 1.0
+    max_valid_wheel_rev_s: 5.0  # Reject corrupt feedback; not a motor speed limit.
+    wheel_pair_slop: 0.02
+    wheel_timeout: 0.25
+    imu_pair_slop: 0.05
+    imu_timeout: 0.5
+    max_frame_age: 0.25
+    # STM32 does not write CTRL6/CTRL8: assumes LSM6DSV16X power-on defaults.
+    # Accel ±2g: 0.061 mg/LSB; gyro ±125dps: 4.375 mdps/LSB.
+    # If the sensor range is changed, these MUST match the actual registers.
+    accel_range_g: 2
+    gyro_range_dps: 125
+    # Measured stationary on the floor for 60 s, 2026-09-29; subtract XYZ in rad/s.
+    # Source: diagnostics/stationary_2026-09-29_015102/result.json
+    gyro_bias: [-0.012650764556, 0.001503619331, 0.000257072454]
+    odom_frame: odom
+    base_frame: base_footprint
+    imu_frame: imu_link
+    # Conservative initial variances for EKF bringup; motion/slip tuning remains.
+    linear_velocity_variance: 0.0025
+    angular_velocity_variance: 0.01
+    gyro_variance: 0.0009
+    accel_variance: 0.01

@@ -1,0 +1,7 @@
+<library path="amr_wheel_speed_critic">
+  <class name="amr_nav2_plugins::WheelSpeedCritic"
+         type="amr_nav2_plugins::WheelSpeedCritic"
+         base_class_type="dwb_core::TrajectoryCritic">
+    <description>Reject commands exceeding either AMR drive wheel's speed limit.</description>
+  </class>
+</library>

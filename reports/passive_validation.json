@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "fixture_only_session_layer": true,
+  "drive_apis_removed": true,
+  "passive_spin_initial_rad_s": 2.0,
+  "passive_spin_after_0_1s_rad_s": 0.6036702990531921,
+  "analytic_viscous_prediction_rad_s": 0.5850731119880381,
+  "fixture_static_torque_nm": 0.04,
+  "fixture_dynamic_torque_nm": 0.02,
+  "below_breakaway_speed_rad_s": 1.4708498863313935e-09,
+  "above_breakaway_speed_rad_s": 0.978553831577301,
+  "measured_fixture_dynamic_torque_nm": 0.020349600341320037,
+  "coverage": "Engine mapping and isolated wheel resistance; fixture torques are synthetic, not robot measurements."
+}

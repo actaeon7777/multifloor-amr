@@ -1,0 +1,58 @@
+# AMCL uses 1080 beams during initialization, then returns to the tracking
+# budget after verification. Only max_beams changes; its 30m range is unchanged.
+# Independent verification uses up to 360 beams and shares AMCL's 30m range.
+navigation_startup:
+  ros__parameters:
+    automatic_localization: true
+    # TIM finds a laser pose from /map + /scan; the supervisor alone seeds AMCL.
+    # Use 'amcl' explicitly only to compare the former uniform-particle search.
+    global_localization_backend: tim
+    tim_service: /localization/global_localize
+    tim_timeout_sec: 30.0
+    tim_max_candidates: 5
+    # Only quiet drift inside these bounds is transported to the latest scan.
+    # Every odometry sample must stay within the bounds throughout inference.
+    tim_max_compensation_translation: 0.02
+    tim_max_compensation_yaw: 0.01
+    initialization_max_beams: 1080
+    tracking_max_beams: 60
+    global_frame: map
+    odom_frame: odom
+    base_frame: base_footprint
+    data_timeout: 1.5
+    pose_timeout: 3.0
+    search_timeout: 60.0
+    verification_duration: 2.5
+    verification_samples: 6
+    # A human supplies the global prior. Keep both beam-profile checks, but
+    # require a shorter window with distinct AMCL poses as well as new scans.
+    manual_verification_duration: 1.0
+    manual_verification_samples: 4
+    # Refresh stationary AMCL faster only while localization is being verified.
+    initialization_update_interval: 0.25
+    tracking_update_interval: 1.0
+    # After READY, initial confidence limits only report tracking_warning.
+    # They must not undo initialization or cancel a running navigation goal.
+    # Invalid/stale data, TF, malformed covariance, free-space and lifecycle
+    # faults still close the gate. Their recovery requires new stopped evidence.
+    tracking_verification_duration: 1.0
+    tracking_verification_samples: 4
+    max_xy_std: 0.35
+    max_yaw_std: 0.25
+    min_particle_concentration: 0.90
+    min_match_ratio: 0.70
+    min_known_ratio: 0.85
+    min_valid_beams: 30
+    quality_max_beams: 360
+    quality_max_range: 30.0
+    tracking_quality_max_range: 30.0
+    match_tolerance: 0.20
+    ambiguity_margin: 0.10
+    rival_position_step: 0.5
+    rival_yaw_step: 0.2617993877991494
+    rival_max_candidates: 200000
+    service_timeout: 5.0
+    navigation_start_timeout: 90.0
+    stationary_linear_speed: 0.02
+    stationary_angular_speed: 0.04
+    stationary_duration: 1.0

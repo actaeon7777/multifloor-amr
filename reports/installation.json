@@ -1,0 +1,17 @@
+{
+  "version": "6.1.0",
+  "method": "official workstation zip",
+  "path": "/home/user/capstone/amr_ws/runtime/isaac-sim-6.1.0",
+  "archive_md5": "b471383a51f259e0af22541f05c34b0e",
+  "archive_entries": 205821,
+  "unpacked_bytes": 27342091711,
+  "extracted": true,
+  "runtime_verified": true,
+  "build": "6.1.0-rc.26+release.49347.2d230af4.gl",
+  "verified_date_local": "2026-10-03",
+  "timezone": "Asia/Seoul",
+  "gpu": "NVIDIA GeForce RTX 4070 Ti 12GB",
+  "driver": "595.91.07",
+  "runtime_report": "reports/runtime_validation.json",
+  "preview": "reports/amr_preview.png"
+}

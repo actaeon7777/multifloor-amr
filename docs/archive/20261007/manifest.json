@@ -1,0 +1,115 @@
+{
+  "snapshot_date": "2026-10-07",
+  "backup": "backups/before_docs_unification_20261007_144528",
+  "link_policy": "Archive links resolve to archived references or preserved source files; historical statements are unchanged.",
+  "documents": [
+    {
+      "original_path": "docs/WORKSPACE_PORTABILITY.md",
+      "archive_path": "docs/archive/20261007/docs/WORKSPACE_PORTABILITY.md",
+      "original_sha256": "f49f9733ebdc945c5f08a2d8305c7019ad2f7e319fd5fcd875c5540034b8b066",
+      "archive_sha256": "81805a9add20824cb619d45164bdb4921f741c5e6b0fa567f99bfc4231a103bb"
+    },
+    {
+      "original_path": "docs/SIM2REAL.md",
+      "archive_path": "docs/archive/20261007/docs/SIM2REAL.md",
+      "original_sha256": "f2f8675ac4802009236b0fea3d35b4b07f51caa2e06bd0400f0aabea33eecf6b",
+      "archive_sha256": "705e1f23ca69c51d41cf9cb558a33c88c1f07593c9f4d9f0ac885600746d72cf"
+    },
+    {
+      "original_path": "docs/REAL_AMR_BASELINE.md",
+      "archive_path": "docs/archive/20261007/docs/REAL_AMR_BASELINE.md",
+      "original_sha256": "6c2083fb3ae4589770c32ff52250b7a70f6c7ac6c241c83fbf5aada451cec846",
+      "archive_sha256": "761cb5657996e73ae58eb845687af4d9166b30f33c53f29bbe2dfe351912b63b"
+    },
+    {
+      "original_path": "docs/AMR_REMOTE_REAL_DRIVE_TEST.md",
+      "archive_path": "docs/archive/20261007/docs/AMR_REMOTE_REAL_DRIVE_TEST.md",
+      "original_sha256": "d63655f7efc98bdb9f30889393c499acd5c5828b5727541c49b73879fdd7cfe2",
+      "archive_sha256": "01839f4b3e64a97c911a9276143b669c491bc48fb88cd658132bea812c605690"
+    },
+    {
+      "original_path": "docs/HOST_CONTROL_AGENT_PROMPT.md",
+      "archive_path": "docs/archive/20261007/docs/HOST_CONTROL_AGENT_PROMPT.md",
+      "original_sha256": "268d0d05c5acfe215409adb645c287748912770ddf71a7f0c0deec9104fbbd09",
+      "archive_sha256": "2adb6257fd7871fb8ade438de9af8e329603eeabbffd6a46f8bdd453317256f7"
+    },
+    {
+      "original_path": "docs/AMR_REMOTE_COMM_TEST.md",
+      "archive_path": "docs/archive/20261007/docs/AMR_REMOTE_COMM_TEST.md",
+      "original_sha256": "9f3a427ec018cdc52b7af7dd0a86d612e273d64da11b46993836d63ce88c34f4",
+      "archive_sha256": "1198a3a3e7d27afb973183a1f554400a33513495574ff8be3852eaac668bf1b5"
+    },
+    {
+      "original_path": "docs/ROLLBACK_PC_UPDATE_20261006.md",
+      "archive_path": "docs/archive/20261007/docs/ROLLBACK_PC_UPDATE_20261006.md",
+      "original_sha256": "0c72f96aaec8db8535c2d644cab3c237f261e98e0fc0b2fc3735f1ad914b287c",
+      "archive_sha256": "3920cd9c601ae1a2d086d970e871b2e683c021d67c8caa751ed767b975ee24ea"
+    },
+    {
+      "original_path": "README.md",
+      "archive_path": "docs/archive/20261007/root/README.md",
+      "original_sha256": "be9af5ea2a7d33f5b44b705018821d289e4407b5e150b47b42c9a1c68b11bb6b",
+      "archive_sha256": "92afbb8efc401187172f3ff9292a298af3401455f1fa529a7c27ced929a31c31"
+    },
+    {
+      "original_path": "실행법.md",
+      "archive_path": "docs/archive/20261007/root/실행법.md",
+      "original_sha256": "8e376f221f465dbc1d7f5e268cb7ce163e15e84c099dcdb8163085f003482c14",
+      "archive_sha256": "fe6f24b841e6ff771ad2d11df0289d1ec3cba5cc0900fc9e27e023328f94b69d"
+    },
+    {
+      "original_path": "PORTING_JAZZY.md",
+      "archive_path": "docs/archive/20261007/root/PORTING_JAZZY.md",
+      "original_sha256": "d4f21fbbe18c5c06179904b92f4e493722264be7d7ed0dde89640ea068eb6702",
+      "archive_sha256": "6fba96f68d0375ff7b2008c78d13f0b7156506fd6ae92485a26c6ef1302d11e9"
+    },
+    {
+      "original_path": "AMR_실물_이전_실행방법_20261006.txt",
+      "archive_path": "docs/archive/20261007/root/AMR_실물_이전_실행방법_20261006.txt",
+      "original_sha256": "f81c6ea5b7449ec564fece9716460e19f1ca6ea77e93a8729cb0bf1e662f0238",
+      "archive_sha256": "311f9d15fbf4c5ef7cf5541547e812ea264a33e1e680dfe3307564de8af8a970"
+    },
+    {
+      "original_path": "Control_Server/README.md",
+      "archive_path": "docs/archive/20261007/Control_Server/README.md",
+      "original_sha256": "bd53e4c8c3c172d2b32b2205fa875caa59127c4b081a8fc323e5676c800b8455",
+      "archive_sha256": "2909ac47d7d7df8e1de9863cde9e3972264f1d6d739b3d2890c56e22d7c23543"
+    },
+    {
+      "original_path": "Control_Server/BUILD_WORKFLOW.md",
+      "archive_path": "docs/archive/20261007/Control_Server/BUILD_WORKFLOW.md",
+      "original_sha256": "5e5a1be072bfd6d33c625d6e1f53bb53e86c1086cd1ef175fab07f6bb629bbd7",
+      "archive_sha256": "a62fa66abbb839a918162a40bbe302ba6a47183ea2fd7e7c4484e1bff6ab2bf2"
+    },
+    {
+      "original_path": "Control_Server/HOST_CONTROL_AGENT_PROMPT.md",
+      "archive_path": "docs/archive/20261007/Control_Server/HOST_CONTROL_AGENT_PROMPT.md",
+      "original_sha256": "b75d15d9192a162b32b92a29784559784c0ec436cb9051f225d5ca6233b3e708",
+      "archive_sha256": "50294dad68d226a9d2d7080b78987271b4af54ac708c93bb718b02196539080c"
+    },
+    {
+      "original_path": "Control_Server/UPDATE_20261006.md",
+      "archive_path": "docs/archive/20261007/Control_Server/UPDATE_20261006.md",
+      "original_sha256": "df161b04b857c1f9eb6803711e72d1a69e9a7eeb85fc11dbb89acbec74a6ecbd",
+      "archive_sha256": "f4813a423a8b1e309f568c5e39bc7717790c589b3f719e58d5a27eb5e8d6cd7b"
+    },
+    {
+      "original_path": "src/amr_system/amr_web_ui/README.md",
+      "archive_path": "docs/archive/20261007/src/amr_system/amr_web_ui/README.md",
+      "original_sha256": "b8f95858cd35a061e4e53ef80b090afbc4931c626c4c15bf30b865f1e6e9a728",
+      "archive_sha256": "8e06b6cdafba19be1fa132e7e051852037b1c1fb4e058315d803a5c2ff6972e3"
+    },
+    {
+      "original_path": "src/amr_system/amr_remote_bridge/README.md",
+      "archive_path": "docs/archive/20261007/src/amr_system/amr_remote_bridge/README.md",
+      "original_sha256": "95d3721f2a0bc2da02c9a94e329e1edde47b0b047a1c40ff38d5a93a90e58375",
+      "archive_sha256": "93e9de9dfe8c0de00d985c05398ae33e3dede18268e208177e70dfea1bcfcd22"
+    },
+    {
+      "original_path": "src/amr_system/amr_vehicle_status/README.md",
+      "archive_path": "docs/archive/20261007/src/amr_system/amr_vehicle_status/README.md",
+      "original_sha256": "1d12cca04cb145fb7fccd7b5b691f08bd7854ae92fdaa716a83d393542bd2a56",
+      "archive_sha256": "5a6dd90fb4fb65455b065b13c9224a614b8c247a3c8ce6b43e7a44b6e83ea998"
+    }
+  ]
+}

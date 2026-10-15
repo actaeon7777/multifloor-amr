@@ -1,0 +1,22 @@
+{
+  "model_version": "provisional-v1",
+  "calibration_status": "uncalibrated",
+  "provenance": "Rates from source firmware / porting notes; noise, delay and scan range need real recordings. Real IMU bias is deliberately not subtracted.",
+  "command_period_s": 0.05,
+  "command_timeout_s": 0.3,
+  "command_delay_s": 0.0,
+  "sensor_delay_s": 0.0,
+  "wheel_hz": 10.0,
+  "imu_hz": 10.0,
+  "scan_hz": 8.8,
+  "scan_points": 3240,
+  "scan_range_min_m": 0.05,
+  "scan_range_max_m": 30.0,
+  "gyro_noise_std_rad_s": 0.0,
+  "accel_noise_std_m_s2": 0.0,
+  "scan_noise_std_m": 0.0,
+  "linear_velocity_variance": 0.0025,
+  "angular_velocity_variance": 0.01,
+  "gyro_variance": 0.0009,
+  "accel_variance": 0.01
+}

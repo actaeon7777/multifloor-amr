@@ -1,0 +1,20 @@
+# LB held: manual. RB press: toggle AUTO; manual is ignored while AUTO is on.
+control_mux:
+  ros__parameters:
+    deadman_button: 6
+    auto_toggle_button: 7
+    auto_timeout: 0.50      # seconds; stop without falling back to manual
+    toggle_release_debounce: 0.10  # stable RB release before accepting another press
+    mode_stop_duration: 0.10  # zero output interval on each mode transition
+    required_axes: [1, 2]
+    joy_timeout: 0.50       # seconds; Joy loss still requires releasing LB again
+    command_timeout: 0.50   # seconds; fresh commands resume while Joy/LB remain valid
+    release_debounce: 0.10  # seconds to confirm LB release; 0.0 disables debounce
+    publish_rate: 20.0      # periodic refresh Hz; new commands also publish immediately
+    max_linear_speed: 1.00  # m/s
+    max_angular_speed: 0.80 # rad/s
+    # Final MANUAL/AUTO output scales v and w equally to preserve curvature.
+    # Geometry must match STM32. Wheel speed policy is owned by this node.
+    wheel_diameter: 0.172  # m
+    track_width: 0.499     # m
+    max_wheel_rev_s: 1.8   # rev/s; 0.973 m/s per wheel

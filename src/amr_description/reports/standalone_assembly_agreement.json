@@ -1,0 +1,10 @@
+{
+  "LiDAR Mount v3.step": {
+    "exact_brep_match": true,
+    "brep_sha256": "936db19a3e56c1786d12cfd49bacee3728d068ca7d543390a43b45cc24bbdb53"
+  },
+  "Mounting_Plate v3.step": {
+    "exact_brep_match": true,
+    "brep_sha256": "0e50afa6b0df362501a53197b805b1c0c61bb811edf90ae17dec052a43a8be28"
+  }
+}

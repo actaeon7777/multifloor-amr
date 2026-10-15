@@ -1,0 +1,13 @@
+# Matches the user's working keyboard CAN sender. No bitrate is set by this node.
+# can0 must already be configured and UP with the proven hardware bitrate.
+cmd_vel_to_can:
+  ros__parameters:
+    channel: can0
+    can_id: 513             # 0x201, standard 11-bit CAN data frame, DLC 8
+    dry_run: false          # Live CAN by default; use can_dry_run:=true for preview
+    tx_rate: 20.0           # Hz; struct.pack('<ff', v_mps, w_radps)
+    command_timeout: 0.50   # seconds; pause on expiry, resume on a fresh valid /cmd_vel
+    send_timeout: 0.01      # bounded CAN socket write wait, seconds
+    max_linear_speed: 1.00  # m/s
+    max_angular_speed: 0.80 # rad/s
+    shutdown_stop_count: 5

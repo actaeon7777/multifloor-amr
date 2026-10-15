@@ -1,0 +1,26 @@
+runtime/
+build/
+install/
+log/
+logs/
+bags/
+diagnostics/
+backups/
+releases/
+sim/assets/
+sim/generated/
+sim/amr_flat_test.usda
+reports/*.png
+reports/import_cache.json
+reports/scene_build.json
+reports/verified_artifacts.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+reports/trials/
+
+
+# Rendered demo outputs (frames/videos, GBs)
+reports/demo_*/

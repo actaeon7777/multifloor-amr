@@ -1,0 +1,118 @@
+{
+  "implementation_status": "PC closed-loop infrastructure implemented; performance qualification incomplete",
+  "real_calibration": "deferred by user; no physical measurements invented",
+  "baseline_commit": "652068c",
+  "baseline_tag": "baseline-before-sim2real",
+  "build_packages": 11,
+  "colcon_tests": {
+    "total": 335,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 37
+  },
+  "focused_tool_model_tests_passed": 9,
+  "ros_integration": {
+    "navigation_manager": {
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "localization": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "ekf": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "manual": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "telemetry": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "can_bridge": {
+      "tests": 4,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "web_ui": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "nav2_pipeline": {
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "physical_simulation_bridge": "DDS cmd_vel to wheel joints and real PhysX wheel/IMU/raycast sensor outputs verified",
+  "recorded_straight_trial": {
+    "fixed_inputs_sha256": "23c9a3fa2eea16861b046aafe8ed39280f20226e41a5a8fd5fb3a528428a2f51",
+    "passed": true,
+    "calibration_status": "uncalibrated",
+    "seed": 0,
+    "goal": [
+      2.0,
+      0.0,
+      0.0
+    ],
+    "world": "arena",
+    "action_status": 4,
+    "goal_succeeded": true,
+    "stopped": true,
+    "recoveries": 0,
+    "simulation": {
+      "state": "running",
+      "calibration_status": "uncalibrated",
+      "sim_time": 27.134999393485487,
+      "real_time_factor": 0.9923968096884888,
+      "sensor_counts": {
+        "wheel": 268,
+        "imu": 272,
+        "scan": 238,
+        "truth": 543
+      },
+      "sensor_model": "provisional-v1",
+      "obstacle_contact_events": 0
+    },
+    "command_timing": {
+      "samples": 374,
+      "mean_period_s": 0.049865934061498966,
+      "max_period_s": 0.07993654500023695,
+      "over_75ms": 1
+    }
+  },
+  "corner_observation": {
+    "goal_reached": true,
+    "obstacle_contact_events": 1,
+    "control_intervals_over_75ms": 2,
+    "candidate_gate_passed": false
+  },
+  "ground_truth_to_localization": false,
+  "dwb_parameters_changed": false,
+  "candidate_selected": false,
+  "real_robot_deployed": false,
+  "remaining": [
+    "Fix and qualify control timing/localization discontinuity before comparative tuning",
+    "Run every scenario five times and final candidate with ten sensor seeds; no complete sweep yet",
+    "Identify and validate real actuator/sensor response when physical data is available",
+    "Read live Jetson/ODrive/STM32 identities; build and compare on physical robot"
+  ],
+  "raw_records": "reports/trials (ignored by Git; retained locally)"
+}

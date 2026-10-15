@@ -1,0 +1,14 @@
+# Entire known map and a stationary observation. No pose prior is accepted.
+nav_msgs/OccupancyGrid map
+sensor_msgs/LaserScan scan
+uint32 max_candidates
+float64 timeout_sec
+---
+bool success
+string message
+# LASER poses in map coordinates, stamped with the input scan timestamp.
+# No base-frame conversion and no TF or /initialpose publication by this server.
+geometry_msgs/PoseStamped[] poses
+# TIM TAM scores, descending, [0,1]; diagnostics, not calibrated probabilities.
+float64[] scores
+float64 elapsed_sec

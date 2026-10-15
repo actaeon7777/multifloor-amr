@@ -7,6 +7,16 @@
 > `diagnostics/`는 Jetson 작업공간, 나머지는 시뮬레이션 PC 작업공간에 있다. 아래 경로는 그 기준이다.
 > 시뮬레이션 수치는 실물 보정 전 모델(`calibration_status: uncalibrated`)의 결과이며 실차 성능으로 확정하지 않는다.
 
+## 2026-10-16 · 시뮬레이션 센서 주기를 실물에 맞춤
+
+- `sim/config/sensors.json` 휠 10→100 Hz, LiDAR 8.8→10 Hz (실물 bag `012425` 기준, IMU 10 Hz는 그대로). 10/04에 같은 변경을 했으나
+  10/13 병합 때 PC 쪽 이전 값이 들어와 되돌아가 있었다.
+- Isaac headless 스모크 시험(floor4, 6초): 휠 100.08 Hz, IMU 10.01 Hz, LiDAR 10.00 Hz(시뮬레이션 시간), 스캔 3,240점 전부 유효, 명령 단절 정지 통과.
+  짧은 시험의 RTF는 0.876.
+- arena 폐루프 시험(Nav2): 도착 3.4 cm, 경로 오차 RMS 1.2 cm, 충돌·복구·명령 제한 위반 0, 센서 공백 0, 명령 주기 평균 49.9 ms(75 ms 초과 0),
+  `valid_for_comparison: true` (`reports/trials/rates_100_10_arena_004349/`).
+- 10/13~14의 층간 이동 시나리오·호실 주행 결과는 이전 주기(휠 10 Hz, LiDAR 8.8 Hz)에서 측정한 값이다.
+
 ## 2026-10-16 · 중앙 관제 경유 층간 이동
 
 - 관제 서버가 10/07에 복사해 둔 웹 UI 사본(`Control_Server/vendor/`)을 쓰고 있어 층 기능이 보이지 않았다.
@@ -143,7 +153,7 @@
   LaserScan은 3,240점, 0.05–30 m 선언.
 - 당시 `sim/config/sensors.json`의 휠 10→100 Hz, LiDAR 8.8→10 Hz로 바꾸고 Isaac 6초 headless 검사(휠 100.083 Hz, IMU 10.008 Hz,
   LiDAR 10.000 Hz, RTF 0.965)와 관련 시험 37개를 통과했다 (`reports/sensor_alignment_012425/`).
-- **주의**: 현재 저장소의 `sensors.json`은 휠 10 Hz·LiDAR 8.8 Hz다. 병합 때 PC 쪽 이전 값이 들어온 것으로 보이며 재확인이 필요하다.
+- 이 값은 10/13 병합 때 되돌아갔다가 10/16에 다시 적용했다.
 
 ## 2026-10-04 · 바닥 접촉 불안정 (시뮬레이션)
 

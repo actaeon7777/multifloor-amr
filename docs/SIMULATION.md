@@ -102,8 +102,8 @@ ROS_DOMAIN_ID=107 ros2 launch amr_web_ui web_ui.launch.py use_sim_time:=true por
 - LiDAR: PhysX 충돌 형상에 대한 회전 스캔, 3,240점, 0.05–30 m, `laser` 프레임. 각 광선 취득 시각의 센서 자세를 반영하고
   첫 광선 시각을 stamp로, `time_increment = scan_time / (N-1)`을 쓴다([LaserScan 정의](https://github.com/ros2/common_interfaces/blob/jazzy/sensor_msgs/msg/LaserScan.msg)).
   200 Hz 물리 단계로 광선 시점을 양자화한다. 0.4 m/s·0.6 rad/s에서 한 스캔 동안 약 4 cm·3.4°가 바뀌므로 회전 스캔 시점을 무시하지 않는다.
-- 주기·노이즈는 `sim/config/sensors.json`이 정한다(현재 휠 10 Hz, IMU 10 Hz, LiDAR 8.8 Hz, 노이즈 0).
-  2026-10-04에 실물 bag 기준 휠 100 Hz·LiDAR 10 Hz로 맞췄다는 기록이 있으나 현재 파일 값과 다르다([실험 기록](EXPERIMENTS.md#2026-10-04--센서-주기-정합-시뮬레이션)). 재확인이 필요하다.
+- 주기·노이즈는 `sim/config/sensors.json`이 정한다. ROS 발행 주기는 실물 bag에 맞춘 휠 100 Hz, IMU 10 Hz, LiDAR 10 Hz이고 노이즈는 0이다.
+  원시 CAN 갱신률이나 노이즈·지연·접촉 물리를 보정했다는 뜻은 아니다([실험 기록](EXPERIMENTS.md#2026-10-16--시뮬레이션-센서-주기를-실물에-맞춤)).
 - 시뮬레이션 EKF는 `predict_to_current_time=true`(실물 기본값 false)로 측정 사이 상태를 현재 시각으로 예측해 30 Hz TF를 낸다.
 
 ### 조이스틱

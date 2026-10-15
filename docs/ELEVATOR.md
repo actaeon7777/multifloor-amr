@@ -278,7 +278,7 @@ python3 scripts/run_floor_suite.py --output logs/elevator/<새 폴더> [--scenar
 
 ### 시나리오 결과 (2026-10-14)
 
-원자료 `logs/elevator/final_20261014/` (시뮬레이션 PC). **11/11 통과.**
+원자료 `logs/elevator/final_20261014/` (시뮬레이션 PC). **11/11 통과.** 센서 주기를 실물에 맞추기 전(휠 10 Hz, LiDAR 8.8 Hz) 조건이다.
 
 | 시나리오 | 경로 | 주입 고장 | 기대 | 결과 | 도착 오차 m | 소요 s |
 |---|---|---|---|---|---|---|

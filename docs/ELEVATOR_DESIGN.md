@@ -266,6 +266,7 @@ action/NavigateToFloorPose.action
 
 `/floor_mission/status`는 기존 `/localization/status`, `/navigation/status`와 같은 JSON String 관례를 따른다.
 `VehicleStatus` 메시지에는 이번 단계에서 층 필드를 추가하지 않는다 (중앙 관제 스키마 영향 회피). 웹 UI는 `/floor/state`를 직접 구독한다.
+중앙 관제 경유는 `amr_remote_bridge`가 `/api/floors`와 층 지도(`floor/<층>` 레이어)를 함께 전달하고, 다른 층 목표는 그 층 지도의 버전·해시로 검증한다 (2026-10-16).
 
 ### 4.3 실차 전송 경로와 CAN 프레임 제안 (**ID·페이로드 미확정 · TODO**)
 

@@ -13,9 +13,9 @@ import threading
 import time
 from uuid import uuid4
 
-from .common import (COMMANDS, LAYERS, MAX_COMMAND, MAX_MESSAGE, PROTOCOL_VERSION,
-                     REQUEST_ID, HttpClient, base_url, dumps, identifier, loads,
-                     positive, read_token)
+from .common import (COMMANDS, LAYERS, MAX_COMMAND, MAX_FLOORS, MAX_MESSAGE, PROTOCOL_VERSION,
+                     REQUEST_ID, HttpClient, base_url, dumps, floor_layer, floor_map_version,
+                     identifier, layer_floor, loads, positive, read_token, valid_layer)
 
 
 LOG = logging.getLogger(__name__)
@@ -40,8 +40,39 @@ class Agent:
         self.results = OrderedDict()
         self.executed = OrderedDict()
         self.round_trip = 0
-        self.layer_cursor = 0
+        self.layer_attempts = {}
         self.exchange_metrics = {}
+        # Multi-floor: the local /api/floors document (None without floor support).
+        self.floors = None
+        self.floors_checked = None
+
+    def layer_url(self, name):
+        floor = layer_floor(name)
+        return self.local_url + (f'/api/floors/{floor}/map.png' if floor else f'/api/layers/{name}.png')
+
+    def layer_version(self, name, state):
+        floor = layer_floor(name)
+        if floor:
+            return floor_map_version(self.floors, floor)
+        return state['layers'].get(name, {}).get('version')
+
+    def read_floors(self):
+        """Refresh the floor list at the layer cadence; a web UI without floors answers 404."""
+        now = time.monotonic()
+        if self.floors_checked is not None and now - self.floors_checked < self.layer_refresh:
+            return
+        self.floors_checked = now
+        try:
+            status, _, body = self.http.request(self.local_url + '/api/floors', timeout=self.timeout,
+                                                limit=256 * 1024)
+            floors = loads(body) if status == 200 else None
+            if floors is not None and not (isinstance(floors, dict) and isinstance(floors.get('floors'), list)
+                                           and len(floors['floors']) <= MAX_FLOORS):
+                raise ValueError('Invalid local /api/floors response')
+        except Exception as exc:
+            LOG.warning('Local floor list unavailable (%s); state exchange continues', type(exc).__name__)
+            floors = None
+        self.floors = floors
 
     def collect(self):
         def read_state():
@@ -56,6 +87,7 @@ class Agent:
 
         started = time.monotonic()
         self.exchange_metrics = dict(phase='local_state', host_http_status=None)
+        self.read_floors()
         state, captured = read_state()
         updates = {}
         pending = []
@@ -66,19 +98,29 @@ class Agent:
             cached = self.layer_cache.get(name)
             if not cached or cached[0] != info.get('version') or time.monotonic()-cached[1] >= self.layer_refresh:
                 pending.append((name, info))
-        # Large/rolling PNGs must not age a single state through three serial
-        # image requests. Serve one pending layer per cycle, fairly, then capture
-        # the current state. Images whose version changed are discarded.
+        # Floor maps are static files: upload once per version, or again when the host asks.
+        for entry in (self.floors or {}).get('floors', ()):
+            if not isinstance(entry, dict) or not isinstance(entry.get('map'), dict):
+                continue
+            try:
+                name = floor_layer(entry.get('name'))
+            except ValueError:
+                continue
+            cached = self.layer_cache.get(name)
+            if not cached or cached[0] != entry['map'].get('version'):
+                pending.append((name, entry['map']))
+        # Large/rolling PNGs must not age a single state through several serial
+        # image requests. Serve one pending layer per cycle, least recently tried
+        # first, then capture the current state. Images whose version changed are discarded.
         image_started = time.monotonic()
         if pending:
             # The map is needed to validate coordinate commands after restart.
             name, info = next((item for item in pending if item[0] == 'map'),
-                              pending[self.layer_cursor % len(pending)])
-            self.layer_cursor += 1
+                              min(pending, key=lambda item: self.layer_attempts.get(item[0], 0)))
+            self.layer_attempts[name] = time.monotonic()
             try:
-                status, headers, png = self.http.request(
-                    self.local_url + f'/api/layers/{name}.png', timeout=self.timeout,
-                    limit=2 * 1024 * 1024)
+                status, headers, png = self.http.request(self.layer_url(name), timeout=self.timeout,
+                                                         limit=2 * 1024 * 1024)
                 actual = next((v for k, v in headers.items() if k.lower() == 'x-map-version'), None)
                 if status == 200 and actual == str(info.get('version')) and png.startswith(b'\x89PNG\r\n\x1a\n'):
                     updates[name] = dict(version=info['version'], png=base64.b64encode(png).decode('ascii'))
@@ -86,7 +128,7 @@ class Agent:
                 LOG.warning('Local map layer %s unavailable (%s); state exchange continues', name, type(exc).__name__)
             state, captured = read_state()
             updates = {name: image for name, image in updates.items()
-                       if state['layers'].get(name, {}).get('version') == image['version']}
+                       if self.layer_version(name, state) == image['version']}
         self.exchange_metrics = dict(phase='host_exchange', collect_ms=1000*(time.monotonic()-started),
                                      image_ms=1000*(time.monotonic()-image_started),host_http_status=None)
         return state, updates, captured
@@ -99,10 +141,12 @@ class Agent:
             self.results[command_id] = self.executed[command_id]
             return
         kind, payload, ttl = command.get('kind'), command.get('payload'), command.get('ttl')
+        # Hosts before floor support omit map_layer: the pose then refers to the live map.
+        map_layer = command.get('map_layer', 'map')
         if (kind not in COMMANDS or not isinstance(payload, dict) or
                 not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or
                 not math.isfinite(ttl) or len(dumps(payload)) > MAX_COMMAND or
-                payload.get('request_id') != command_id):
+                payload.get('request_id') != command_id or not valid_layer(map_layer)):
             raise ValueError('Invalid command from host')
         # Subtract the entire exchange RTT; this is conservative and needs no clock synchronization.
         if self.stop.is_set():
@@ -116,7 +160,7 @@ class Agent:
                 local_started = time.monotonic()
                 if kind in ('goal', 'initialpose') or (kind == 'relocalize' and 'map_version' in payload):
                     status, headers, png = self.http.request(
-                        self.local_url + '/api/layers/map.png', timeout=min(self.timeout, ttl - round_trip),
+                        self.layer_url(map_layer), timeout=min(self.timeout, ttl - round_trip),
                         limit=2 * 1024 * 1024)
                     version = next((v for k, v in headers.items() if k.lower() == 'x-map-version'), None)
                     if (status != 200 or version != str(payload.get('map_version')) or
@@ -151,13 +195,15 @@ class Agent:
         except Exception as exc:
             state, updates, captured = None, {}, time.monotonic()
             self.layer_cache.clear()
+            self.floors, self.floors_checked = None, None
             # The central UI must become unavailable, rather than keep old data looking live.
             error = type(exc).__name__ + ': local web API unavailable'
         self.sequence += 1
         envelope = dict(protocol=PROTOCOL_VERSION, robot_id=self.robot_id,
                         session_id=self.session_id, sequence=self.sequence, state=state,
                         state_age=time.monotonic() - captured + self.round_trip,
-                        layers=updates, results=list(self.results.values()), local_error=error)
+                        layers=updates, results=list(self.results.values()), local_error=error,
+                        floors=self.floors if state is not None else None)
         self.exchange_metrics.update(payload_bytes=len(dumps(envelope)), state_age=envelope['state_age'])
         if self.exchange_metrics['payload_bytes'] > MAX_MESSAGE:
             raise ValueError('Telemetry exceeds 8 MiB; reduce local map/scan data size')

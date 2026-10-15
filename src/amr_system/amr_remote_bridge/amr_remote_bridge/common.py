@@ -13,6 +13,9 @@ PROTOCOL_VERSION = 1
 MAX_MESSAGE = 8 * 1024 * 1024
 MAX_COMMAND = 4096
 LAYERS = frozenset(('map', 'local_costmap', 'global_costmap'))
+# Static maps of other floors travel as layers named 'floor/<floor>' (see /api/floors).
+FLOOR_LAYER = 'floor/'
+MAX_FLOORS = 16
 COMMANDS = frozenset(('goal', 'initialpose', 'cancel', 'relocalize'))
 AGED_FIELDS = ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization')
 IDENTIFIER = re.compile(r'[A-Za-z0-9_-]{1,64}')
@@ -23,6 +26,34 @@ def identifier(value):
     if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
         raise ValueError('robot_id must contain 1-64 letters, digits, underscores or hyphens')
     return value
+
+
+def floor_layer(name):
+    return FLOOR_LAYER + identifier(name)
+
+
+def layer_floor(name):
+    """The floor of a 'floor/<floor>' layer name, or None for a live layer."""
+    if isinstance(name, str) and name.startswith(FLOOR_LAYER):
+        return identifier(name[len(FLOOR_LAYER):])
+    return None
+
+
+def valid_layer(name):
+    try:
+        return name in LAYERS or layer_floor(name) is not None
+    except ValueError:
+        return False
+
+
+def floor_map_version(floors, floor):
+    """Source version of a floor's static map from an /api/floors document, or None."""
+    if not isinstance(floors, dict):
+        return None
+    for entry in floors.get('floors', ()):
+        if isinstance(entry, dict) and entry.get('name') == floor and isinstance(entry.get('map'), dict):
+            return entry['map'].get('version')
+    return None
 
 
 def positive(value):

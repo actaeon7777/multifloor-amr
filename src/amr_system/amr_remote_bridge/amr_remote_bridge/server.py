@@ -14,8 +14,9 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .common import (AGED_FIELDS, COMMANDS, LAYERS, MAX_COMMAND, MAX_MESSAGE, PROTOCOL_VERSION,
-                     REQUEST_ID, dumps, identifier, loads, positive, read_token)
+from .common import (AGED_FIELDS, COMMANDS, FLOOR_LAYER, LAYERS, MAX_COMMAND, MAX_FLOORS, MAX_MESSAGE,
+                     PROTOCOL_VERSION, REQUEST_ID, dumps, floor_layer, floor_map_version, identifier,
+                     layer_floor, loads, positive, read_token)
 
 DISPLAY_FIELDS = ('scan', 'wheel', 'imu', 'ekf', 'joints', 'command', 'diagnostics', 'power',
                   'vehicle', 'pose', 'localization', 'time', 'battery')
@@ -50,6 +51,7 @@ class Command:
     payload: dict
     deadline: float
     map_digest: str = ''
+    map_layer: str = 'map'
     status: str = 'QUEUED'
     result: dict | None = None
     event: threading.Event = field(default_factory=threading.Event)
@@ -64,6 +66,7 @@ class Robot:
     captured: float | None = None
     state: dict | None = None
     local_error: str | None = None
+    floors: dict | None = None
     layers: dict = field(default_factory=dict)
     revisions: dict = field(default_factory=dict)
     commands: OrderedDict = field(default_factory=OrderedDict)
@@ -82,6 +85,49 @@ class Registry:
         return (robot.state is not None and robot.captured is not None and
                 robot.last_exchange is not None and now - robot.captured < self.stale_after and
                 now - robot.last_exchange < self.stale_after)
+
+    @staticmethod
+    def _validate_floors(floors):
+        """The agent forwards the local /api/floors document; only what the relay relies on is checked."""
+        if floors is None:
+            return None
+        if not isinstance(floors, dict) or not isinstance(floors.get('floors'), list) or len(floors['floors']) > MAX_FLOORS:
+            raise ApiError(400, 'Invalid floor list')
+        names = set()
+        for entry in floors['floors']:
+            if not isinstance(entry, dict):
+                raise ApiError(400, 'Invalid floor entry')
+            name = entry.get('name')
+            try:
+                identifier(name)
+            except ValueError:
+                raise ApiError(400, 'Invalid floor name') from None
+            if name in names:
+                raise ApiError(400, 'Duplicate floor name')
+            names.add(name)
+            layer = entry.get('map')
+            if layer is not None and (not isinstance(layer, dict) or not isinstance(layer.get('version'), int)
+                                      or isinstance(layer.get('version'), bool)):
+                raise ApiError(400, 'Invalid floor map metadata')
+        return deepcopy(floors)
+
+    @staticmethod
+    def _source_version(state, floors, name):
+        """Version the AMR currently reports for a live or floor layer, or None."""
+        floor = layer_floor(name)
+        if floor:
+            return floor_map_version(floors, floor)
+        info = state['layers'].get(name)
+        return info['version'] if info else None
+
+    @staticmethod
+    def _current_floor(state):
+        # Same rule as the UI: while riding, the live map is still the departure floor's.
+        floor = state.get('floor') if isinstance(state, dict) else None
+        if not isinstance(floor, dict):
+            return None
+        current = floor.get('floor') or floor.get('transit_from')
+        return current if isinstance(current, str) else None
 
     @staticmethod
     def _finish(command, status, body):
@@ -128,12 +174,17 @@ class Registry:
         updates, results = message.get('layers', {}), message.get('results', [])
         if not isinstance(updates, dict) or not isinstance(results, list) or len(results) > 256:
             raise ApiError(400, 'Invalid exchange contents')
+        floors = self._validate_floors(message.get('floors')) if state is not None else None
         decoded = {}
         for name, image in updates.items():
-            if name not in LAYERS or not isinstance(image, dict) or state is None:
+            try:
+                known = name in LAYERS or layer_floor(name) is not None
+            except ValueError:
+                known = False
+            if not known or not isinstance(image, dict) or state is None:
                 raise ApiError(400, 'Invalid layer update')
-            info = state['layers'].get(name)
-            if not info or image.get('version') != info['version']:
+            version = self._source_version(state, floors, name)
+            if version is None or image.get('version') != version:
                 raise ApiError(400, 'Layer image does not match its metadata')
             try:
                 png = base64.b64decode(image['png'], validate=True)
@@ -141,7 +192,7 @@ class Registry:
                 raise ApiError(400, 'Invalid layer encoding') from None
             if len(png) > 2 * 1024 * 1024 or not png.startswith(b'\x89PNG\r\n\x1a\n'):
                 raise ApiError(400, 'Invalid or oversized PNG')
-            decoded[name] = dict(source_version=info['version'], png=png,
+            decoded[name] = dict(source_version=version, png=png,
                                  digest=hashlib.sha256(png).hexdigest())
         for result in results:
             if (not isinstance(result, dict) or not isinstance(result.get('command_id'), str) or
@@ -168,6 +219,7 @@ class Registry:
                 raise ApiError(409, 'Exchange sequence has already been used')
             robot.sequence, robot.last_exchange = sequence, now
             robot.state = deepcopy(state)
+            robot.floors = floors
             robot.captured = now - age if state is not None else None
             robot.local_error = 'Local web API unavailable' if state is None else None
             for name, image in decoded.items():
@@ -193,12 +245,16 @@ class Registry:
                         command.status = 'SENT'
                         commands.append(dict(command_id=command.command_id, kind=command.kind,
                                              payload=command.payload, map_digest=command.map_digest,
-                                             ttl=command.deadline - now))
+                                             map_layer=command.map_layer, ttl=command.deadline - now))
                         break
             needed = []
             if state is not None:
-                needed = [name for name, info in state['layers'].items()
-                          if name not in robot.layers or robot.layers[name]['source_version'] != info['version']]
+                expected = {name: info['version'] for name, info in state['layers'].items()}
+                for entry in (floors or {}).get('floors', ()):
+                    if entry.get('map') is not None:
+                        expected[floor_layer(entry['name'])] = entry['map']['version']
+                needed = [name for name, version in expected.items()
+                          if name not in robot.layers or robot.layers[name]['source_version'] != version]
             return dict(protocol=PROTOCOL_VERSION, session_id=session_id, sequence=sequence,
                         commands=commands, accepted_results=accepted_results,
                         accepted_layers=list(decoded), needed_layers=needed)
@@ -231,13 +287,35 @@ class Registry:
             result['remote'] = dict(robot_id=robot_id, age=extra_age, timeout=self.stale_after)
             return result
 
+    def _current_layer(self, robot, name):
+        """The cached image for a layer whose version the AMR still reports, else None."""
+        image = robot.layers.get(name)
+        if image is None or image['source_version'] != self._source_version(robot.state, robot.floors, name):
+            return None
+        return image
+
     def layer(self, robot_id, name):
         with self.lock:
-            snapshot = self.snapshot(robot_id)
-            if name not in snapshot['layers']:
+            self.snapshot(robot_id)  # Freshness check only.
+            image = self._current_layer(self.robots[robot_id], name)
+            if image is None:
                 raise ApiError(404, '지도 레이어를 기다리고 있습니다.')
-            image = self.robots[robot_id].layers[name]
             return image['png'], image['version']
+
+    def floors(self, robot_id):
+        """The AMR's floor list with floor map versions translated to host revisions."""
+        with self.lock:
+            snapshot = self.snapshot(robot_id)
+            robot = self.robots[robot_id]
+            if robot.floors is None:
+                raise ApiError(404, '층 설정이 없습니다.')
+            result = deepcopy(robot.floors)
+            for entry in result['floors']:
+                image = self._current_layer(robot, floor_layer(entry['name'])) if entry.get('map') else None
+                # The UI loads a floor's map only once its image has arrived here.
+                entry['map'] = dict(entry['map'], version=image['version']) if image else None
+            result['current_floor'] = self._current_floor(snapshot) or result.get('current_floor')
+            return result
 
     def queue(self, robot_id, kind, payload):
         if kind not in COMMANDS or not isinstance(payload, dict):
@@ -255,6 +333,14 @@ class Registry:
         elif kind == 'relocalize' and 'map_version' in payload:
             if type(payload['map_version']) is not int:
                 raise ApiError(400, '유효한 지도 버전이 필요합니다.')
+        floor, room = payload.get('floor'), payload.get('room', '')
+        if floor is not None or room:
+            if kind != 'goal' or not isinstance(floor, str) or not isinstance(room, str) or len(room) > 32:
+                raise ApiError(400, '층과 호실 정보가 올바르지 않습니다.')
+            try:
+                identifier(floor)
+            except ValueError:
+                raise ApiError(400, '층과 호실 정보가 올바르지 않습니다.') from None
         now = time.monotonic()
         with self.lock:
             robot = self.robots.get(robot_id)
@@ -271,8 +357,18 @@ class Registry:
             if any(command.result is None for command in robot.commands.values()):
                 raise ApiError(409, '이전 원격 요청을 처리 중입니다. 잠시 기다려 주세요.')
             forwarded = deepcopy(payload)
-            digest = ''
-            if kind != 'cancel':
+            digest, layer_name = '', 'map'
+            if kind == 'goal' and floor is not None and floor != self._current_floor(state):
+                # A destination on another floor was chosen on that floor's static map.
+                layer_name = floor_layer(floor)
+                image = self._current_layer(robot, layer_name)
+                if image is None:
+                    raise ApiError(409, f'{floor} 지도를 기다리고 있습니다. 잠시 후 다시 선택해 주세요.')
+                if image['version'] != payload.get('map_version'):
+                    raise ApiError(409, '지도가 갱신되었습니다. 목적지를 다시 선택해 주세요.')
+                forwarded['map_version'] = image['source_version']
+                digest = image['digest']
+            elif kind != 'cancel':
                 info = state['layers'].get('map')
                 # Relocalization has no pose and can be requested before a map
                 # arrives. When one exists it must use the displayed revision.
@@ -284,7 +380,8 @@ class Registry:
                 if info:
                     forwarded['map_version'] = robot.layers['map']['source_version']
                     digest = robot.layers['map']['digest']
-            command = Command(request_id, kind, signature, forwarded, now + self.command_timeout, digest)
+            command = Command(request_id, kind, signature, forwarded, now + self.command_timeout,
+                              digest, layer_name)
             robot.commands[request_id] = command
             while len(robot.commands) > 256:
                 robot.commands.popitem(last=False)
@@ -396,6 +493,12 @@ def create_server(registry, assets, token, host='127.0.0.1', port=8081, default_
                     self.respond(200, dict(robots=registry.roster()))
                 elif path == '/api/state':
                     self.respond(200, registry.snapshot(robot_id))
+                elif path == '/api/floors':
+                    self.respond(200, registry.floors(robot_id))
+                elif path.startswith('/api/floors/') and path.endswith('/map.png'):
+                    name = path[len('/api/floors/'):-len('/map.png')]
+                    png, version = registry.layer(robot_id, floor_layer(name))
+                    self.respond(200, png, 'image/png', {'X-Map-Version': version})
                 elif path.startswith('/api/layers/') and path.endswith('.png'):
                     name = path[len('/api/layers/'):-4]
                     if name not in LAYERS:

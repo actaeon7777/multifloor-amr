@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
@@ -97,6 +98,26 @@ def system():
 
 def payload(request_id='remote_request_001', **kwargs):
     return dict(request_id=request_id, x=.5, y=.5, yaw=.3, map_version=1, **kwargs)
+
+
+def enable_floors(shared):
+    """Two floors without amr_stack: static grids injected the way floor_grid() caches them."""
+    rooms = {'302': SimpleNamespace(room_id='302', goal=(1.5, .5, 0.))}
+    floors = {'3F': SimpleNamespace(name='3F', level=3, real_enabled=False, provisional_copy_of='4F', rooms=rooms),
+              '4F': SimpleNamespace(name='4F', level=4, real_enabled=True, provisional_copy_of=None, rooms={})}
+
+    def floor(name):
+        if name not in floors:
+            raise ValueError(name)
+        return floors[name]
+
+    shared.building = SimpleNamespace(floors=floors, default_floor='4F', floor=floor)
+    shared.simulation = True
+    for name, version in (('3F', 3003), ('4F', 4004)):
+        grid = Grid(3, 2, 1, [0, 0, 0], [0, 0, 0, 0, 0, 100])
+        grid.version, grid.floor = version, name
+        shared.floor_grids[name] = grid
+    shared.state.update(floor=dict(zone=1, floor='4F', confidence='BEACON'), floor_action_ready=True)
 
 
 def test_telemetry_images_and_original_ui_are_served(system):
@@ -461,3 +482,63 @@ def test_amr_publisher_expiry_is_not_hidden_by_live_relay(system):
     assert not state['telemetry']['wheel']['fresh']
     assert state['telemetry']['wheel']['source_age'] >= 1.
     assert state['telemetry']['wheel']['hz'] is None
+
+
+def test_floor_list_maps_and_cross_floor_goals_are_relayed(system):
+    shared, registry = system['shared'], system['registry']
+    enable_floors(shared)
+    system['start']()
+    wait_for(lambda: all(f['map'] for f in registry.floors('amr-01')['floors']))
+    status, _, body = system['request']('/robots/amr-01/api/floors')
+    floors = loads(body)
+    assert status == 200 and [f['name'] for f in floors['floors']] == ['3F', '4F']
+    assert floors['current_floor'] == '4F' and floors['default_floor'] == '4F'
+    assert floors['floors'][0]['map']['version'] == 1 and floors['floors'][0]['map']['width'] == 3
+    assert floors['floors'][0]['rooms'] == [dict(id='302', x=1.5, y=.5, yaw=0.)]
+    status, headers, png = system['request']('/robots/amr-01/api/floors/3F/map.png')
+    assert status == 200 and headers['X-Map-Version'] == '1' and png == shared.floor_grids['3F'].png
+    assert system['request']('/api/floors/9F/map.png')[0] == 404
+    # Another floor: the pose is checked against that floor's static map, not the live map.
+    command = dict(request_id='remote_floor_goal_01', x=1.5, y=.5, yaw=0., map_version=1, floor='3F', room='302')
+    status, _, body = system['request']('/api/goal', command)
+    assert status == 202 and loads(body)['kind'] == 'floor_goal'
+    assert system['calls'] == [('goal', dict(command, map_version=3003))]
+    assert shared.state['goal']['floor'] == '3F' and shared.state['goal']['room'] == '302'
+    # The robot's own floor keeps using the live map revision (host 1 -> source 17).
+    same = dict(request_id='remote_floor_goal_02', x=.5, y=.5, yaw=.3, map_version=1, floor='4F', room='')
+    assert system['request']('/api/goal', same)[0] == 202
+    assert system['calls'][-1] == ('goal', dict(same, map_version=17))
+    assert system['request']('/api/goal', dict(command, request_id='remote_floor_goal_03', map_version=2))[0] == 409
+    assert system['request']('/api/goal', dict(command, request_id='remote_floor_goal_04', floor='9F'))[0] == 409
+    assert system['request']('/api/initialpose', dict(payload('remote_floor_pose_01'), floor='3F'))[0] == 400
+    assert len(system['calls']) == 2
+    # A host that lost the image asks for it again and publishes a new revision.
+    registry.robots['amr-01'].layers.pop('floor/3F')
+    wait_for(lambda: registry.floors('amr-01')['floors'][0]['map'])
+    assert registry.floors('amr-01')['floors'][0]['map']['version'] == 2
+
+
+def test_agent_checks_the_floor_map_digest_for_cross_floor_goals(system):
+    agent, shared = system['agent'], system['shared']
+    enable_floors(shared)
+    body = dict(request_id='direct_floor_01', x=1.5, y=.5, yaw=0., map_version=3003, floor='3F', room='302')
+    command = dict(command_id='direct_floor_01', kind='goal', ttl=1, payload=body,
+                   map_layer='floor/3F', map_digest='wrong')
+    agent.execute(command, 0)
+    assert agent.results['direct_floor_01']['http_status'] == 409 and not system['calls']
+    command.update(command_id='direct_floor_02', payload=dict(body, request_id='direct_floor_02'),
+                   map_digest=hashlib.sha256(shared.floor_grids['3F'].png).hexdigest())
+    agent.execute(command, 0)
+    assert agent.results['direct_floor_02']['http_status'] == 202
+    assert system['calls'] == [('goal', command['payload'])]
+    with pytest.raises(ValueError):
+        agent.execute(dict(command, command_id='direct_floor_03', map_layer='../etc',
+                           payload=dict(body, request_id='direct_floor_03')), 0)
+
+
+def test_single_floor_robot_has_an_empty_floor_list(system):
+    system['start']()
+    status, _, body = system['request']('/api/floors')
+    assert status == 200 and loads(body)['floors'] == [] and loads(body)['current_floor'] is None
+    assert system['request']('/api/goal', dict(payload('no_floor_goal_01'), floor='3F'))[0] == 409
+    assert not system['calls']

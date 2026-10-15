@@ -5,7 +5,7 @@ import anyio
 from fastapi import FastAPI, Request
 from starlette.exceptions import HTTPException
 
-from amr_remote_bridge.common import COMMANDS, LAYERS, MAX_COMMAND, MAX_MESSAGE, identifier
+from amr_remote_bridge.common import COMMANDS, LAYERS, MAX_COMMAND, MAX_MESSAGE, floor_layer, identifier
 from amr_remote_bridge.server import ApiError, Registry
 from .config import Settings
 from .http import authenticate, read_message, respond
@@ -90,6 +90,12 @@ def create_app(settings=None, registry=None):
             return respond(200, {'robots': await run(registry.roster)})
         if route == '/api/state':
             return respond(200, await run(registry.snapshot, robot_id))
+        if route == '/api/floors':
+            return respond(200, await run(registry.floors, robot_id))
+        if route.startswith('/api/floors/') and route.endswith('/map.png'):
+            name = route[len('/api/floors/'):-len('/map.png')]
+            png, version = await run(registry.layer, robot_id, floor_layer(name))
+            return respond(200, png, 'image/png', {'X-Map-Version': str(version)})
         if route.startswith('/api/layers/') and route.endswith('.png'):
             name = route[len('/api/layers/'):-4]
             if name not in LAYERS:

@@ -5,7 +5,7 @@
 그대로 쓰므로 `Control_Server/`만 따로 복사하지 말고 저장소 전체를 받아 둔다.
 
 ```bash
-cd /home/kim/Control_Server
+cd ~/multifloor-amr/Control_Server   # 서버 PC에서 저장소를 clone한 위치
 .venv/bin/python scripts/serverctl.py start
 ```
 
@@ -16,6 +16,6 @@ AMR 연결과 주행 조작은 [실운용 실행법](../docs/README.md#4-중앙-
 서버를 종료할 때는 아래 명령을 실행한다.
 
 ```bash
-cd /home/kim/Control_Server
+cd ~/multifloor-amr/Control_Server   # 서버 PC에서 저장소를 clone한 위치
 .venv/bin/python scripts/serverctl.py stop
 ```

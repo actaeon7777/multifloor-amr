@@ -1,5 +1,7 @@
 # AMR 실운용 실행법
 
+> 다른 문서: [실차 레퍼런스](REAL_VEHICLE.md) · [위치 추정](LOCALIZATION.md) · [층간 이동](ELEVATOR.md) · [시뮬레이션](SIMULATION.md) · [검증](VALIDATION.md) · [실험 기록](EXPERIMENTS.md)
+
 AMR에서 터미널 2개를 사용한다. 중앙 관제를 사용할 때만 서버와 AMR 터미널 3을 추가한다.
 기본 지도는 G동 4층이다.
 
@@ -67,7 +69,7 @@ MANUAL 복귀 후 수동 주행은 LB를 놓았다가 다시 누른다.
 ### 중앙 서버 PC — 서버 실행
 
 ```bash
-cd /home/kim/Control_Server
+cd ~/multifloor-amr/Control_Server   # 서버 PC에서 저장소를 clone한 위치
 .venv/bin/python scripts/serverctl.py start
 ```
 
@@ -101,6 +103,6 @@ ros2 run amr_remote_bridge remote_client \
 중앙 관제 서버도 종료할 때는 중앙 서버 PC에서 실행한다.
 
 ```bash
-cd /home/kim/Control_Server
+cd ~/multifloor-amr/Control_Server   # 서버 PC에서 저장소를 clone한 위치
 .venv/bin/python scripts/serverctl.py stop
 ```

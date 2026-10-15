@@ -1,6 +1,6 @@
 """floor_mission_manager: navigate to a pose on any floor, riding the elevator.
 
-Real vehicle and simulation share this node. Flow (docs/ELEVATOR_DESIGN.md 3.2):
+Real vehicle and simulation share this node. Flow (docs/ELEVATOR.md 4.4):
 NAV_TO_HALL -> CALL_ELEVATOR -> WAIT_DOOR_OPEN -> BOARDING -> IN_CAR_ALIGN ->
 SELECT_FLOOR -> RIDING -> SWITCH_MAP -> ALIGHTING -> RELOCALIZE -> NAV_TO_GOAL.
 

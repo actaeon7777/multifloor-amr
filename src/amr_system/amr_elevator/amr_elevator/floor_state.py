@@ -3,7 +3,7 @@
 Evidence: hall beacons (RF, 1 Hz, "I am the N-floor beacon"), the acknowledged
 car-floor command, the LiDAR door state, and the robot position relative to the
 car (pose from the last verified localization carried by odometry, plus LiDAR
-enclosure).  Rules (docs/ELEVATOR_DESIGN.md 3.1):
+enclosure).  Rules (docs/ELEVATOR.md 4.2):
 
 * A floor changes only through the car: depart (door closed with an acknowledged
   target) -> arrive (door open + a strong hall beacon).  Outside the car a

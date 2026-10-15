@@ -136,24 +136,26 @@ ros2 launch amr_web_ui web_ui.launch.py use_sim_time:=false host:=127.0.0.1 port
 브라우저 `http://127.0.0.1:8080` → **주행 준비 완료** 확인 후 목표 지정.
 원격 접속(SSH 터널 18080), 중앙 관제(`remote_client`, 8081), 종료 순서는 [docs/README.md](docs/README.md).
 
-### 시뮬레이션 (PC)
+### 배포 (Jetson·관제 서버)
 
-최초 준비 (ROS 2 Jazzy 설치 후):
+Jetson과 관제 서버 PC 모두 이 저장소를 clone해 두고 태그로 버전을 고른다. x86 빌드 결과물은 옮기지 않는다.
 
 ```bash
-sudo apt-get install -y ros-jazzy-navigation2 ros-jazzy-nav2-bringup \
-  ros-jazzy-robot-localization ros-jazzy-test-msgs ros-jazzy-slam-toolbox \
-  ros-jazzy-xacro ros-jazzy-control-msgs liboctomap-dev python3-can
+# PC: 검증한 커밋에 태그
+git tag -a v2026.10.16 -m "..." && git push origin v2026.10.16
+# Jetson: 현재 장치·ROS 설정 기록(읽기만) 후 태그 체크아웃·arm64 빌드 (단위 + CAN dry-run 통합 시험 포함)
+./scripts/inventory_robot.sh /저장경로/robot-inventory
+git fetch --tags && git checkout v2026.10.16 && ./scripts/build_ros.sh
+# 복귀는 이전 태그를 같은 방법으로 체크아웃하고 다시 빌드한다.
 ```
 
-pip Isaac(`~/isaacsim-env`)을 `runtime/isaac-sim-6.1.0`에 연결한다. 다른 설치본을 쓰려면
-`ln -s /설치경로 runtime/isaac-sim-6.1.0` (해당 경로에 `python.sh`·`isaac-sim.sh` 필요).
+관제 서버는 `Control_Server/`만 따로 복사하지 않는다. 웹 UI·중계 코드를 `src/amr_system/`에서 직접 읽는다.
+
+### 시뮬레이션 (PC)
+
+최초 준비(ROS 패키지, Isaac 연결, 장면 생성)는 [docs/SIMULATION.md](docs/SIMULATION.md#1-준비).
 
 ```bash
-scripts/link_pip_isaacsim.sh          # pip Isaac 연결 (최초 1회)
-./scripts/build_ros.sh                # ROS 빌드
-./build_scene.sh                      # 지도·물리 URDF·AMR USD 생성 (필요 시)
-
 ./scripts/experiment.sh sim           # 4층 + 전체 스택 (도메인 107)
 ROS_DOMAIN_ID=107 ros2 launch amr_web_ui web_ui.launch.py use_sim_time:=true port:=8080
 
@@ -165,18 +167,16 @@ python3 scripts/sim_demo.py --room 401 402   # 4층 호실 순회 데모
   (straight, corner_left/right, s_curve, narrow, obstacle).
 - 전체 ROS 프로세스 정리: `ros2kill` (`--dry-run`으로 미리보기).
 - 층간 이동(3F·4F·5F, 엘리베이터): `./scripts/experiment.sh sim world:=building [start_floor:=3F]`,
-  시나리오 `scripts/run_floor_suite.py`. 층 설정 `src/amr_system/amr_stack/config/floors.yaml`, 설계 `docs/ELEVATOR_DESIGN.md`.
+  시나리오 `scripts/run_floor_suite.py`. 층 설정 `src/amr_system/amr_stack/config/floors.yaml`, 설명 [docs/ELEVATOR.md](docs/ELEVATOR.md).
 
-## 7. 현재 상태 (2026-10-14 기준)
+## 7. 현재 상태 (2026-10-16 기준)
 
-- colcon 16개 패키지 빌드, 네이티브 LiDAR 빌드 성공.
-- 단위 테스트 통과: amr_sim_bridge 11, amr_can_bridge 45, amr_vehicle_status 17, amr_stack 67, amr_control 122, amr_web_ui 73.
-- arena 통합 시험: Nav2 목표 도달, RTF 1.0, 복구 0, 충돌 0, 명령 주기 평균 50 ms.
-- 4층 호실 401~406 시뮬레이션 주행 모두 도착 (위치 오차 0.10~0.22 m / 5~7°).
-- 전역 경로 평활화 적용 (Smac2D smoother `w_smooth 0.95`, `w_data 0.02` 등):
-  방향 반전 29→0회, 회전량 약 60% 감소. `navigation.yaml`은 실차와 공용이므로 실차 반영 시 코너 안쪽 여유 확인 필요.
-
-- 층간 이동 시뮬레이션 (2026-10-14): 11개 시나리오 통과, 결과 `logs/elevator/REPORT.md`. 3F·5F는 4층 지도 복사본, 실차 미적용.
+- 단위·HTTP 시험 351개 통과(7개 opt-in ROS 모듈 skip), Control_Server 60개 통과. 네이티브 LiDAR·colcon 빌드 성공.
+- 시뮬레이션: arena·floor4 통합 시험, 4층 호실 401~406 주행, 층간 이동 11개 시나리오 통과([docs/ELEVATOR.md](docs/ELEVATOR.md#시나리오-결과-2026-10-14)).
+  3F·5F는 4층 지도 복사본이며 실차 층간 이동은 꺼져 있다.
+- 중앙 관제(8081)에서도 층 탭·다른 층 호실 지정이 가능하다(2026-10-16).
+- 전역 경로 평활화(`navigation.yaml`, 실차 공용)는 실차 반영 시 코너 안쪽 여유를 확인해야 한다.
+- 실차 주행·BMS·펌웨어 readback·실제 호스트 배포는 현장 검증이 남아 있다. 날짜별 결과는 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
 
 ## 8. 알려진 이슈·확인할 항목
 
@@ -185,17 +185,21 @@ python3 scripts/sim_demo.py --room 401 402   # 4층 호실 순회 데모
 - sim 모드에서 `/motor/*/telemetry`가 없어 모터 상태가 stale로 표시됨.
 - 시뮬레이션 센서·물리 모델은 **실물 보정 전**이다. 제동거리·절대 위치 정확도를 시뮬레이션 수치로 확정하지 않는다.
 - 주행 중 위치 추정 오차가 복도 진행 방향으로 남아 있음 (평균 0.149 m, 최대 0.512 m, 1회 재현).
+- `sim/config/sensors.json`의 휠·LiDAR 주기(10 Hz·8.8 Hz)가 2026-10-04 실물 정합 기록(100 Hz·10 Hz)과 다르다 — 재확인 필요.
 - AMR 자체 패키지 라이선스는 미정(`TODO`).
 
-## 9. 관련 문서
+## 9. 문서
 
 | 문서 | 내용 |
 |---|---|
-| [docs/README.md](docs/README.md) | 실운용 실행법 (조작·원격·중앙 관제·종료) |
-| [docs/VALIDATION.md](docs/VALIDATION.md) | 검증 절차, 설정 기준값, 재현 명령 |
-| [docs/SIM2REAL.md](docs/SIM2REAL.md) | 공통 제어·시뮬레이션 구조, 위치 추정 설계와 실험 기록 |
-| [docs/REAL_AMR_BASELINE.md](docs/REAL_AMR_BASELINE.md) | 실차 주행 제어·조이스틱·CAN·빌드·주행 기록 |
-| [docs/WORKSPACE_PORTABILITY.md](docs/WORKSPACE_PORTABILITY.md) | 워크스페이스 전달·4층 장면 |
-| [docs/ELEVATOR_DESIGN.md](docs/ELEVATOR_DESIGN.md) | 층간 이동(엘리베이터) 설계·구현 반영 사항, 단계별 구현 기록 |
+| [docs/README.md](docs/README.md) | 실운용 실행법 (실행·웹 접속·조작·중앙 관제·종료) |
+| [docs/REAL_VEHICLE.md](docs/REAL_VEHICLE.md) | 실차 제어·센서 레퍼런스 (조이스틱·control_mux·CAN·TF·EKF·Nav2·시간 이상 처리·주행 기록) |
+| [docs/LOCALIZATION.md](docs/LOCALIZATION.md) | 초기 위치 탐색(TIM)·검증·AMCL 빔 전환·주행 중 추적 |
+| [docs/ELEVATOR.md](docs/ELEVATOR.md) | 층간 이동: 요구 사항·설계·알고리즘·CAN 경로·시뮬레이션·시나리오 결과 |
+| [docs/SIMULATION.md](docs/SIMULATION.md) | Isaac Sim 준비·실행·장면·센서 모델·자동 시험·성능 설정·실물 보정 계획 |
+| [docs/VALIDATION.md](docs/VALIDATION.md) | 설정 기준값, ROS 도메인 배정, 시험 명령, 현장 점검 항목 |
+| [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | 날짜별 실험·조사·튜닝 기록 |
 | [sim/native/README.md](sim/native/README.md) | C++ LiDAR 설계·빌드·검증 |
+| [src/amr_description/README_ISAAC_SIM.md](src/amr_description/README_ISAAC_SIM.md) | URDF Isaac 임포트·물리 파라미터 |
 | [Control_Server/README.md](Control_Server/README.md) | 중앙 관제 서버 실행 |
+| [GitHub Issues](https://github.com/actaeon7777/multifloor-amr/issues) | UI/UX 기능 백로그 (`backlog` 라벨) |

@@ -694,22 +694,21 @@ ROS_DOMAIN_ID=107 /usr/bin/python3 scripts/benchmark_runtime.py --output reports
 
 이 도구는 토픽 주기·누락과 명령/바퀴의 겉보기 응답 지연을 분석한다. 지연에는 telemetry·필터·램프 영향이 섞여 있으므로 ODrive 통신 지연만으로 해석하지 않는다. 물리 파라미터를 자동 변경하지 않는다. `validate_model_response.py`는 별도 검증 기록의 정상속도·상승시간·정지시간·정지거리와 측정 불확실성을 받아 10% 또는 불확실성 이내인지 검사한다. 미지의 관절 Coulomb 마찰은 0을 유지한다. 질량·관성을 궤적 맞추기용 자유 변수로 사용하지 않는다.
 
-## Jetson 소스 릴리스와 복귀
+## Jetson 소스 배포와 복귀
+
+Jetson에는 GitHub 저장소를 clone해 두고 태그로 버전을 고른다.
 
 ```bash
-# PC: 깨끗한 커밋에서 소스 묶음 생성
-/usr/bin/python3 scripts/make_release.py --name experiment-infrastructure-v1
-# Jetson: 기존 버전과 다른 releases/이름/ 폴더에 압축 해제
-# 현행 장치/ROS 설정 읽기만 수행
+# PC: 검증한 커밋에 태그
+git tag -a v2026.10.16 -m "..." && git push origin v2026.10.16
+# Jetson: 현행 장치/ROS 설정 읽기만 수행
 ./scripts/inventory_robot.sh /저장경로/robot-inventory
-# Jetson에서 arm64로 빌드하고 CAN dry-run/기존 통합 시험 실행
-./scripts/validate_release.sh
-# 검증된 별도 릴리스 선택. 이 명령은 주행 노드를 시작하지 않는다.
-./scripts/select_release.sh /새릴리스/amr_ws /운용경로/current
-# 복귀도 보존한 이전 디렉터리를 같은 방법으로 선택한다.
+# Jetson: 태그 체크아웃 후 arm64 빌드 (단위 시험 + CAN dry-run 통합 시험 포함)
+git fetch --tags && git checkout v2026.10.16 && ./scripts/build_ros.sh
+# 복귀는 이전 태그를 같은 방법으로 체크아웃하고 다시 빌드한다.
 ```
 
-x86 바이너리는 묶지 않는다. 릴리스 manifest의 `candidate_gate_passed: false`는 환경 코드 릴리스이며 실물 적용 성능 승인으로 해석하지 않는다. 실제 STM32 firmware identity와 ODrive readback 값은 아직 미확인이다. 백업 C 파일의 존재로 업로드된 펌웨어를 단정하지 않는다. 실물 비교는 0.2 m/s에서 시작하고 통과 후 기존 0.4 m/s 범위에서 기준/후보를 교대로 평가한다. 독립 측정 장비가 없는 실물 결과는 추정 궤적 기준으로 기록한다.
+x86 바이너리는 옮기지 않는다. 실제 STM32 firmware identity와 ODrive readback 값은 아직 미확인이다. 백업 C 파일의 존재로 업로드된 펌웨어를 단정하지 않는다. 실물 비교는 0.2 m/s에서 시작하고 통과 후 기존 0.4 m/s 범위에서 기준/후보를 교대로 평가한다. 독립 측정 장비가 없는 실물 결과는 추정 궤적 기준으로 기록한다.
 
 ## 근거 문서
 

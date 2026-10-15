@@ -60,7 +60,7 @@ ROS 폐루프 실행 `./scripts/experiment.sh sim`도 이 상세 장면을 기�
 생성된 `sim/amr_flat_test.usda`와 `reports/scene_build.json`도 포함한다.
 스크립트와 USD 자산 경로는 새 폴더 위치를 따라간다.
 
-Git 또는 `scripts/make_release.py`의 소스 묶음은 맵·원본·해시·참고 설정·
+Git 저장소(`git clone`)는 맵·원본·해시·참고 설정·
 생성 도구를 포함하지만 Isaac 설치본과 생성된 AMR USD는 포함하지 않는다.
 새 PC에서는 내부 `runtime/`에 실행 환경을 준비하고 `./build_scene.sh`로
 장면을 생성한다. ROS를 사용할 경우 새 위치에서 `build/`·`install/`을

@@ -108,11 +108,12 @@ Isaac Sim이 실차 드라이버 대신 같은 토픽을 발행한다 (`amr_sim_
 |---|---|
 | `src/` | ROS 2 패키지 (빌드 대상, `colcon build --base-paths src`) |
 | `sim/` | Isaac Sim 장면(USD), 설정(`config/*.json`), 실행·검증 스크립트, C++ LiDAR, 지도 생성 도구 |
-| `scripts/` | 실행(`experiment.sh`), 빌드, 시험·벤치마크, 기록(`record_trial.sh`), 릴리스 도구 |
+| `scripts/` | 실행(`experiment.sh`), 빌드, 시험·벤치마크, 기록(`record_trial.sh`), 실차 시험 노드(`auto_turn_test.py`) |
 | `Control_Server/` | 중앙 관제 FastAPI 서버 (포트 8081). 웹 UI·중계 코드는 `src/amr_system/`을 그대로 사용 |
 | `docs/` | 운영·검증·Sim2Real·엘리베이터 설계 문서, 참고 이미지(`images/`) |
+| GitHub Issues | UI/UX 기능 백로그(UX-01~23, `backlog` 라벨)와 참고 영상 관찰 기록(#1) |
 | `tests/` | 워크스페이스 도구 단위 시험 |
-| `reports/` | 장면 생성·검증 메타데이터, 원본 형상 해시(`source_snapshot.json`) |
+| `reports/` | 원본 형상 해시(`source_snapshot.json`). 그 밖의 검증 JSON은 스크립트가 재생성 (git 제외) |
 | `logs/` | 시뮬레이션 시험·벤치마크 결과 |
 | `runtime/` | Isaac Sim 런타임 링크와 캐시 (git 제외) |
 | `firmware/stm32/main.c` | STM32 펌웨어 참고본 (STM32 프로젝트 `Core/Src/main.c`에 반영 후 빌드·업로드). `amr_control` 테스트가 직접 컴파일해 검증 |

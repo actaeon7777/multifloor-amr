@@ -268,7 +268,7 @@ base_footprint
 |---|---|
 | 자율 속도 상한 | 0.40 m/s, 0.60 rad/s. 정상 추종은 전진·제자리 회전, 후진은 복구에서만 |
 | 바퀴 제한 | `amr_nav2_plugins::WheelSpeedCritic`이 상한을 넘는 후보 제외. 치수는 launch가 `control_mux.yaml`에서 읽음 (`control_config:=`로 변경 시 양쪽에 전달) |
-| 지역 제어 | RotationShim(방향 차 0.60 rad 초과 시 0.40 rad/s로 정렬, 0.20 rad 이내에서 넘김, 참조점 1.00 m) + DWB 20 Hz, 예측 1.5초, 선속 12·각속 24 샘플 |
+| 지역 제어 | RotationShim(새 목표에서만, 방향 차 0.60 rad 초과 시 0.40 rad/s로 정렬(open loop), 0.20 rad 이내에서 넘김, 참조점 1.00 m) + DWB 20 Hz, 예측 1.5초, 선속 12·각속 24 샘플 |
 | DWB 가감속 | 선형 ±0.50 m/s², 회전 ±1.60 rad/s² (ODrive 실측값 아님), shim ±0.80 rad/s² |
 | DWB critic | `BaseObstacle 0.12`, `PathAlign 32`(전방 0.50 m), `GoalAlign 8`, `PathDist 32`, `GoalDist 32`, `PreferForward`(미세 명령 비용 0.5) |
 | costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.640×0.574 m 직사각형 + padding 0.02 m |

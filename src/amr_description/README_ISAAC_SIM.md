@@ -10,6 +10,22 @@ src/amr_description/urdf/capstone_amr.urdf
 
 이 URDF는 메시를 상대 경로로 참조하므로 `amr_description` 폴더 구조를 유지해야 한다.
 
+## v80 형상 업데이트 (2026-10-16)
+
+`AMR_MASTER_Linear v80.step` 전체 조립체를 반영했다. 상세 비교는
+[`reports/UPDATE_V80.md`](reports/UPDATE_V80.md).
+
+- 구동휠 간격(윤거) 0.499 → **0.529 m**. 휠 위치는 좌우 각 15 mm 바깥으로 이동했고 높이·전후 위치는 같다.
+- 섀시: 알루미늄 프로파일 하부 프레임(640 × 520 mm, Z −54~1 mm), 2020 기둥 4개와 상부 레일(Z 166 mm까지),
+  전방 마스트(Z 656 mm까지)와 그 위의 Z10T(Z 576~754 mm). `chassis.stl`과 `z10t.stl`로 메시화했다.
+- 구동휠 서스펜션: MGN12 리니어 가이드·모터 브래킷(`drive_suspension.stl`). **이 모델에서는 강체로 고정**했다.
+- v28의 중앙 마운팅 플레이트는 v80에 없어 `mounting_plate.stl`과 해당 visual을 뺐다.
+- LiDAR 마운트·본체, 캐스터 4개, 구동휠 메시의 위치·체적은 v28과 같다.
+- 질량 15.0 kg와 `base_link` 관성 근사는 v28 값을 유지했다. v80 실물을 다시 잰 값이 아니다.
+- 2020 기둥 4개가 LiDAR 스캔 평면(Z 108.605 mm)을 지난다. 실물 스캔에는 약 ±22~30°, ±149~157° 방향
+  0.27~0.28 m 거리에 차체가 보인다. 실차는 `amr_stack`의 `scan_body_filter`가 이 점을 지운다.
+  시뮬레이션 LiDAR는 자기 충돌체를 무시하므로 기둥 너머가 가려지는 것은 재현하지 않는다.
+
 ## v28 형상 업데이트 (2026-09-28)
 
 `AMR_MASTER v28.step`, `LiDAR Mount v3.step`, `Mounting_Plate v3.step`을 반영했다.
@@ -23,7 +39,7 @@ v23/v28의 52개 조립 항목에서 배치, 외곽, 체적을 비교했으며 �
 - 장착 위치, LiDAR 센서 프레임, 구동휠·캐스터 설정은 기존과 같다.
 - 질량 15.0 kg 및 관성 근사는 기존 값이다. 수정 후 질량을 새로 측정한 값은 아니다.
 
-변경 전 파일은 프로젝트 루트의 `backups/before_v28_update.zip`에 보관했다.
+(이 플레이트는 v80에서 제거됐다.)
 
 ## 권장 URDF Importer 설정
 
@@ -35,12 +51,21 @@ v23/v28의 52개 조립 항목에서 배치, 외곽, 체적을 비교했으며 �
 - Merge Mesh: 켬
 - 출력: `capstone_amr.usd`로 저장
 
-섀시 시각 STL은 597,040 triangles이지만 충돌 형상은 `0.640 x 0.520 x 0.085 m` box를 사용한다. 정밀한 외곽 충돌이 필요하면 나중에 여러 box 또는 저해상도 convex collision으로 교체한다.
+섀시 시각 STL은 287,840 triangles이지만 충돌 형상은 CAD 부품 외곽에서 만든 box들이다.
 
-중앙 `mounting_plate.stl`은 `base_link` visual에 별도로 포함된다. 크기는
-`0.560 x 0.360 x 0.005 m`, Z 범위는 `-0.034~-0.029 m`이다. 기존 섀시
-box collision이 이 영역을 이미 포함하므로 판 전용 collision은 중복 생성하지 않는다.
-따라서 중앙 개구부는 visual에 표현되지만 현재의 단순 섀시 collision에는 뚫려 있지 않다.
+| 충돌 box | 크기 (m) | 중심 (m) |
+|---|---|---|
+| 하부 프레임 | 0.640 × 0.520 × 0.055 | (0, 0, −0.0265) |
+| 2020 기둥 ×4 | 0.020 × 0.040 × 0.200 | (0.270 / −0.260, ±0.1326, 0.066) |
+| 상부 측면 레일 ×2 | 0.510 × 0.040 × 0.020 | (0.005, ±0.1326, 0.156) |
+| 전방 가로대 | 0.040 × 0.3107 × 0.020 | (0.240, 0, 0.176) |
+| 마스트 | 0.020 × 0.040 × 0.470 | (0.250, 0, 0.421) |
+| Z10T 마운트 하부 | 0.0764 × 0.100 × 0.055 | (0.2372, 0, 0.6035) |
+| Z10T 본체 | 0.123 × 0.233 × 0.123 | (0.2308, 0, 0.6925) |
+| 서스펜션 브래킷 ×2 | 0.200 × 0.055 × 0.094 | (0, ±0.2075, 0.013) |
+
+하부 프레임 box는 프로파일 사이 빈 공간과 휠 웰을 채운다. 구동휠과 겹치지만 부모–자식 관절 쌍이라
+PhysX가 충돌을 검사하지 않는다(Self-Collision 끔).
 
 ## 조인트 드라이브
 
@@ -88,7 +113,7 @@ Gazebo의 `<mu1>`/`<mu2>` 태그는 제거했다. Isaac Sim에서 PhysX Material
 
 ```text
 Wheel Radius   = 0.086 m
-Wheel Distance = 0.499 m
+Wheel Distance = 0.529 m
 Joint order    = left_drive_wheel_joint, right_drive_wheel_joint
 ```
 
@@ -112,7 +137,7 @@ LiDAR 본체와 LiDAR 마운트가 모두 포함된다. 따라서 라이다 링�
 
 ## LiDAR 링크와 Isaac Sim 센서
 
-CAD의 `AMR_MASTER v28.step`에서 재확인한 고정 링크 구조가 URDF에 포함되어 있다.
+CAD의 `AMR_MASTER v28.step`에서 확인하고 `AMR_MASTER_Linear v80.step`에서 다시 대조한 고정 링크 구조가 URDF에 포함되어 있다.
 기존 센서 프레임의 미세한 CAD 오차를 정리한 위치·회전 기준을 유지했다.
 
 ```text
@@ -163,17 +188,17 @@ xacro src/amr_description/urdf/capstone_amr.urdf.xacro -o src/amr_description/ur
 - `meshes/visual`: URDF가 실제 사용하는 개별 링크 메시
 - `meshes/reference`: CAD 조립 확인용이며 URDF에서 사용하지 않음
 
-`mounting_plate.stl`, `lidar_mount.stl`, `lidar_body.stl`은 STEP 조립 좌표와
-부품 로컬 좌표를 각각 유지해 배치했으며 URDF와 웹 프리뷰가 동일한 값을 사용한다.
+`chassis.stl`, `drive_suspension.stl`, `z10t.stl`은 v80 STEP 조립 좌표(= `base_link`, mm)로
+바로 저장했다. `lidar_mount.stl`, `lidar_body.stl`은 부품 로컬 좌표를 유지한다.
 
 `amr_master.stl`을 URDF visual에 추가하면 섀시와 움직이는 휠/캐스터가 중복되므로 사용하지 않는다.
-이 참조 메시도 v28 전체 조립체로 갱신했다. 전체 CAD에는 BREP 유효성 검사를
-통과하지 못하는 구성 형상이 있어 참조 시각화 용도로만 사용한다. 이번에 교체한
-두 부품은 개별 BREP 유효성 및 폐쇄 메시 검사를 통과했다.
-전체 참조 STL 변환에서 삼각화되지 않은 CAD 면 24개가 생략되었다. URDF는 이 참조
-파일을 사용하지 않으며, 교체한 두 부품의 메시에는 생략된 면이 없다.
+이 참조 메시는 v80 전체 조립체(STEP 그대로, 중복 배치된 부품 포함)로 갱신했다.
+LiDAR 본체 형상은 BREP 유효성 검사를 통과하지 못해 기존 `lidar_body.stl`을 유지했다.
 
 ## 확인이 남은 물리 파라미터
+
+- v80 실물 전체 질량과 무게중심. 상부 구조·마스트·Z10T가 추가되고 플레이트가 빠졌지만 질량은 v28 값이다
+- 구동휠 리니어 서스펜션의 스프링 상수·행정. 현재는 강체로 고정했다
 
 - 캐스터 0.2 kg의 링크별 질량 분배와 각 부품 관성은 임시값
 - `base_link`의 무게중심과 관성은 현재 섀시 bounding box 근사값

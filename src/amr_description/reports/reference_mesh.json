@@ -1,7 +1,11 @@
 {
-  "source": "AMR_MASTER v28.step",
+  "source": "AMR_MASTER_Linear v80.step",
   "source_assembly_brep_valid": false,
   "usage": "Reference visualization only; not used by URDF",
   "unchanged_vendor_components_repaired": false,
-  "export_warning": "24 faces skipped due to null triangulation; reference mesh only"
+  "export_warning": "17 faces of lidar2 v1 v4 skipped due to null triangulation; reference mesh only",
+  "frame": "base_link, millimetres",
+  "duplicate_placements_included": true,
+  "triangles": 801003,
+  "deflection": {"linear_mm": 0.2, "angular_rad": 0.5}
 }

@@ -26,8 +26,8 @@ def test_turn_keeps_curvature_in_both_modes_and_straight_recovers(mode, v, w):
         assert gate.output(0.15) == (0.0, 0.0)
     limited_v, limited_w = gate.output(0.23)
     assert limited_w / limited_v == pytest.approx(w / v)
-    assert max(abs(limited_v + limited_w * 0.2495),
-               abs(limited_v - limited_w * 0.2495)) == pytest.approx(pi * 0.172 * 1.8)
+    assert max(abs(limited_v + limited_w * 0.2645),
+               abs(limited_v - limited_w * 0.2645)) == pytest.approx(pi * 0.172 * 1.8)
     assert 0 < limited_v / v < 1
     assert 0 < limited_w / w < 1
     receive((v, 0, 0, 0, 0, 0), 0.24)
@@ -43,10 +43,10 @@ def test_small_input_is_unchanged_and_oversized_rotation_is_bounded():
     for sign in (-1, 1):
         v, w = limiter.limit(0.0, sign * 100.0)
         assert v == pytest.approx(0.0, abs=1e-12)
-        assert w == pytest.approx(sign * 2 * pi * 0.172 * 1.8 / 0.499)
+        assert w == pytest.approx(sign * 2 * pi * 0.172 * 1.8 / 0.529)
 
 
-@pytest.mark.parametrize('geometry', [(0.172, 0.499, 1.8), (0.2, 0.5, 0.8)])
+@pytest.mark.parametrize('geometry', [(0.172, 0.529, 1.8), (0.2, 0.5, 0.8)])
 def test_all_quadrants_respect_both_wheel_limits(geometry):
     diameter, track, rev_limit = geometry
     limiter = WheelSpeedLimiter(*geometry)
@@ -123,8 +123,8 @@ def test_stm32_converts_without_hidden_speed_limit(stm32_convert):
     # Deliberately exceed the old 1.8 rev/s limit in the host harness only.
     for v, w in [(2.0, 0.8), (-2.0, -0.8), (0.0, 8.0)]:
         right, left_motor = stm32_convert(v, w)
-        assert right == pytest.approx((v + 0.2495 * w) / (pi * 0.172), abs=1e-6)
-        assert left_motor == pytest.approx(-(v - 0.2495 * w) / (pi * 0.172), abs=1e-6)
+        assert right == pytest.approx((v + 0.2645 * w) / (pi * 0.172), abs=1e-6)
+        assert left_motor == pytest.approx(-(v - 0.2645 * w) / (pi * 0.172), abs=1e-6)
 
 
 def test_upper_output_stays_bounded_after_real_stm32_conversion(stm32_convert):
@@ -136,4 +136,4 @@ def test_upper_output_stays_bounded_after_real_stm32_conversion(stm32_convert):
             assert max(abs(right), abs(left_motor)) <= 1.8 + 1e-6
             right_mps, left_mps = right * pi * 0.172, -left_motor * pi * 0.172
             assert (right_mps + left_mps) / 2 == pytest.approx(target_v, abs=1e-6)
-            assert (right_mps - left_mps) / 0.499 == pytest.approx(target_w, abs=1e-6)
+            assert (right_mps - left_mps) / 0.529 == pytest.approx(target_w, abs=1e-6)

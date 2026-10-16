@@ -23,7 +23,7 @@ class ControlMux(Node):
             'deadman_button': 6, 'required_axes': [1, 2],
             'joy_timeout': 0.50, 'command_timeout': 0.50, 'release_debounce': 0.10,
             'max_linear_speed': 0.20, 'max_angular_speed': 0.40,
-            'wheel_diameter': 0.172, 'track_width': 0.499, 'max_wheel_rev_s': 1.8,
+            'wheel_diameter': 0.172, 'track_width': 0.529, 'max_wheel_rev_s': 1.8,
             'auto_toggle_button': 7, 'auto_timeout': 0.50,
             'toggle_release_debounce': 0.10, 'mode_stop_duration': 0.10,
         }

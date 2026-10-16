@@ -28,7 +28,7 @@ class CanTelemetry(Node):
         super().__init__('can_telemetry', **kwargs)
         self.bus = None
         defaults = {
-            'channel': 'can0', 'wheel_diameter': .172, 'track_width': .499,
+            'channel': 'can0', 'wheel_diameter': .172, 'track_width': .529,
             'left_direction': -1., 'right_direction': 1.,
             'encoder_turns_per_wheel_turn': 1., 'max_valid_wheel_rev_s': 5.,
             'wheel_pair_slop': .02, 'wheel_timeout': .25,

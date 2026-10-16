@@ -22,8 +22,8 @@ G동 실내를 자율 주행하고 엘리베이터로 층간 이동하는 **차�
 | LiDAR | SLAMTEC S2 (`sllidar_ros2`, frame `laser`) |
 | IMU | STM32를 거쳐 CAN으로 수신 (0x301 가속도, 0x302 자이로) |
 | 조작기 | Xbox Series X Controller |
-| 기구 | 바퀴 지름 0.172 m, 윤거 0.499 m, 바퀴 상한 1.8 rev/s, footprint 0.64 × 0.544 m |
-| 로봇 모델 | v28 URDF/Xacro + STL (`src/amr_description`) |
+| 기구 | 바퀴 지름 0.172 m, 윤거 0.529 m, 바퀴 상한 1.8 rev/s, footprint 0.64 × 0.574 m |
+| 로봇 모델 | v80 URDF/Xacro + STL (`src/amr_description`) |
 
 ## 3. 시스템 구조
 
@@ -94,7 +94,7 @@ Isaac Sim이 실차 드라이버 대신 같은 토픽을 발행한다 (`amr_sim_
 | `amr_rviz_plugins` | RViz TF 데드락 회피 플러그인 |
 | `amr_sim_bridge` | Isaac PhysX 구동기·센서 ↔ 실차 인터페이스 어댑터, 시뮬레이션 엘리베이터 모델·중계(`elevator_sim_relay`) |
 | `amr_elevator` / `amr_elevator_interfaces` | 층간 이동: 문·층·안/밖 판별(`elevator_monitor`), 층간 미션(`floor_mission_manager`), 메시지·액션 |
-| `amr_description` | v28 URDF/Xacro, 물리 URDF, 메시 |
+| `amr_description` | v80 URDF/Xacro, 물리 URDF, 메시 |
 | `teleop_tools` (`joy_teleop`, `teleop_tools_msgs`) | F1TENTH 소스에서 복사한 조이스틱 입력 변환 |
 | `sllidar_ros2` | SLAMTEC LiDAR 드라이버 |
 

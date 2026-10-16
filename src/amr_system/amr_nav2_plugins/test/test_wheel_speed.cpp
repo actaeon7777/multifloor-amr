@@ -5,13 +5,13 @@
 
 TEST(WheelSpeed, MatchesIndependentLeftAndRightWheelChecks)
 {
-  amr_nav2_plugins::WheelSpeedLimit limit(.172, .499, 1.8);
+  amr_nav2_plugins::WheelSpeedLimit limit(.172, .529, 1.8);
   const double circumference = std::acos(-1.0) * .172;
   for (int i = -100; i <= 100; ++i) {
     for (int j = -80; j <= 80; ++j) {
       double v = i / 100.0, w = j / 100.0;
-      double left = (v - .499 * w / 2) / circumference;
-      double right = (v + .499 * w / 2) / circumference;
+      double left = (v - .529 * w / 2) / circumference;
+      double right = (v + .529 * w / 2) / circumference;
       EXPECT_EQ(limit.allows(v, w), std::max(std::abs(left), std::abs(right)) <= 1.8);
     }
   }
@@ -29,7 +29,7 @@ TEST(WheelSpeed, CriticRejectsThroughDwbException)
   auto node = std::make_shared<nav2_util::LifecycleNode>("wheel_critic_test", "",
     rclcpp::NodeOptions().parameter_overrides({
       {"FollowPath.WheelSpeed.wheel_diameter", .172},
-      {"FollowPath.WheelSpeed.track_width", .499},
+      {"FollowPath.WheelSpeed.track_width", .529},
       {"FollowPath.WheelSpeed.max_wheel_rev_s", 1.8}}));
   amr_nav2_plugins::WheelSpeedCritic critic;
   critic.initialize(node, "WheelSpeed", "FollowPath", nullptr);

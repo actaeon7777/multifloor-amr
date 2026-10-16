@@ -51,7 +51,7 @@ typedef struct
  * - Node 0: right wheel, positive command = forward direction
  * - Node 1: left wheel, physical direction is reversed, so direction = -1
  * - Wheel outer diameter: 172 mm -> 0.172 m
- * - Track width: 499 mm -> 0.499 m
+ * - Track width: 529 mm -> 0.529 m
  *
  * Speed limiting is performed by Jetson control_mux before sending (v, w).
  * ODrive Input_Vel unit is rev/s (= turn/s).
@@ -61,7 +61,7 @@ typedef struct
  */
 #define DRIVE_PI                         3.1415926f
 #define DRIVE_WHEEL_DIAMETER_DEFAULT_M   0.172f
-#define DRIVE_TRACK_WIDTH_DEFAULT_M       0.499f
+#define DRIVE_TRACK_WIDTH_DEFAULT_M       0.529f
 
 #define DRIVE_NODE0_DIRECTION_DEFAULT     1.0f
 #define DRIVE_NODE1_DIRECTION_DEFAULT    -1.0f

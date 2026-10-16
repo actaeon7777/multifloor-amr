@@ -9,7 +9,7 @@ from amr_control.wheel_limiter import WheelSpeedLimiter
 class ControlGate:
     def __init__(self, auto_toggle_button=7, auto_timeout=0.50,
                  toggle_release_debounce=0.10, mode_stop_duration=0.10,
-                 wheel_diameter=0.172, track_width=0.499, max_wheel_rev_s=1.8,
+                 wheel_diameter=0.172, track_width=0.529, max_wheel_rev_s=1.8,
                  **manual_options):
         self.manual = ManualGate(**manual_options)
         self.wheel_limiter = WheelSpeedLimiter(wheel_diameter, track_width, max_wheel_rev_s)

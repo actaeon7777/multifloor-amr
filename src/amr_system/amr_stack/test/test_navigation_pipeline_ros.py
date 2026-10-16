@@ -254,7 +254,7 @@ def overlaps_obstacle(pose, box=(.8, -.25, 1.2, .25)):
     c, s = math.cos(yaw), math.sin(yaw)
     for ax, ay in ((1., 0.), (0., 1.), (c, s), (-s, c)):
         separation = abs((cx-x)*ax+(cy-y)*ay)
-        body_extent = .320*abs(c*ax+s*ay)+.272*abs(-s*ax+c*ay)
+        body_extent = .320*abs(c*ax+s*ay)+.287*abs(-s*ax+c*ay)
         obstacle_extent = (x2-x1)/2*abs(ax)+(y2-y1)/2*abs(ay)
         if separation >= body_extent+obstacle_extent:
             return False
@@ -377,7 +377,7 @@ def test_real_smac_dwb_mux_pause_goal_and_recovery(tmp_path):
         assert not any(overlaps_obstacle(pose) for pose in robot.poses)
         assert robot.previews and all(p.startswith('DRY_RUN') for p in robot.previews)
         wheel_limit=math.pi*.172*1.8
-        assert all(abs(v)+abs(w)*.499/2 <= wheel_limit+1e-7 for _,v,w in robot.commands)
+        assert all(abs(v)+abs(w)*.529/2 <= wheel_limit+1e-7 for _,v,w in robot.commands)
 
         # A goal inside the static obstacle forces the configured recovery tree.
         begin=len(robot.commands)

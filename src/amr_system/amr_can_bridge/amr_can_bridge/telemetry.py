@@ -61,7 +61,7 @@ class WheelOdometry:
     Node 0 is physically RIGHT; node 1 is LEFT, despite old STM32 macro names.
     """
 
-    def __init__(self, diameter=.172, track=.499, left_sign=-1., right_sign=1.,
+    def __init__(self, diameter=.172, track=.529, left_sign=-1., right_sign=1.,
                  turns_per_wheel_turn=1., pair_slop=.02, timeout=.25, max_rev_s=5.):
         self.circumference = pi * positive('wheel_diameter', diameter)
         self.track = positive('track_width', track)

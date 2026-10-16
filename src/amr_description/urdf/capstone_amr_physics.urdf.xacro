@@ -7,8 +7,10 @@
     Coordinate convention: +X forward, +Y left, +Z up.
     base_link is the midpoint of the left/right drive-wheel axle.
     Mesh files use millimetres; mesh scale converts millimetres to metres.
-    Geometry revision: AMR_MASTER v28.step, LiDAR Mount v3.step,
-    Mounting_Plate v3.step (2026-09-28). Existing measured mass budget retained.
+    Geometry revision: AMR_MASTER_Linear v80.step (2026-10-16): aluminium
+    profile frame with upper structure, Z10T mast, linear-guide drive-wheel
+    suspension (modelled rigid) and 529 mm drive track. The v28 measured mass
+    budget and base_link inertia approximation are retained until reweighed.
 
     Direct Isaac Sim import uses the expanded capstone_amr.urdf beside this file.
     Import as Robot Type=Wheeled, Base Type=Mobile, with self-collision disabled.
@@ -19,16 +21,22 @@
 
   <xacro:property name="wheel_radius" value="0.086"/>
   <xacro:property name="wheel_width" value="0.0446"/>
-  <xacro:property name="wheel_track" value="0.499"/>
+  <xacro:property name="wheel_track" value="0.529"/>
   <xacro:property name="drive_axle_x" value="0.0"/>
   <xacro:property name="drive_wheel_mesh_scale" value="0.001004086"/>
   <xacro:property name="drive_wheel_mesh_y" value="0.029118494"/>
 
-  <xacro:property name="chassis_mesh_length" value="0.640"/>
-  <xacro:property name="chassis_mesh_width" value="0.520"/>
-  <xacro:property name="chassis_mesh_height" value="0.085"/>
-  <xacro:property name="chassis_mesh_origin_z" value="-0.044"/>
-  <xacro:property name="chassis_mesh_center_z" value="-0.0115"/>
+  <!-- v28 base_link inertia box, retained until the v80 robot is reweighed. -->
+  <xacro:property name="base_inertia_length" value="0.640"/>
+  <xacro:property name="base_inertia_width" value="0.520"/>
+  <xacro:property name="base_inertia_height" value="0.085"/>
+  <xacro:property name="base_inertia_center_z" value="-0.0115"/>
+
+  <!-- v80 lower profile frame: X +-320, Y +-260, Z -54 to 1 mm. -->
+  <xacro:property name="frame_length" value="0.640"/>
+  <xacro:property name="frame_width" value="0.520"/>
+  <xacro:property name="frame_bottom_z" value="-0.054"/>
+  <xacro:property name="frame_top_z" value="0.001"/>
 
   <!--
     15.0 kg measured total mass budget:
@@ -42,7 +50,7 @@
   <xacro:property name="caster_frame_mass" value="0.10"/>
   <xacro:property name="caster_wheel_mass" value="0.05"/>
 
-  <!-- Placement rechecked against AMR_MASTER v28.step; unchanged from v23. -->
+  <!-- Placement rechecked against AMR_MASTER_Linear v80.step; unchanged from v23. -->
   <xacro:property name="lidar_mount_origin_z" value="-0.029"/>
   <xacro:property name="lidar_from_mount_z" value="0.137605"/>
 
@@ -52,8 +60,8 @@
   <material name="dark_metal">
     <color rgba="0.28 0.33 0.39 1"/>
   </material>
-  <material name="mounting_plate_surface">
-    <color rgba="0.74 0.72 0.66 1"/>
+  <material name="z10t_body">
+    <color rgba="0.12 0.13 0.15 1"/>
   </material>
   <material name="rubber">
     <color rgba="0.04 0.045 0.055 1"/>
@@ -81,27 +89,42 @@
     </inertial>
   </xacro:macro>
 
+  <xacro:macro name="frame_box" params="x y z sx sy sz">
+    <collision>
+      <origin xyz="${x} ${y} ${z}" rpy="0 0 0"/>
+      <geometry><box size="${sx} ${sy} ${sz}"/></geometry>
+    </collision>
+  </xacro:macro>
+
   <link name="base_footprint"/>
 
   <link name="base_link">
     <xacro:box_inertial
       mass="${chassis_mass}"
-      x="${chassis_mesh_length}" y="${chassis_mesh_width}" z="${chassis_mesh_height}"
-      origin_xyz="0 0 ${chassis_mesh_center_z}"/>
+      x="${base_inertia_length}" y="${base_inertia_width}" z="${base_inertia_height}"
+      origin_xyz="0 0 ${base_inertia_center_z}"/>
+    <!-- These three STLs are already expressed in the base_link CAD frame. -->
     <visual>
-      <origin xyz="0 0 ${chassis_mesh_origin_z}" rpy="0 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
         <mesh filename="${mesh_prefix}/chassis.stl" scale="0.001 0.001 0.001"/>
       </geometry>
       <material name="aluminium"/>
     </visual>
-    <!-- The plate STL is already expressed in the base_link CAD frame. -->
+    <!-- Linear-guide suspension brackets of both drive wheels; rigid in this model. -->
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <mesh filename="${mesh_prefix}/mounting_plate.stl" scale="0.001 0.001 0.001"/>
+        <mesh filename="${mesh_prefix}/drive_suspension.stl" scale="0.001 0.001 0.001"/>
       </geometry>
-      <material name="mounting_plate_surface"/>
+      <material name="dark_metal"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/z10t.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="z10t_body"/>
     </visual>
     <!-- LiDAR geometry is lumped into base_link together with its mass. -->
     <visual>
@@ -118,13 +141,30 @@
       </geometry>
       <material name="dark_metal"/>
     </visual>
-    <!-- PhysX-friendly collision; visual STL contains 597,040 triangles. -->
+    <!-- PhysX-friendly collision boxes from the v80 part bounds; the visual
+         frame STL has 287,840 triangles. -->
     <collision>
-      <origin xyz="0 0 ${chassis_mesh_center_z}" rpy="0 0 0"/>
+      <origin xyz="0 0 ${(frame_bottom_z + frame_top_z) / 2.0}" rpy="0 0 0"/>
       <geometry>
-        <box size="${chassis_mesh_length} ${chassis_mesh_width} ${chassis_mesh_height}"/>
+        <box size="${frame_length} ${frame_width} ${frame_top_z - frame_bottom_z}"/>
       </geometry>
     </collision>
+    <!-- 2020 uprights. They cross the LiDAR scan plane at Z = 108.605 mm. -->
+    <xacro:frame_box x="0.270" y="0.1326" z="0.066" sx="0.020" sy="0.040" sz="0.200"/>
+    <xacro:frame_box x="0.270" y="-0.1326" z="0.066" sx="0.020" sy="0.040" sz="0.200"/>
+    <xacro:frame_box x="-0.260" y="0.1326" z="0.066" sx="0.020" sy="0.040" sz="0.200"/>
+    <xacro:frame_box x="-0.260" y="-0.1326" z="0.066" sx="0.020" sy="0.040" sz="0.200"/>
+    <!-- Top side rails, front cross member and Z10T mast. -->
+    <xacro:frame_box x="0.005" y="0.1326" z="0.156" sx="0.510" sy="0.040" sz="0.020"/>
+    <xacro:frame_box x="0.005" y="-0.1326" z="0.156" sx="0.510" sy="0.040" sz="0.020"/>
+    <xacro:frame_box x="0.240" y="0" z="0.176" sx="0.040" sy="0.3107" sz="0.020"/>
+    <xacro:frame_box x="0.250" y="0" z="0.421" sx="0.020" sy="0.040" sz="0.470"/>
+    <!-- Z10T mount below the body, then the Z10T body bounds. -->
+    <xacro:frame_box x="0.2372" y="0" z="0.6035" sx="0.0764" sy="0.100" sz="0.055"/>
+    <xacro:frame_box x="0.2308" y="0" z="0.6925" sx="0.123" sy="0.233" sz="0.123"/>
+    <!-- Drive-wheel suspension brackets above the lower frame. -->
+    <xacro:frame_box x="0" y="0.2075" z="0.013" sx="0.200" sy="0.055" sz="0.094"/>
+    <xacro:frame_box x="0" y="-0.2075" z="0.013" sx="0.200" sy="0.055" sz="0.094"/>
     <!-- v3 mount: two extended walls, two upper side walls, and top plate.
          Small counterbored screw holes are omitted from collision geometry. -->
     <collision>

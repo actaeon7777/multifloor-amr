@@ -16,5 +16,5 @@ control_mux:
     # Final MANUAL/AUTO output scales v and w equally to preserve curvature.
     # Geometry must match STM32. Wheel speed policy is owned by this node.
     wheel_diameter: 0.172  # m
-    track_width: 0.499     # m
+    track_width: 0.529     # m
     max_wheel_rev_s: 1.8   # rev/s; 0.973 m/s per wheel

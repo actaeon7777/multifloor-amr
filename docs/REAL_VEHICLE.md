@@ -19,7 +19,7 @@ S2 LiDAR → /scan → AMCL → map → odom
 | `amr_stack` | bringup·localization·navigation·experiment launch와 설정 YAML, 지도 |
 | `amr_control` | `control_mux`(수동/자율 선택, 바퀴 속도 제한), `time_health` |
 | `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(수신), `elevator_can_link`(층간 이동용, 기본 꺼짐) |
-| `amr_description` | v28 URDF, 실물 `laser`·`imu_link` 프레임 |
+| `amr_description` | v80 URDF, 실물 `laser`·`imu_link` 프레임 |
 | `teleop_tools` | F1TENTH 소스에서 복사한 `joy_teleop` (출처 `src/amr_system/teleop_tools/AMR_SOURCE.md`) |
 
 설정 파일은 모두 `src/amr_system/amr_stack/config/`에 있다. 설정 변경은 해당 launch 재시작 후 적용된다.
@@ -114,10 +114,10 @@ YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 ra
 
 ## 4. 바퀴 속도 제한과 STM32 변환
 
-- `control_mux`가 모드를 고른 뒤 바퀴 속도를 제한한다. `control_mux.yaml`의 `wheel_diameter` 0.172 m, `track_width` 0.499 m, `max_wheel_rev_s` 1.8 rev/s.
+- `control_mux`가 모드를 고른 뒤 바퀴 속도를 제한한다. `control_mux.yaml`의 `wheel_diameter` 0.172 m, `track_width` 0.529 m, `max_wheel_rev_s` 1.8 rev/s.
 - 바퀴 선속도 상한 `U = π × wheel_diameter × max_wheel_rev_s`, 필요한 최대 바퀴 속도 `M = |v| + |ω| × track_width / 2`.
   `M > U`이면 `(v, ω)` 모두에 `U / M`을 곱해 회전 반경을 유지한다. 후진·제자리 회전도 같다.
-  기본값에서 직진 최대 약 0.973 m/s, `(1.0, 0.8)` 요청은 약 `(0.811, 0.649)`. 원래 요청은 `/cmd_vel_manual`, 제한 후는 `/cmd_vel`에서 본다.
+  기본값에서 직진 최대 약 0.973 m/s, `(1.0, 0.8)` 요청은 약 `(0.803, 0.642)`. 원래 요청은 `/cmd_vel_manual`, 제한 후는 `/cmd_vel`에서 본다.
 - [`firmware/stm32/main.c`](../firmware/stm32/main.c)는 받은 `(v, ω)`에 역기구학과 모터 장착 방향만 적용한다.
   바퀴별 클리핑과 별도 gain은 제거했고, 통신 타임아웃과 모터 오류 정지는 유지한다.
   `drive_wheel_diameter_m`·`drive_track_width_m`는 상위 설정과 일치해야 하며 `drive_node0/1_direction`은 방향 부호(±1)다.
@@ -195,7 +195,7 @@ base_footprint
     ├── lidar_mount_link           z = -0.029 m
     │   └── lidar_link             z = 0.137605 m
     │       └── laser              yaw = pi
-    └── 바퀴·캐스터 링크            v28 관절 구조
+    └── 바퀴·캐스터 링크            v28 관절 구조 유지(v80 윤거 0.529 m)
 ```
 
 - `base_link`는 구동축 중앙, +X 전방·+Y 좌측·+Z 위. `base_link → laser`는 `(0, 0, 0.108605)` m, yaw = pi.
@@ -203,7 +203,7 @@ base_footprint
 - URDF는 `src/amr_description/urdf/capstone_amr.urdf.xacro`와 확장본 `.urdf`. 런치는 확장본을 읽어 mesh 경로를
   `package://amr_description/meshes/visual/`로 바꿔 `/robot_description`으로 제공한다. Xacro 수정 시 확장본도 재생성한다.
 - 구동 바퀴 TF는 CAN 측정 `/joint_states`로 갱신된다. 캐스터는 측정값이 없어 발행하지 않는다.
-- 바퀴 중심 간격은 URDF·상위 제한·STM32 소스 모두 0.499 m다.
+- 바퀴 중심 간격은 URDF·상위 제한·STM32 소스 모두 0.529 m다(v80 CAD).
 
 ## 8. EKF
 
@@ -267,7 +267,7 @@ base_footprint
 | 지역 제어 | RotationShim(방향 차 0.60 rad 초과 시 0.40 rad/s로 정렬, 0.20 rad 이내에서 넘김, 참조점 1.00 m) + DWB 20 Hz, 예측 1.5초, 선속 12·각속 24 샘플 |
 | DWB 가감속 | 선형 ±0.50 m/s², 회전 ±1.60 rad/s² (ODrive 실측값 아님), shim ±0.80 rad/s² |
 | DWB critic | `BaseObstacle 0.12`, `PathAlign 32`(전방 0.50 m), `GoalAlign 8`, `PathDist 32`, `GoalDist 32`, `PreferForward`(미세 명령 비용 0.5) |
-| costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.640×0.544 m 직사각형 + padding 0.02 m |
+| costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.640×0.574 m 직사각형 + padding 0.02 m |
 | 장애물 | `/scan` 반영 5 m, ray tracing 6 m, inflation 1.60 m·감소 계수 2.0, LiDAR 0.5초 지연 시 오래된 것으로 처리 |
 | 전역 계획 | Smac 2D, 미확인 공간 통과 안 함, smoother(`w_smooth 0.95`, `w_data 0.02`), 2 Hz 유효성 확인·10초 만료 재계획 |
 | 도착 | 위치 0.15 m·방향 0.15 rad + `StoppedGoalChecker` |
@@ -284,7 +284,7 @@ base_footprint
 - 기본 화면은 `amr_rviz_plugins/SingleThreadedTF`로 TF 수신·표시를 한 스레드에서 처리한다(TF 메시지 필터 교착 회피). 화면을 저장할 때도
   `Transformation -> Current` 선택을 유지한다. 플러그인이 설치되지 않았으면 navigation launch가 빌드 안내와 함께 중단한다.
 - Navigation 2 패널·GoalTool·ParticleCloud는 기본 화면에서 뺐다. 15 fps, CAD 모델·전역 costmap·경로 화살표는 기본으로 끈다.
-- 초록 **Robot Footprint**는 충돌 검사 외곽(0.640×0.544 m + 0.02 m), 장애물 주변 색 띠는 inflation 비용(1.60 m 전체가 통행 금지는 아님).
+- 초록 **Robot Footprint**는 충돌 검사 외곽(0.640×0.574 m + 0.02 m), 장애물 주변 색 띠는 inflation 비용(1.60 m 전체가 통행 금지는 아님).
 
 ## 10. 시간 이상 처리
 

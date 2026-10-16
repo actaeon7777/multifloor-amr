@@ -2,7 +2,7 @@ can_telemetry:
   ros__parameters:
     channel: can0
     wheel_diameter: 0.172
-    track_width: 0.499
+    track_width: 0.529
     # Actual installation: ODrive node 0 = RIGHT (+); node 1 = LEFT (-).
     left_direction: -1.0
     right_direction: 1.0

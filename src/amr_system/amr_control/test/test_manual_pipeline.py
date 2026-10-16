@@ -35,7 +35,7 @@ def test_manual_pipeline():
     rclpy.init()
     node = rclpy.create_node('manual_pipeline_test')
     wheel_speed_limit = pi * 0.172 * 1.8
-    full_turn_scale = wheel_speed_limit / (1.0 + 0.8 * 0.499 / 2)
+    full_turn_scale = wheel_speed_limit / (1.0 + 0.8 * 0.529 / 2)
     full_turn = (full_turn_scale, 0.8 * full_turn_scale)
     received = []
     raw = []

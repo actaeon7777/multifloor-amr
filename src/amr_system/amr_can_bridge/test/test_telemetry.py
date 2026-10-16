@@ -64,15 +64,15 @@ def test_pure_turn_and_exact_arc(sign):
     w = WheelOdometry()
     pair(w, 0., 0., 1.)
     s = pair(w, -sign*.1, sign*.1, 1.1, -sign, sign)
-    angle = sign*.2*pi*.172/.499
+    angle = sign*.2*pi*.172/.529
     assert (s.x, s.y) == pytest.approx((0., 0.))
     assert s.yaw == pytest.approx(angle)
     assert s.w == pytest.approx(angle/.1)
     w = WheelOdometry()
     pair(w, 0., 0., 1.)
     s = pair(w, 0., sign*.2, 1.1, 0., sign*2.)
-    assert s.x == pytest.approx(.499/2*sin(angle))
-    assert s.y == pytest.approx(.499/2*(1-cos(angle)))
+    assert s.x == pytest.approx(.529/2*sin(angle))
+    assert s.y == pytest.approx(.529/2*(1-cos(angle)))
 
 
 def test_asynchronous_pairing_no_old_wheel_reuse():

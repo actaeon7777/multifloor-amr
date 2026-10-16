@@ -24,7 +24,7 @@
 | 로컬 웹 / 중앙 웹 포트 | `8080` / `8081` | `web_ui.launch.py`, `Control_Server` |
 | CAN 비트레이트 | `500000 bit/s` | `deploy/jetson/can0.service` |
 | Xbox 장치 이름 | `Xbox Series X Controller` | `joy_teleop.yaml` |
-| 바퀴 지름 / 간격 / 회전 속도 제한 | `0.172 m` / `0.499 m` / `1.8 rev/s` | `control_mux.yaml`, URDF, `firmware/stm32/main.c` |
+| 바퀴 지름 / 간격 / 회전 속도 제한 | `0.172 m` / `0.529 m` / `1.8 rev/s` | `control_mux.yaml`, URDF, `firmware/stm32/main.c` |
 | AMCL 초기 / 주행 빔 수 | `1080` / `60` | `localization_startup.yaml` |
 | LiDAR 최대 검증 거리 | `30.0 m` | `localization.yaml`, `localization_startup.yaml` |
 | 공용 차량 상태 발행 주기 / 수신 만료 | `10 Hz` / `0.5 s` | `amr_vehicle_status` |

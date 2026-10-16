@@ -4,7 +4,7 @@ from math import isfinite, pi
 
 
 class WheelSpeedLimiter:
-    def __init__(self, wheel_diameter=0.172, track_width=0.499, max_wheel_rev_s=1.8):
+    def __init__(self, wheel_diameter=0.172, track_width=0.529, max_wheel_rev_s=1.8):
         for value in (wheel_diameter, track_width, max_wheel_rev_s):
             if not isfinite(value) or value <= 0:
                 raise ValueError('wheel geometry and speed limit must be finite and positive')

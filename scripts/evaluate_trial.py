@@ -73,7 +73,7 @@ def evaluate(samples,result):
                        sensor_gap_samples=sum(row.get('scan_age_s') is None or row.get('odom_age_s') is None or row['scan_age_s']>.3 or row['odom_age_s']>.25 for row in samples))
     # Read the actual policy from the trial manifest/config where available in the runner.
     limit=result.get('wheel_limit_rev_s',1.8)*2*math.pi
-    radius=result.get('wheel_radius_m',.086);half_track=result.get('track_width_m',.499)/2
+    radius=result.get('wheel_radius_m',.086);half_track=result.get('track_width_m',.529)/2
     metrics['command_limit_violations']=sum(max(abs(row['cmd'][0]-half_track*row['cmd'][1]),
                                                 abs(row['cmd'][0]+half_track*row['cmd'][1]))/radius>limit+1e-6 for row in samples)
     metrics['obstacle_contact_events']=result.get('simulation',{}).get('obstacle_contact_events')

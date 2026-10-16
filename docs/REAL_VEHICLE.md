@@ -11,7 +11,7 @@ joy_node → /joy → joy_teleop → /cmd_vel_manual ─┐
 Nav2 → navigation_manager → /cmd_vel_auto ──────┘   (바퀴 속도 제한)
 
 CAN 피드백 → can_telemetry → /wheel/odometry, /joint_states, /imu/data_raw → EKF → odom → base_footprint
-S2 LiDAR → /scan → AMCL → map → odom
+S2 LiDAR → /scan_raw → scan_body_filter → /scan → AMCL → map → odom
 ```
 
 | 패키지 | 실차에서의 역할 |
@@ -200,6 +200,10 @@ base_footprint
 
 - `base_link`는 구동축 중앙, +X 전방·+Y 좌측·+Z 위. `base_link → laser`는 `(0, 0, 0.108605)` m, yaw = pi.
 - `/scan.header.frame_id=laser`, `inverted=false`를 유지한다. S2 런치 인자 `serial_port`, `serial_baudrate`, `scan_mode`로 드라이버를 바꿀 수 있다.
+- v80 차체의 2020 기둥 4개가 스캔 평면을 지나 약 ±22~30°, ±149~157° 방향 0.27~0.28 m에 보인다. 드라이버는 `/scan_raw`로 내보내고
+  `scan_body_filter`가 `scan_body_filter.yaml`의 `base_link` 상자(기둥 외곽 + 0.03 m) 안에 떨어지는 점을 NaN으로 바꿔 `/scan`을 낸다.
+  상자는 Nav2 footprint 안쪽이라 로봇 밖의 점은 지우지 않는다. 기둥 너머는 실제로 가려져 보이지 않는다.
+  `laser` TF를 받기 전에는 스캔을 내보내지 않는다. `start_lidar:=false`이면 필터도 뜨지 않는다. `record_trial.sh`는 두 토픽을 모두 기록한다.
 - URDF는 `src/amr_description/urdf/capstone_amr.urdf.xacro`와 확장본 `.urdf`. 런치는 확장본을 읽어 mesh 경로를
   `package://amr_description/meshes/visual/`로 바꿔 `/robot_description`으로 제공한다. Xacro 수정 시 확장본도 재생성한다.
 - 구동 바퀴 TF는 CAN 측정 `/joint_states`로 갱신된다. 캐스터는 측정값이 없어 발행하지 않는다.
@@ -319,7 +323,7 @@ AMR_REQUIRE_TIME_SYNC=1 ./scripts/experiment.sh real   # chrony 점검 실패 �
 
 | bringup 옵션 | 기본값 | 기능 |
 |---|---|---|
-| `start_lidar` | `true` | S2 드라이버 |
+| `start_lidar` | `true` | S2 드라이버 + 차체 스캔 필터 |
 | `use_rviz` | `false` | RViz |
 | `start_joy` | `true` | 조이스틱 드라이버 |
 | `start_can_bridge` | `true` | CAN 송신 브리지 |

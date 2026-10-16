@@ -27,5 +27,6 @@ setup(
         'joy_autoselect = amr_stack.joy_autoselect:main',
         'navigation_manager = amr_stack.navigation_manager:main',
         'navigation_startup = amr_stack.navigation_startup:main',
+        'scan_body_filter = amr_stack.scan_body_filter:main',
     ]},
 )

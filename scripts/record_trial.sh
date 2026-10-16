@@ -105,7 +105,7 @@ printf 'recording_started_at=%s\n' "$(TZ=Asia/Seoul date --iso-8601=seconds)" >>
 # Keep the shell alive afterward to report the saved folder and bag summary.
 trap ':' INT
 topics=(/clock /cmd_vel /cmd_vel_navigation /cmd_vel_auto /wheel/odometry /joint_states
-        /imu/data_raw /scan /odometry/filtered /amcl_pose /tf /tf_static /plan
+        /imu/data_raw /scan /scan_raw /odometry/filtered /amcl_pose /tf /tf_static /plan
         /map /local_costmap/costmap /local_costmap/costmap_updates
         /global_costmap/costmap /global_costmap/costmap_updates
         /local_costmap/published_footprint /local_plan /transformed_global_plan

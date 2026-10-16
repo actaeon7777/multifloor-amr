@@ -1,0 +1,14 @@
+# Robot parts in the S2 scan plane (base_link Z 0.108605 m), from
+# AMR_MASTER_Linear v80.step. Each row: x_min, x_max, y_min, y_max in base_link.
+# With the margin every box must stay inside the Nav2 footprint
+# (x +-0.320, y +-0.287), so no return outside the robot is ever removed.
+scan_body_filter:
+  ros__parameters:
+    base_frame: base_link
+    margin: 0.03
+    body_boxes: [
+       0.260,  0.280,  0.1126,  0.1526,   # front-left 2020 upright
+       0.260,  0.280, -0.1526, -0.1126,   # front-right
+      -0.270, -0.250,  0.1126,  0.1526,   # rear-left
+      -0.270, -0.250, -0.1526, -0.1126,   # rear-right
+    ]

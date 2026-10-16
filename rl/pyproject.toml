@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amr-rl"
+version = "0.1.0"
+description = "Isaac Lab tasks for the AMR local navigation policy."
+requires-python = ">=3.12,<3.13"
+
+[project.entry-points."isaaclab.tasks"]
+amr_rl = "amr_rl.tasks"
+
+[tool.setuptools.packages.find]
+include = ["amr_rl*"]

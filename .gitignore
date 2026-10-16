@@ -10,6 +10,7 @@ releases/
 sim/assets/
 sim/generated/
 sim/amr_flat_test.usda
+rl/assets/
 reports/*.png
 reports/import_cache.json
 reports/scene_build.json

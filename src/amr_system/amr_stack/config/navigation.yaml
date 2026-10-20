@@ -65,7 +65,13 @@ controller_server:
       max_angular_accel: 0.8
       simulate_ahead_time: 2.0
       rotate_to_goal_heading: false
-      closed_loop: true
+      # Align only for a new goal. Re-arming on every replan (10 s path refresh) made the
+      # shim turn toward the goal point at the goal and fight DWB's final alignment
+      # (full-stack sim, 2026-10-16: 1 of 3 "goal behind" trials timed out spinning).
+      rotate_to_heading_once: true
+      # Ramp from the last command, not the measured rate: in-place rotation yields ~85 %
+      # of the command in sim, so measured + accel*dt stalled at ~0.26 rad/s instead of 0.4.
+      closed_loop: false
       debug_trajectory_details: false
       min_vel_x: 0.0
       min_vel_y: 0.0

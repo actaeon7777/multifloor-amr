@@ -9,6 +9,9 @@
   <material name="z10t_body">
     <color rgba="0.12 0.13 0.15 1" />
   </material>
+  <material name="housing">
+    <color rgba="0.82 0.83 0.84 1" />
+  </material>
   <material name="rubber">
     <color rgba="0.04 0.045 0.055 1" />
   </material>
@@ -16,8 +19,8 @@
   <link name="base_link">
     <inertial>
       <origin rpy="0 0 0" xyz="0 0 -0.0115" />
-      <mass value="9.8" />
-      <inertia ixx="0.22672708333333336" ixy="0" ixz="0" iyy="0.3404070833333333" iyz="0" izz="0.5553333333333333" />
+      <mass value="12.8" />
+      <inertia ixx="0.29613333333333336" ixy="0" ixz="0" iyy="0.44461333333333336" iyz="0" izz="0.7253333333333334" />
     </inertial>
     <visual>
       <origin rpy="0 0 0" xyz="0 0 0" />
@@ -41,6 +44,20 @@
       <material name="z10t_body" />
     </visual>
     <visual>
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../meshes/visual/housing.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="housing" />
+    </visual>
+    <visual>
+      <origin rpy="0 -0.20943951023931953 0" xyz="0.320488 0.025 0.061017" />
+      <geometry>
+        <mesh filename="../meshes/visual/gemini2.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="z10t_body" />
+    </visual>
+    <visual>
       <origin rpy="0 0 0" xyz="0 0 -0.029" />
       <geometry>
         <mesh filename="../meshes/visual/lidar_mount.stl" scale="0.001 0.001 0.001" />
@@ -55,9 +72,21 @@
       <material name="dark_metal" />
     </visual>
     <collision>
-      <origin rpy="0 0 0" xyz="0 0 -0.0265" />
+      <origin rpy="0 0 0" xyz="0 0 0.0125" />
       <geometry>
-        <box size="0.64 0.52 0.055" />
+        <box size="0.656 0.556 0.135" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0.229 0.09" />
+      <geometry>
+        <box size="0.228 0.098 0.02" />
+      </geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 -0.229 0.09" />
+      <geometry>
+        <box size="0.228 0.098 0.02" />
       </geometry>
     </collision>
     <collision>
@@ -118,18 +147,6 @@
       <origin rpy="0 0 0" xyz="0.2308 0 0.6925" />
       <geometry>
         <box size="0.123 0.233 0.123" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin rpy="0 0 0" xyz="0 0.2075 0.013" />
-      <geometry>
-        <box size="0.2 0.055 0.094" />
-      </geometry>
-    </collision>
-    <collision>
-      <origin rpy="0 0 0" xyz="0 -0.2075 0.013" />
-      <geometry>
-        <box size="0.2 0.055 0.094" />
       </geometry>
     </collision>
     <collision>
@@ -545,5 +562,11 @@
     <parent link="base_link" />
     <child link="imu_link" />
     <origin rpy="0 0 0" xyz="0.160 0.0035 0.016" />
+  </joint>
+  <link name="camera_link" />
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link" />
+    <child link="camera_link" />
+    <origin rpy="0 -0.20943951023931953 0" xyz="0.320488 0.025 0.061017" />
   </joint>
 </robot>

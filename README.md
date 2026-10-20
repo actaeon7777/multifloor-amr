@@ -22,8 +22,8 @@ G동 실내를 자율 주행하고 엘리베이터로 층간 이동하는 **차�
 | LiDAR | SLAMTEC S2 (`sllidar_ros2`, frame `laser`) |
 | IMU | STM32를 거쳐 CAN으로 수신 (0x301 가속도, 0x302 자이로) |
 | 조작기 | Xbox Series X Controller |
-| 기구 | 바퀴 지름 0.172 m, 윤거 0.529 m, 바퀴 상한 1.8 rev/s, footprint 0.64 × 0.574 m |
-| 로봇 모델 | v80 URDF/Xacro + STL (`src/amr_description`) |
+| 기구 | 바퀴 지름 0.172 m, 윤거 0.529 m, 바퀴 상한 1.8 rev/s, footprint 0.656 × 0.574 m, 질량 18 kg |
+| 로봇 모델 | v119 URDF/Xacro + STL (`src/amr_description`) |
 
 ## 3. 시스템 구조
 

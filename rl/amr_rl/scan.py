@@ -8,7 +8,7 @@ import math
 import torch
 
 # Nav2 footprint (navigation.yaml local/global costmap), base_link centered.
-FOOTPRINT_HALF_X = 0.320
+FOOTPRINT_HALF_X = 0.328
 FOOTPRINT_HALF_Y = 0.287
 
 

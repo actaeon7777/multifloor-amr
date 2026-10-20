@@ -10,6 +10,19 @@ src/amr_description/urdf/capstone_amr.urdf
 
 이 URDF는 메시를 상대 경로로 참조하므로 `amr_description` 폴더 구조를 유지해야 한다.
 
+## v119 형상 업데이트 (2026-10-20)
+
+`AMR_MASTER_Linear v119.step`을 반영했다. 상세는 [`reports/UPDATE_V119.md`](reports/UPDATE_V119.md).
+
+- 하우징 4조각(`housing.stl`): 외곽 X ±328, Y ±278, Z −55~80 mm, 구동휠 위 펜더는 Z 100 mm까지.
+  차체 길이가 0.640 → **0.656 m**가 됐다. 폭은 구동휠 바깥면 기준 0.574 m로 같다.
+- Orbbec Gemini 2 깊이 카메라: 하우징 앞코에 있고 **12° 위로 들려 있다**. `camera_link` 프레임을 추가했다(아래 절).
+- 후면 XT90 커넥터는 `chassis.stl`에 합쳤다.
+- 충돌체: 하부 프레임 box와 서스펜션 box 2개를 하우징 box 1개와 펜더 box 2개로 바꿨다.
+- 하우징 상면(80 mm)과 펜더(99.9 mm)는 LiDAR 스캔 평면(108.605 mm)보다 낮다. 카메라 시야(91° × 66°)도 하우징에 가리지 않는다.
+- 전체 질량을 15.0 → **18.0 kg**로 올렸다(2026-10-20 지정값). 늘어난 3.0 kg은 모두 `base_link`(9.8 → 12.8 kg)에 넣었다.
+- Nav2 지역 costmap footprint를 X ±0.320 → ±0.328 m로 맞췄다(`navigation.yaml`, `rl/amr_rl/scan.py`).
+
 ## v80 형상 업데이트 (2026-10-16)
 
 `AMR_MASTER_Linear v80.step` 전체 조립체를 반영했다. 상세 비교는
@@ -55,17 +68,17 @@ v23/v28의 52개 조립 항목에서 배치, 외곽, 체적을 비교했으며 �
 
 | 충돌 box | 크기 (m) | 중심 (m) |
 |---|---|---|
-| 하부 프레임 | 0.640 × 0.520 × 0.055 | (0, 0, −0.0265) |
+| 하우징 (하부 프레임·서스펜션·카메라 포함) | 0.656 × 0.556 × 0.135 | (0, 0, 0.0125) |
+| 펜더 ×2 | 0.228 × 0.098 × 0.020 | (0, ±0.229, 0.090) |
 | 2020 기둥 ×4 | 0.020 × 0.040 × 0.200 | (0.270 / −0.260, ±0.1326, 0.066) |
 | 상부 측면 레일 ×2 | 0.510 × 0.040 × 0.020 | (0.005, ±0.1326, 0.156) |
 | 전방 가로대 | 0.040 × 0.3107 × 0.020 | (0.240, 0, 0.176) |
 | 마스트 | 0.020 × 0.040 × 0.470 | (0.250, 0, 0.421) |
 | Z10T 마운트 하부 | 0.0764 × 0.100 × 0.055 | (0.2372, 0, 0.6035) |
 | Z10T 본체 | 0.123 × 0.233 × 0.123 | (0.2308, 0, 0.6925) |
-| 서스펜션 브래킷 ×2 | 0.200 × 0.055 × 0.094 | (0, ±0.2075, 0.013) |
 
-하부 프레임 box는 프로파일 사이 빈 공간과 휠 웰을 채운다. 구동휠과 겹치지만 부모–자식 관절 쌍이라
-PhysX가 충돌을 검사하지 않는다(Self-Collision 끔).
+하우징 box는 앞코의 곡면, 휠 아치와 상판 옆 어깨(일부 Z 60~80 mm)까지 채운다. 구동휠과 겹치지만
+부모–자식 관절 쌍이라 PhysX가 충돌을 검사하지 않는다(Self-Collision 끔).
 
 ## 조인트 드라이브
 
@@ -121,17 +134,17 @@ Joint order    = left_drive_wheel_joint, right_drive_wheel_joint
 
 ## 질량 배분
 
-실측한 AMR 전체 질량 `15.0 kg`에 맞춰 다음처럼 배분했다.
+v119 AMR 전체 질량 `18.0 kg`(2026-10-20 지정값, v28 실측은 15.0 kg)를 다음처럼 배분했다. 구동휠과 캐스터는 실측값이다.
 
 | 항목 | 개수 | 개당 질량 | 합계 |
 |---|---:|---:|---:|
-| `base_link` 나머지 | 1 | 9.8 kg | 9.8 kg |
+| `base_link` 나머지 | 1 | 12.8 kg | 12.8 kg |
 | WA172E 구동휠 모터 | 2 | 2.2 kg | 4.4 kg |
 | 캐스터 조립체 | 4 | 0.2 kg | 0.8 kg |
-| **총합** | | | **15.0 kg** |
+| **총합** | | | **18.0 kg** |
 
-`base_link`의 9.8 kg에는 배터리 약 4.5 kg, 프레임, 상판, 전장품,
-LiDAR 본체와 LiDAR 마운트가 모두 포함된다. 따라서 라이다 링크에 별도 질량을
+`base_link`의 12.8 kg에는 배터리 약 4.5 kg, 프레임과 상부 구조, 마스트, Z10T, 하우징, 전장품,
+LiDAR 본체와 마운트, Gemini 2가 모두 포함된다. 관성은 v28의 bounding box 근사를 질량만 바꿔 쓴다. 따라서 라이다 링크에 별도 질량을
 또 넣지 않는다. 캐스터 한 개의 0.2 kg은 현재 상판 0.05 kg, 스위블 프레임
 0.10 kg, 바퀴 0.05 kg으로 임시 분배했다.
 
@@ -188,16 +201,34 @@ xacro src/amr_description/urdf/capstone_amr.urdf.xacro -o src/amr_description/ur
 - `meshes/visual`: URDF가 실제 사용하는 개별 링크 메시
 - `meshes/reference`: CAD 조립 확인용이며 URDF에서 사용하지 않음
 
-`chassis.stl`, `drive_suspension.stl`, `z10t.stl`은 v80 STEP 조립 좌표(= `base_link`, mm)로
-바로 저장했다. `lidar_mount.stl`, `lidar_body.stl`은 부품 로컬 좌표를 유지한다.
+`chassis.stl`, `drive_suspension.stl`, `z10t.stl`, `housing.stl`은 STEP 조립 좌표(= `base_link`, mm)로
+바로 저장했다. `gemini2.stl`은 `camera_link` 좌표(mm)다. `lidar_mount.stl`, `lidar_body.stl`은 부품 로컬 좌표를 유지한다.
 
 `amr_master.stl`을 URDF visual에 추가하면 섀시와 움직이는 휠/캐스터가 중복되므로 사용하지 않는다.
-이 참조 메시는 v80 전체 조립체(STEP 그대로, 중복 배치된 부품 포함)로 갱신했다.
+이 참조 메시는 v119 전체 조립체(STEP 그대로, 중복 배치된 부품 포함)로 갱신했다.
 LiDAR 본체 형상은 BREP 유효성 검사를 통과하지 못해 기존 `lidar_body.stl`을 유지했다.
+
+## 깊이 카메라 링크 (Gemini 2)
+
+```text
+base_link
+└─ camera_joint   xyz="0.320488 0.025 0.061017"  rpy="0 -0.20944 0"
+   └─ camera_link
+```
+
+- `camera_link`는 왼쪽(+Y) IR 렌즈의 광축 위, 렌즈 앞면에 있다. +X가 광축이고, 피치 −12°는 위를 보는 방향이다.
+  지면 기준 높이는 0.147 m다.
+- 이 위치는 OrbbecSDK_ROS2의 `camera_link`가 depth(왼쪽 IR) 원점이라는 가정에 따른 것이다.
+  depth·color·IR·optical 프레임은 드라이버가 공장 캘리브레이션으로 발행하므로 URDF에는 넣지 않았다.
+  드라이버의 `camera_link` 이름을 그대로 쓰면 TF가 이어진다.
+- 실차 확인: `ros2 run tf2_ros tf2_echo camera_link camera_right_ir_frame`가 약 (0, −0.050, 0)이면 가정이 맞다.
+  (0, +0.050, 0)이면 `camera_y`를 −0.025로 바꾼다.
+- 카메라 visual(`gemini2.stl`)은 `camera_link` 좌표계 메시이며 `base_link`에 붙였다. 카메라 collision은 하우징 box 안에 있다.
+- Isaac Sim 깊이 카메라 prim은 아직 만들지 않았다. 만들 때는 `camera_link` 아래에 두고, USD 카메라의 −Z 시선을 `camera_link` +X에 맞춘다.
 
 ## 확인이 남은 물리 파라미터
 
-- v80 실물 전체 질량과 무게중심. 상부 구조·마스트·Z10T가 추가되고 플레이트가 빠졌지만 질량은 v28 값이다
+- v119 무게중심과 관성. 총질량은 18.0 kg로 맞췄지만 무게중심과 관성은 v28 bounding box 근사다
 - 구동휠 리니어 서스펜션의 스프링 상수·행정. 현재는 강체로 고정했다
 
 - 캐스터 0.2 kg의 링크별 질량 분배와 각 부품 관성은 임시값

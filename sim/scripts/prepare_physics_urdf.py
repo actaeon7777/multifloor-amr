@@ -127,7 +127,7 @@ def main():
         assert all(inertia[k] == 0 for k in ("ixy", "ixz", "iyz")), "Revalidate non-diagonal inertia with eigenvalues"
         diagonal = [inertia[k] for k in ("ixx", "iyy", "izz")]
         assert min(diagonal) > 0 and 2 * max(diagonal) <= sum(diagonal) + 1e-12
-    assert math.isclose(mass, 15.0, abs_tol=1e-9)
+    assert math.isclose(mass, 18.0, abs_tol=1e-9)
     assert {"lidar_mount_link", "lidar_link", "laser", "imu_link"} <= links.keys()
     meshes = {}
     for mesh in output.iter("mesh"):

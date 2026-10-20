@@ -15,7 +15,7 @@ def validate_motion(stage, build, config, controller):
     assert SimulationManager.get_active_physics_engine() == "physx"
     assert math.isclose(dt, 1 / hz, rel_tol=1e-5)
     total_mass = float(robot.get_link_masses().numpy().sum())
-    assert math.isclose(total_mass, 15, abs_tol=0.01)
+    assert math.isclose(total_mass, 18, abs_tol=0.01)
     names = list(build["joints"])
     all_indices = robot.get_dof_indices(names)
     drive_indices = robot.get_dof_indices(["left_drive_wheel_joint", "right_drive_wheel_joint"])

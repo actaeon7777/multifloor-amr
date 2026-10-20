@@ -271,7 +271,7 @@ base_footprint
 | 지역 제어 | RotationShim(방향 차 0.60 rad 초과 시 0.40 rad/s로 정렬, 0.20 rad 이내에서 넘김, 참조점 1.00 m) + DWB 20 Hz, 예측 1.5초, 선속 12·각속 24 샘플 |
 | DWB 가감속 | 선형 ±0.50 m/s², 회전 ±1.60 rad/s² (ODrive 실측값 아님), shim ±0.80 rad/s² |
 | DWB critic | `BaseObstacle 0.12`, `PathAlign 32`(전방 0.50 m), `GoalAlign 8`, `PathDist 32`, `GoalDist 32`, `PreferForward`(미세 명령 비용 0.5) |
-| costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.640×0.574 m 직사각형 + padding 0.02 m |
+| costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.656×0.574 m 직사각형 + padding 0.02 m |
 | 장애물 | `/scan` 반영 5 m, ray tracing 6 m, inflation 1.60 m·감소 계수 2.0, LiDAR 0.5초 지연 시 오래된 것으로 처리 |
 | 전역 계획 | Smac 2D, 미확인 공간 통과 안 함, smoother(`w_smooth 0.95`, `w_data 0.02`), 2 Hz 유효성 확인·10초 만료 재계획 |
 | 도착 | 위치 0.15 m·방향 0.15 rad + `StoppedGoalChecker` |
@@ -288,7 +288,7 @@ base_footprint
 - 기본 화면은 `amr_rviz_plugins/SingleThreadedTF`로 TF 수신·표시를 한 스레드에서 처리한다(TF 메시지 필터 교착 회피). 화면을 저장할 때도
   `Transformation -> Current` 선택을 유지한다. 플러그인이 설치되지 않았으면 navigation launch가 빌드 안내와 함께 중단한다.
 - Navigation 2 패널·GoalTool·ParticleCloud는 기본 화면에서 뺐다. 15 fps, CAD 모델·전역 costmap·경로 화살표는 기본으로 끈다.
-- 초록 **Robot Footprint**는 충돌 검사 외곽(0.640×0.574 m + 0.02 m), 장애물 주변 색 띠는 inflation 비용(1.60 m 전체가 통행 금지는 아님).
+- 초록 **Robot Footprint**는 충돌 검사 외곽(0.656×0.574 m + 0.02 m), 장애물 주변 색 띠는 inflation 비용(1.60 m 전체가 통행 금지는 아님).
 
 ## 10. 시간 이상 처리
 

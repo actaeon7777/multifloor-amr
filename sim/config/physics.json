@@ -42,10 +42,10 @@
   "provenance": {
     "paths_relative_to": "workspace root (amr_ws)",
     "geometry": "src/amr_description",
-    "geometry_description": "AMR_MASTER_Linear v80 (profile frame, Z10T mast, rigid drive suspension, 529 mm track), LiDAR Mount v3; includes laser and imu_link",
+    "geometry_description": "AMR_MASTER_Linear v119 (profile frame, Z10T mast, rigid drive suspension, 529 mm track, housing, Gemini 2), LiDAR Mount v3; includes laser, imu_link and camera_link",
     "motor_parameters": "sim/reference/wa172e_actuator_parameters.yaml",
     "contact_and_solver": "sim/reference/amr_realistic_overrides.usda",
-    "mass_and_inertia": "Retained from the v28 source URDF: 15 kg budget, approximate CoM/inertias; v80 not reweighed, so not a new measurement.",
+    "mass_and_inertia": "18 kg total set for v119 (v28 measured 15 kg); the 3 kg increase is on base_link. CoM/inertias are the v28 approximation scaled with the base_link mass, not a new measurement.",
     "drive_gain": "5 Nm/(rad/s) is the prior PI-response surrogate, not a measured passive damping coefficient.",
     "urdf_drive_damping": "Provisional 0.1 Nm s/rad retained; now authored independently as PhysxJointAxisAPI viscous friction, separate from the velocity drive gain.",
     "motor_envelope": "Prior linear approximation from 24 V, 8.7 KV and 13 A; battery sag, thermal response and regenerative braking are not modeled.",

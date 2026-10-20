@@ -8,8 +8,10 @@
     Mesh files use millimetres; mesh scale converts millimetres to metres.
     Geometry revision: AMR_MASTER_Linear v80.step (2026-10-16): aluminium
     profile frame with upper structure, Z10T mast, linear-guide drive-wheel
-    suspension (modelled rigid) and 529 mm drive track. The v28 measured mass
-    budget and base_link inertia approximation are retained until reweighed.
+    suspension (modelled rigid) and 529 mm drive track. The base_link inertia
+    box approximation from v28 is retained.
+    v119 (2026-10-20) adds the four-piece housing, an Orbbec Gemini 2 depth
+    camera in the housing nose (pitched 12 deg up) and the rear XT90 connector.
 
     Direct Isaac Sim import uses the expanded capstone_amr.urdf beside this file.
     Import as Robot Type=Wheeled, Base Type=Mobile, with self-collision disabled.
@@ -25,25 +27,41 @@
   <xacro:property name="drive_wheel_mesh_scale" value="0.001004086"/>
   <xacro:property name="drive_wheel_mesh_y" value="0.029118494"/>
 
-  <!-- v28 base_link inertia box, retained until the v80 robot is reweighed. -->
+  <!-- v28 base_link inertia box, retained until the robot is reweighed. -->
   <xacro:property name="base_inertia_length" value="0.640"/>
   <xacro:property name="base_inertia_width" value="0.520"/>
   <xacro:property name="base_inertia_height" value="0.085"/>
   <xacro:property name="base_inertia_center_z" value="-0.0115"/>
 
-  <!-- v80 lower profile frame: X +-320, Y +-260, Z -54 to 1 mm. -->
-  <xacro:property name="frame_length" value="0.640"/>
-  <xacro:property name="frame_width" value="0.520"/>
-  <xacro:property name="frame_bottom_z" value="-0.054"/>
-  <xacro:property name="frame_top_z" value="0.001"/>
+  <!--
+    v119 housing outer bounds: X +-328, Y +-278, Z -55 to 80 mm, with fenders
+    over the drive wheels (X +-114, |Y| 180 to 278 mm) up to Z 100 mm. It
+    encloses the lower profile frame (X +-320, Y +-260, Z -54 to 1 mm).
+  -->
+  <xacro:property name="housing_length" value="0.656"/>
+  <xacro:property name="housing_width" value="0.556"/>
+  <xacro:property name="housing_bottom_z" value="-0.055"/>
+  <xacro:property name="housing_top_z" value="0.080"/>
 
   <!--
-    15.0 kg measured total mass budget:
-      base_link remainder 9.8 kg (battery, frame, plate, electronics, LiDAR and mount)
-      two drive wheels 2 x 2.2 kg, four complete casters 4 x 0.2 kg.
-    Each caster's measured 0.2 kg is provisionally split across its three links.
+    Gemini 2 in the v119 STEP: body origin at base_link (311, 0, 59) mm, optical
+    axes pitched 12 deg up. camera_link is the left (+Y) IR lens front on its
+    optical axis, where the Orbbec driver's depth frame is assumed to sit.
   -->
-  <xacro:property name="chassis_mass" value="9.8"/>
+  <xacro:property name="camera_x" value="0.320488"/>
+  <xacro:property name="camera_y" value="0.025"/>
+  <xacro:property name="camera_z" value="0.061017"/>
+  <xacro:property name="camera_pitch" value="${-12.0 * pi / 180.0}"/>
+
+  <!--
+    18.0 kg total mass (set 2026-10-20 for v119; v28 measured 15.0 kg):
+      base_link remainder 12.8 kg (battery, frame, upper frame, mast, Z10T,
+        housing, electronics, LiDAR, Gemini 2 and their mounts)
+      two drive wheels 2 x 2.2 kg, four complete casters 4 x 0.2 kg (measured).
+    Each caster's measured 0.2 kg is provisionally split across its three links.
+    The 3.0 kg increase is all on base_link, inside the v28 inertia box below.
+  -->
+  <xacro:property name="chassis_mass" value="12.8"/>
   <xacro:property name="drive_wheel_mass" value="2.2"/>
   <xacro:property name="caster_mount_mass" value="0.05"/>
   <xacro:property name="caster_frame_mass" value="0.10"/>
@@ -61,6 +79,9 @@
   </material>
   <material name="z10t_body">
     <color rgba="0.12 0.13 0.15 1"/>
+  </material>
+  <material name="housing">
+    <color rgba="0.82 0.83 0.84 1"/>
   </material>
   <material name="rubber">
     <color rgba="0.04 0.045 0.055 1"/>
@@ -102,7 +123,8 @@
       mass="${chassis_mass}"
       x="${base_inertia_length}" y="${base_inertia_width}" z="${base_inertia_height}"
       origin_xyz="0 0 ${base_inertia_center_z}"/>
-    <!-- These three STLs are already expressed in the base_link CAD frame. -->
+    <!-- These four STLs are already expressed in the base_link CAD frame.
+         chassis.stl also carries the rear XT90 connector. -->
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
@@ -125,6 +147,22 @@
       </geometry>
       <material name="z10t_body"/>
     </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/housing.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="housing"/>
+    </visual>
+    <!-- Camera geometry is lumped into base_link like the LiDAR;
+         gemini2.stl is expressed in the camera_link frame. -->
+    <visual>
+      <origin xyz="${camera_x} ${camera_y} ${camera_z}" rpy="0 ${camera_pitch} 0"/>
+      <geometry>
+        <mesh filename="${mesh_prefix}/gemini2.stl" scale="0.001 0.001 0.001"/>
+      </geometry>
+      <material name="z10t_body"/>
+    </visual>
     <!-- LiDAR geometry is lumped into base_link together with its mass. -->
     <visual>
       <origin xyz="0 0 ${lidar_mount_origin_z}" rpy="0 0 0"/>
@@ -140,14 +178,18 @@
       </geometry>
       <material name="dark_metal"/>
     </visual>
-    <!-- PhysX-friendly collision boxes from the v80 part bounds; the visual
-         frame STL has 287,840 triangles. -->
+    <!-- PhysX-friendly collision boxes from the v119 part bounds. The housing
+         box also covers the lower frame, the suspension brackets, the camera
+         (front at X 324 mm) and the XT90 connector (rear at X -326 mm). -->
     <collision>
-      <origin xyz="0 0 ${(frame_bottom_z + frame_top_z) / 2.0}" rpy="0 0 0"/>
+      <origin xyz="0 0 ${(housing_bottom_z + housing_top_z) / 2.0}" rpy="0 0 0"/>
       <geometry>
-        <box size="${frame_length} ${frame_width} ${frame_top_z - frame_bottom_z}"/>
+        <box size="${housing_length} ${housing_width} ${housing_top_z - housing_bottom_z}"/>
       </geometry>
     </collision>
+    <!-- Fenders over the drive wheels. -->
+    <xacro:frame_box x="0" y="0.229" z="0.090" sx="0.228" sy="0.098" sz="0.020"/>
+    <xacro:frame_box x="0" y="-0.229" z="0.090" sx="0.228" sy="0.098" sz="0.020"/>
     <!-- 2020 uprights. They cross the LiDAR scan plane at Z = 108.605 mm. -->
     <xacro:frame_box x="0.270" y="0.1326" z="0.066" sx="0.020" sy="0.040" sz="0.200"/>
     <xacro:frame_box x="0.270" y="-0.1326" z="0.066" sx="0.020" sy="0.040" sz="0.200"/>
@@ -161,9 +203,6 @@
     <!-- Z10T mount below the body, then the Z10T body bounds. -->
     <xacro:frame_box x="0.2372" y="0" z="0.6035" sx="0.0764" sy="0.100" sz="0.055"/>
     <xacro:frame_box x="0.2308" y="0" z="0.6925" sx="0.123" sy="0.233" sz="0.123"/>
-    <!-- Drive-wheel suspension brackets above the lower frame. -->
-    <xacro:frame_box x="0" y="0.2075" z="0.013" sx="0.200" sy="0.055" sz="0.094"/>
-    <xacro:frame_box x="0" y="-0.2075" z="0.013" sx="0.200" sy="0.055" sz="0.094"/>
     <!-- v3 mount: two extended walls, two upper side walls, and top plate.
          Small counterbored screw holes are omitted from collision geometry. -->
     <collision>
@@ -328,6 +367,19 @@
     <parent link="base_link"/>
     <child link="imu_link"/>
     <origin xyz="0.160 0.0035 0.016" rpy="0 0 0"/>
+  </joint>
+
+  <!--
+    Orbbec Gemini 2 mount frame (+X along the optical axis, +Z up, pitched
+    12 deg up). OrbbecSDK_ROS2 publishes camera_link -> depth/color/IR and
+    optical frames itself from the factory calibration, so none of those
+    frames are defined here. Depth FOV 91 x 66 deg, 50 mm baseline.
+  -->
+  <link name="camera_link"/>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="${camera_x} ${camera_y} ${camera_z}" rpy="0 ${camera_pitch} 0"/>
   </joint>
 
 </robot>

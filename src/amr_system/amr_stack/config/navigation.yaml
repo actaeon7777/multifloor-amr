@@ -243,7 +243,8 @@ local_costmap:
       always_send_full_costmap: false
       width: 6
       height: 6
-      footprint: '[[0.320, 0.287], [0.320, -0.287], [-0.320, -0.287], [-0.320, 0.287]]'
+      # v119 housing X +-0.328; Y +-0.287 is the drive-wheel outer face.
+      footprint: '[[0.328, 0.287], [0.328, -0.287], [-0.328, -0.287], [-0.328, 0.287]]'
       footprint_padding: 0.02
 behavior_server:
   ros__parameters:

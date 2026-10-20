@@ -23,7 +23,7 @@ class ArenaSpec:
     box_count: tuple                  # (min, max) active boxes
     goal_distance: tuple = (2.0, 9.0)  # straight-line start-goal distance, m
     goal_clearance: float = 0.55      # goal point to nearest obstacle edge (goal cell beyond the inscribed radius)
-    start_clearance: float = 0.55     # start point to nearest obstacle edge (robot half-diagonal 0.43)
+    start_clearance: float = 0.55     # start point to nearest obstacle edge (robot half-diagonal 0.436)
     min_reachable: float = 0.3        # reachable share of free cells, else the layout is redrawn
     resolution: float = 0.1
     candidates: int = 64

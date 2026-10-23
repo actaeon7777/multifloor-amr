@@ -100,7 +100,7 @@ class NavigationStartup(Node):
             initialization_update_interval=0.25, tracking_update_interval=1.0,
             tracking_verification_duration=1.0, tracking_verification_samples=4,
             tracking_tf_jump_xy=1.0, tracking_tf_jump_yaw=0.5,
-            tracking_max_xy_std=0.6, tracking_max_yaw_std=0.35,
+            tracking_max_xy_std=0.6, tracking_max_yaw_std=0.35, tracking_min_match_ratio=0.60,
             max_xy_std=0.35, max_yaw_std=0.25, min_particle_concentration=0.90,
             min_match_ratio=0.70, min_known_ratio=0.85, min_valid_beams=30,
             initialization_max_beams=1080, tracking_max_beams=60,
@@ -117,7 +117,8 @@ class NavigationStartup(Node):
             if isinstance(value, (float, int)) and not isinstance(value, bool):
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f'{key} must be positive and finite')
-        for key in ('min_match_ratio', 'min_known_ratio', 'min_particle_concentration', 'ambiguity_margin'):
+        for key in ('min_match_ratio', 'min_known_ratio', 'min_particle_concentration', 'ambiguity_margin',
+                    'tracking_min_match_ratio'):
             if self.cfg[key] > 1:
                 raise ValueError(f'{key} must be at most 1')
         for key in ('initialization_max_beams', 'tracking_max_beams', 'quality_max_beams'):
@@ -1079,7 +1080,11 @@ class NavigationStartup(Node):
             # The uncompensated score is a diagnostic for a failed alignment;
             # scoring it on every passing scan doubled this node's scoring cost.
             raw_quality = quality
-            if ray_poses is not None and (quality.match_ratio < self.cfg['min_match_ratio']
+            # Objects absent from the map (furniture, open doors) legitimately
+            # pull the match ratio to 68-70 % by the 401 doorway (2026-10-24);
+            # tracking warns below its own limit, admission keeps 70 %.
+            min_match = self.cfg['tracking_min_match_ratio'] if self.prior_verified else self.cfg['min_match_ratio']
+            if ray_poses is not None and (quality.match_ratio < min_match
                                           or quality.known_ratio < self.cfg['min_known_ratio']):
                 raw_quality = self.map_quality.score(**self.scan_args(), laser_pose=laser_pose)
         except (TransformException, ValueError) as exc:
@@ -1096,12 +1101,12 @@ class NavigationStartup(Node):
         if confidence_problem:
             self.evidence_issue = 'confidence'
             return ((laser_pose, quality.match_ratio) if self.prior_verified else None), confidence_problem
-        if (quality.match_ratio < self.cfg['min_match_ratio']
+        if (quality.match_ratio < min_match
                 or quality.known_ratio < self.cfg['min_known_ratio']):
             self.evidence_issue = 'scan_alignment'
             return ((laser_pose, quality.match_ratio) if self.prior_verified else None), (
                 '지도와 LiDAR 스캔 정렬이 부족합니다. '
-                f'일치율 {quality.match_ratio:.1%}/{self.cfg["min_match_ratio"]:.0%}, '
+                f'일치율 {quality.match_ratio:.1%}/{min_match:.0%}, '
                 f'회전·이동 보정 전 {raw_quality.match_ratio:.1%}, '
                 f'지도 내 관측 {quality.known_ratio:.1%}/{self.cfg["min_known_ratio"]:.0%}, '
                 f'벽 관통 {quality.obstruction_ratio:.1%}, '

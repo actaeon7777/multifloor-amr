@@ -56,6 +56,10 @@ navigation_startup:
     # legitimately reaches 0.36-0.39 m between distinctive features.
     tracking_max_xy_std: 0.6
     tracking_max_yaw_std: 0.35
+    # Match-ratio limit for the tracking_warning after READY; admission keeps
+    # min_match_ratio 0.70. Objects missing from the map (401 doorway) give
+    # 68-70 % at the correct pose.
+    tracking_min_match_ratio: 0.60
     max_xy_std: 0.35
     max_yaw_std: 0.25
     min_particle_concentration: 0.90

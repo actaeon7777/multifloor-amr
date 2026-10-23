@@ -1092,6 +1092,9 @@ def test_real_amcl_manual_initialization_and_nomotion_updates(harnesses, tmp_pat
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
+            # AMCL's latched /amcl_pose and map->odom TF must be gone before the
+            # next test's synthetic backend starts, or they seed its supervisor.
+            h.until(lambda: h.probe.count_publishers('/amcl_pose') == 0, timeout=15.)
 
 
 def offset_pose(message, dx, dy, dyaw):
@@ -1232,6 +1235,9 @@ def test_real_amcl_converges_from_a_rough_click_with_refinement(harnesses, tmp_p
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
+            # AMCL's latched /amcl_pose and map->odom TF must be gone before the
+            # next test's synthetic backend starts, or they seed its supervisor.
+            h.until(lambda: h.probe.count_publishers('/amcl_pose') == 0, timeout=15.)
 
 
 def test_manual_fresh_scans_cannot_reuse_one_amcl_pose_stamp(harnesses, monkeypatch):
@@ -1342,9 +1348,14 @@ def test_manual_verification_bounds_gradual_drift_from_a_fixed_anchor(harnesses)
     # scans with each changed map pose so rejection is about unstable pose,
     # not a deliberately inconsistent scan or stale transform.
     for index in range(1, 9):
+        before = h.supervisor.get_clock().now().nanoseconds
         h.backend.pose = (initial_pose[0] + .1*index, initial_pose[1], initial_pose[2])
         h.backend.ranges = h.backend.raycast()
-        h.spin(.16)
+        # Wait until the supervisor has judged a scan taken after this step. A
+        # fixed spin lets a loaded Jetson skip steps and judge only stale,
+        # mutually consistent observations (full-suite flake, 2026-10-24).
+        h.until(lambda: h.supervisor.last_checked_scan > before)
+        h.spin(.05)
         assert h.supervisor.pose_evidence()[1] is None
         assert h.supervisor.beam_phase == 'initialization'
         assert not h.backend.start_commands
@@ -1475,6 +1486,15 @@ def test_tracking_corridor_covariance_below_the_tracking_limit_raises_no_warning
     h.spin(.8)
     assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
     assert h.supervisor.metrics['xy_std'] == pytest.approx(.39, abs=.01)
+    _assert_tracking_prior_retained(h, faults, saved)
+
+
+def test_tracking_match_ratio_between_tracking_and_admission_limits_raises_no_warning(harnesses, monkeypatch):
+    h, faults, saved = _ready_tracking_fixture(harnesses, monkeypatch)
+    faults.quality['match_ratio'] = .65  # below the 0.70 admission limit, above tracking's 0.60
+    h.spin(.8)
+    assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
+    assert h.supervisor.metrics['match_ratio'] == pytest.approx(.65)
     _assert_tracking_prior_retained(h, faults, saved)
 
 

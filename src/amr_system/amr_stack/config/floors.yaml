@@ -119,6 +119,15 @@ floors:
       "513-뒷문": {goal: [15.2, 9.16, 3.141593], door: [14.23, 9.16]}
       "514": {goal: [15.58, 20.52, 1.5708], door: [15.58, 21.49]}
 
+# 지도 없는 통과층. 홀 비콘(RF node 0x40 + 층)은 1–7F에 설치돼 있다(docs/ELEVATOR_RF_PROTOCOL.md §6.2).
+# 여기 층에 카가 서면 "다른 층"으로 보고 계속 탑승한다. 목적지로는 고를 수 없다.
+# 실측 지도가 생기면 floors로 옮기고 여기서 지운다. level·beacon_floor_code는 floors와 겹치면 안 된다.
+pass_floors:
+  "1F": {level: 1, beacon_floor_code: 1}
+  "2F": {level: 2, beacon_floor_code: 2}
+  "6F": {level: 6, beacon_floor_code: 6}
+  "7F": {level: 7, beacon_floor_code: 7}
+
 # 시뮬레이션 전용 임시값 (실측 아님)
 sim:
   floor_height_m: 3.6

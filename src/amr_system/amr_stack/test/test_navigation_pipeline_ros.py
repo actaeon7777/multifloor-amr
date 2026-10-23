@@ -1,6 +1,7 @@
 """Real Smac/DWB/behaviors -> manager -> existing mux -> dry-run CAN.
 
-Wall-clock kinematic fixture supplies map, scan, TF, odometry and synthetic Joy.
+Wall-clock kinematic fixture supplies map, scan, TF, odometry and synthetic Joy
+(published only while the simulated joystick is connected; LB takes over).
 Synthetic AMCL evidence exercises the real startup supervisor and readiness gate;
 this fixture does not measure AMCL convergence or global localization accuracy.
 No physical IO node is started. This checks software integration, not real-world
@@ -48,8 +49,8 @@ class Robot(Node):
         self.v = self.w = 0.0
         self.command_at = 0.
         self.previous = time.monotonic()
-        self.rb = self.lb = False
-        self.joy_connected = True
+        self.lb = False
+        self.joy_connected = False
         self.manual = 0.0
         self.mode = ''
         self.status = ''
@@ -203,7 +204,7 @@ class Robot(Node):
         joy = Joy()
         joy.axes = [0., 0., 0., 0.]
         joy.buttons = [0]*8
-        joy.buttons[6], joy.buttons[7] = int(self.lb), int(self.rb)
+        joy.buttons[6] = int(self.lb)
         if self.joy_connected:
             self.joy_pub.publish(joy)
         manual = Twist()
@@ -261,7 +262,7 @@ def overlaps_obstacle(pose, box=(.8, -.25, 1.2, .25)):
     return True
 
 
-def test_real_smac_dwb_mux_pause_goal_and_recovery(tmp_path):
+def test_real_smac_dwb_mux_lb_takeover_and_recovery(tmp_path):
     assert os.environ['ROS_DOMAIN_ID'] == '191'
     assert os.environ['ROS_LOCALHOST_ONLY'] == '1'
     rclpy.init()
@@ -293,12 +294,6 @@ def test_real_smac_dwb_mux_pause_goal_and_recovery(tmp_path):
         until(future.done, seconds)
         return future.result()
 
-    def toggle(expected):
-        robot.rb = False; spin(.15)
-        robot.rb = True
-        until(lambda: robot.mode == expected)
-        spin(.12); robot.rb = False; spin(.15)
-
     try:
         startup_config = tmp_path / 'startup.yaml'
         startup_config.write_text('navigation_startup:\n  ros__parameters:\n    automatic_localization: false\n')
@@ -325,49 +320,64 @@ def test_real_smac_dwb_mux_pause_goal_and_recovery(tmp_path):
         client = ActionClient(robot, NavigateToPose, '/navigate_to_pose')
         until(client.server_is_ready)
 
-        def goal(x,y=0.):
+        def send(x,y=0.):
             request = NavigateToPose.Goal()
             request.pose.header.frame_id='map'
             request.pose.pose.position.x,request.pose.pose.position.y=x,y
             request.pose.pose.orientation.w=1.
-            handle=wait(client.send_goal_async(request))
+            return wait(client.send_goal_async(request))
+
+        def goal(x,y=0.):
+            handle=send(x,y)
             assert handle.accepted
             return handle,handle.get_result_async()
 
-        handle,result=goal(2.3)
-        until(lambda:robot.status=='WAITING_AUTO')
+        def commanding(seconds):
+            begin=len(robot.commands)
+            spin(seconds)
+            return any(abs(v)+abs(w)>1e-3 for _,v,w in robot.commands[begin:])
+
+        # A connected joystick with LB up accepts goals; driving starts without any button.
+        robot.joy_connected=True
         spin(.3)
-        assert math.hypot(robot.x,robot.y)<.01
-        toggle('AUTO')
+        assert robot.mode=='AUTO'
+        handle,result=goal(2.3)
         until(lambda:math.hypot(robot.x,robot.y)>.20,30)
         assert any(abs(p.pose.position.y)>.45 for path in robot.paths for p in path.poses)
-        toggle('MANUAL')
-        until(lambda:robot.status=='PAUSED')
+        # Bluetooth loss and reconnect never stop AUTO.
+        robot.joy_connected=False
+        assert commanding(.8) and robot.mode=='AUTO' and not result.done()
+        robot.joy_connected=True
+        assert commanding(.5) and robot.mode=='AUTO' and not result.done()
+        # LB takes over: the real mux stops and the goal is aborted, not paused.
+        robot.lb=True
+        outcome=wait(result,5)
+        assert outcome.status==GoalStatus.STATUS_ABORTED
+        assert '수동 조작' in outcome.result.error_msg
+        until(lambda:robot.mode=='MANUAL' and robot.status=='MANUAL',5)
         spin(.2)
-        paused=(robot.x,robot.y)
+        stopped=(robot.x,robot.y)
         spin(.4)
-        assert math.hypot(robot.x-paused[0],robot.y-paused[1])<.005
-        assert not result.done()
-        # Manual displacement while the outer navigation goal remains paused.
-        robot.lb=True;robot.manual=.10
+        assert math.hypot(robot.x-stopped[0],robot.y-stopped[1])<.005
+        assert not send(2.3).accepted
+        # The same LB press armed manual input (release was observed while connected).
+        robot.manual=.10
         spin(.6)
-        robot.lb=False;robot.manual=0.
+        robot.manual=0.
         spin(.2)
-        assert math.hypot(robot.x-paused[0],robot.y-paused[1])>.025
+        assert math.hypot(robot.x-stopped[0],robot.y-stopped[1])>.025
+        # LB released: AUTO after manual_holdoff, but the aborted goal is never resumed.
+        robot.lb=False
+        until(lambda:robot.mode=='AUTO',3)
+        spin(.5)
+        assert robot.status=='OVERRIDDEN'
+        assert abs(robot.v)<1e-8 and abs(robot.w)<1e-8
         resumed=(robot.x,robot.y)
         old_count=len(robot.paths)
-        toggle('AUTO')
+        handle,result=goal(2.3)
         until(lambda:len(robot.paths)>old_count,15)
         first=robot.paths[old_count].poses[0].pose.position
         assert math.hypot(first.x-resumed[0],first.y-resumed[1])<.20
-        # A disconnected joystick must stop the real mux and preserve this goal.
-        robot.joy_connected=False
-        until(lambda:robot.mode=='MANUAL' and robot.status=='PAUSED',3)
-        spin(.25)
-        assert abs(robot.v)<1e-8 and abs(robot.w)<1e-8 and not result.done()
-        robot.joy_connected=True
-        spin(.3)
-        toggle('AUTO')
         outcome=wait(result,65)
         assert outcome.status==GoalStatus.STATUS_SUCCEEDED
         spin(.3)
@@ -393,8 +403,9 @@ def test_real_smac_dwb_mux_pause_goal_and_recovery(tmp_path):
         assert wait(blocked_result).status==GoalStatus.STATUS_CANCELED
         spin(.3)
         assert abs(robot.v)<1e-8 and abs(robot.w)<1e-8
-        summary={'goal_succeeded':True,'paused_goal_preserved':True,'manual_motion_during_pause':True,
-                 'replanned_on_resume':True,'joystick_loss_preserved_goal':True,'spin_and_backup_recovery':True,'cancel_during_recovery':True,
+        summary={'goal_succeeded':True,'connected_joystick_accepts_goal':True,'bluetooth_loss_keeps_auto':True,
+                 'lb_aborted_goal':True,'manual_motion_with_lb':True,'no_resume_after_lb_release':True,
+                 'new_goal_replanned':True,'spin_and_backup_recovery':True,'cancel_during_recovery':True,
                  'dry_run_can_only':True,'body_cleared_obstacle':True,'commands':len(robot.commands),'plans':len(robot.paths)}
 
         # Unexpected exit of one Nav2 process must stop the navigation launch.
@@ -466,8 +477,9 @@ def test_corridor_and_replan_when_new_obstacle_blocks_path(tmp_path):
     try:
         startup_config = tmp_path / 'startup.yaml'
         startup_config.write_text('navigation_startup:\n  ros__parameters:\n    automatic_localization: false\n')
+        # No CAN bridge here, so nothing publishes /estop/status.
         navigation = start('navigation', ['ros2','launch','amr_stack','navigation.launch.py',
-                                         'startup_config:=' + str(startup_config)])
+                                         'startup_config:=' + str(startup_config), 'require_estop:=false'])
         start('time_health', ['ros2','run','amr_control','time_health'])
         start('mux', ['ros2','run','amr_control','control_mux','--ros-args','--params-file',str(share/'config/control_mux.yaml'),'-p','require_time_health:=true'])
         until(lambda: robot.initial_pose_pub.get_subscription_count() >= 2, 30)
@@ -480,16 +492,12 @@ def test_corridor_and_replan_when_new_obstacle_blocks_path(tmp_path):
             until(service.service_is_ready, 30)
             until(lambda: wait(service.call_async(GetState.Request())).current_state.id == 3, 30)
         goal_pub = robot.create_publisher(PoseStamped, '/goal_pose', 1)
-        until(lambda: goal_pub.get_subscription_count()>0 and robot.mode=='MANUAL')
+        until(lambda: goal_pub.get_subscription_count()>0 and robot.mode=='AUTO')
         pose = PoseStamped()
         pose.header.frame_id = 'map'
         pose.pose.orientation.w = 1.
         pose.pose.position.x = 2.3
         goal_pub.publish(pose)
-        until(lambda: robot.status=='WAITING_AUTO')
-        robot.rb = True
-        until(lambda: robot.mode=='AUTO')
-        robot.rb = False
         # The preserved floor-retuning parameters crawl through this inflated
         # 1.2 m gap (~0.03 m/s). The earlier 35 s budget predates that tuning.
         # Keep collision and route checks, and bound replans by elapsed time.

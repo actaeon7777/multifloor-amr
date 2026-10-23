@@ -1,10 +1,13 @@
 """ROS/Isaac independent elevator car, RF button devices and hall beacons.
 
 Replaces the real RF -> STM32 -> CAN path in simulation.  It only produces what
-the real devices report: hall beacons announcing their floor every period, and
-an acknowledgement after physically pressing a button.  Door state is exposed in
-``status()`` for animation and evaluation only; the AMR must sense doors with
-its LiDAR.  Faults can be injected to exercise the AMR's recovery rules.
+the real devices report: hall beacons announcing their floor every period, the
+car beacon announcing itself while reachable (door open or robot inside), an
+acknowledgement after physically pressing a button, and the relay's command
+status (COMPLETED / NO_ROUTE).  A door-open command may repeat the press about
+every period (protocol 1.1 ``repeat``).  Door state is exposed in ``status()``
+for animation and evaluation only; the AMR must sense doors with its LiDAR.
+Faults can be injected to exercise the AMR's recovery rules.
 
 Floors are indexed bottom-up; positions are in floor indices (float while
 moving).  Times are seconds of the caller's (simulation) clock.
@@ -18,6 +21,10 @@ CMD_HALL_CALL, CMD_CAR_FLOOR, CMD_DOOR_OPEN = 1, 2, 3
 DIR_NONE, DIR_UP, DIR_DOWN = 0, 1, 2
 EVENT_PRESENCE, EVENT_BUTTON_ACK = 1, 2
 LOCATION_HALL, LOCATION_CAR = 0, 1
+STATUS_COMPLETED, STATUS_NO_ROUTE = 2, 6
+RESULT_PRESSED, RESULT_NONE = 0x00, 0xFF
+CAR_NODE_ID = 0x21
+MAX_DOOR_OPEN_REPEAT = 15
 DOOR_STATES = ('CLOSED', 'OPENING', 'OPEN', 'CLOSING')
 
 FAULT_DEFAULTS = {
@@ -48,6 +55,17 @@ class Frame:
 
 
 @dataclass
+class CommandStatus:
+    """Same fields as amr_elevator_interfaces/ElevatorCommandStatus."""
+    stamp: float
+    cmd_seq: int
+    status: int
+    device_result: int
+    target: int
+    attempts: int
+
+
+@dataclass
 class _Motion:
     start: float
     origin: float
@@ -63,6 +81,7 @@ class _Pending:
     due: float
     frame: Frame
     effect: object = None
+    status: CommandStatus = None
 
 
 @dataclass
@@ -110,6 +129,9 @@ class ElevatorSim:
         self.now = 0.
         self.robot_level = self.position
         self.robot_in_car = False
+        self.open_repeats = 0       # door-open presses still to come
+        self.next_open_press = None
+        self.statuses = []
 
     # Inputs -----------------------------------------------------------------
 
@@ -131,11 +153,18 @@ class ElevatorSim:
         """Something stands in the door plane (simulated safety edge)."""
         self.obstructed = bool(blocked)
 
-    def command(self, now, command, floor_code, direction, sequence):
-        """An AMR RF command; the device presses the button after ack_delay_s."""
+    def command(self, now, command, floor_code, direction, sequence, repeat=0):
+        """An AMR RF command; the device presses the button after ack_delay_s.
+
+        ``repeat`` (door-open only, 0..15): the car beacon presses that many times,
+        about every presence period; a new door-open restarts the count.
+        """
         if command == CMD_HALL_CALL:
             index = self.index_of_code(floor_code)
-            if index is None or direction not in (DIR_UP, DIR_DOWN):
+            if index is None:
+                self._status(now, sequence, STATUS_NO_ROUTE, 0)
+                return
+            if direction not in (DIR_UP, DIR_DOWN):
                 return
             location, device_code = LOCATION_HALL, floor_code
             effect = ('hall', index)
@@ -145,7 +174,9 @@ class ElevatorSim:
                 return
             location, device_code, effect = LOCATION_CAR, 0, ('car', index)
         elif command == CMD_DOOR_OPEN:
-            location, device_code, effect = LOCATION_CAR, 0, ('open', None)
+            if not 0 <= repeat <= MAX_DOOR_OPEN_REPEAT:
+                return
+            location, device_code, effect = LOCATION_CAR, 0, ('open', max(1, repeat))
         else:
             return
         if self.faults['button_fails']:
@@ -159,7 +190,17 @@ class ElevatorSim:
         if rssi is not None and not dropped and self.rng.random() >= self.faults['drop_ack_probability']:
             frame = Frame(0., EVENT_BUTTON_ACK, location, device_code,
                           self._next_sequence((location, device_code)), sequence & 0xff, rssi)
-            self.pending.append(_Pending(due + self.faults['ack_extra_delay_s'], frame))
+            target = CAR_NODE_ID if location == LOCATION_CAR else 0x40 + device_code
+            status = CommandStatus(0., sequence & 0xff, STATUS_COMPLETED, RESULT_PRESSED, target, 1)
+            self.pending.append(_Pending(due + self.faults['ack_extra_delay_s'], frame, status=status))
+
+    def _status(self, now, sequence, status, target):
+        self.statuses.append(CommandStatus(now, sequence & 0xff, status, RESULT_NONE, target, 0))
+
+    def take_statuses(self):
+        """Command statuses since the last call (the relay's 0x311 COMMAND_STATUS)."""
+        statuses, self.statuses = self.statuses, []
+        return statuses
 
     # Simulation -------------------------------------------------------------
 
@@ -174,6 +215,13 @@ class ElevatorSim:
                 self._press(*item.effect)
             if item.frame is not None:
                 out.append(item.frame)
+            if item.status is not None:
+                item.status.stamp = now
+                self.statuses.append(item.status)
+        if self.open_repeats > 0 and now >= self.next_open_press:
+            self.open_repeats -= 1
+            self.next_open_press += self.presence_period_s
+            self._press('open', None)
         out.extend(self._presence(now))
         self._advance_car(now, dt)
         return self._deliver(out, now)
@@ -191,6 +239,7 @@ class ElevatorSim:
             'hall_calls': sorted(self.floors[i][0] for i in self.hall_calls),
             'car_calls': sorted(self.floors[i][0] for i in self.car_calls),
             'obstructed': self.obstructed,
+            'door_open_repeats_left': self.open_repeats,
             'faults': {k: v for k, v in self.faults.items() if v != FAULT_DEFAULTS[k]},
         }
 
@@ -219,6 +268,13 @@ class ElevatorSim:
             return -82
         return None
 
+    def _car_rssi(self):
+        """The car beacon is heard from inside, or through an open door at its floor."""
+        if self.robot_in_car:
+            return -55
+        at_floor = self.motion is None and abs(self.position - self.robot_level) < .5
+        return -60 if at_floor and self.door_ratio > .5 else None
+
     def _presence(self, now):
         if self.next_presence is None:
             self.next_presence = now
@@ -231,6 +287,10 @@ class ElevatorSim:
                 frames.append(Frame(0., EVENT_PRESENCE, LOCATION_HALL, code,
                                     self._next_sequence((LOCATION_HALL, code)), 0,
                                     rssi + self.rng.randint(-3, 3)))
+            rssi = self._car_rssi()
+            if rssi is not None and self.rng.random() >= self.faults['drop_presence_probability']:
+                frames.append(Frame(0., EVENT_PRESENCE, LOCATION_CAR, 0,
+                                    self._next_sequence((LOCATION_CAR, 0)), 0, rssi))
             wrong = self.faults['wrong_floor_code']
             if wrong is not None:
                 frames.append(Frame(0., EVENT_PRESENCE, LOCATION_HALL, wrong,
@@ -258,8 +318,12 @@ class ElevatorSim:
         return None if self.motion else round(self.position)
 
     def _press(self, kind, index):
+        """``index``: floor index; for 'open' the command's press count (None: a repeat)."""
         here = self._stopped_at()
         if kind == 'open':
+            if index is not None:  # A new door-open command: (re)start its repeats.
+                self.open_repeats = index - 1
+                self.next_open_press = self.now + self.presence_period_s
             if here is not None:
                 self._open()
             return

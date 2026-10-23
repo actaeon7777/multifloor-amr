@@ -140,6 +140,34 @@ def test_unexpected_stop_keeps_the_target_and_rides_again(building):
     assert ride.events() == ['ENTERED_ELEVATOR', 'DEPARTED', 'ARRIVED_OTHER_FLOOR', 'DEPARTED', 'ARRIVED']
 
 
+def test_stop_at_a_pass_floor_keeps_riding_to_the_target(building):
+    ride = Ride(building, '5F')
+    board(ride)
+    depart(ride, '3F')
+    arrive(ride, 28., code=7)  # Someone called 7F (beacon installed, no map) first.
+    assert (ride.s.confidence, ride.s.transit_to, ride.s.floor) == ('TRANSIT', '3F', '')
+    ride.at(40.)  # Long after arrival_beacon_timeout_s: nothing is assumed.
+    assert ride.s.confidence == 'TRANSIT'
+    ride.at(41.).door(CLOSING)
+    ride.at(42.5).door(CLOSED)
+    assert ride.at(45.).beacon(6) == 'ignored_in_transit'  # Passing 6F, door closed.
+    arrive(ride, 50., code=3)
+    assert (ride.s.floor, ride.s.confidence) == ('3F', 'BEACON')
+    assert ride.events() == ['ENTERED_ELEVATOR', 'DEPARTED', 'PASS_FLOOR_STOP', 'ARRIVED']
+
+
+def test_pass_floor_beacon_outside_is_a_conflict_and_unknown_codes_report_once(building):
+    ride = Ride(building)
+    ride.at(1.)
+    assert ride.beacon(2, rssi=-80) == 'weak'
+    assert ride.beacon(2, rssi=-60) == 'conflict'
+    assert ride.s.floor == '4F' and ride.s.floor_conflict
+    assert [ride.beacon(15) for _ in range(3)] == ['unknown'] * 3
+    assert ride.beacon(0, location=CAR) == 'ok'  # Car PRESENCE: liveness only.
+    assert ride.s.floor == '4F'
+    assert ride.events() == ['FLOOR_CONFLICT', 'UNKNOWN_BEACON']
+
+
 def test_missing_arrival_beacon_is_assumed_and_blocks_a_clean_exit(building):
     ride = Ride(building)
     board(ride)

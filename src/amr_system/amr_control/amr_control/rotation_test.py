@@ -30,7 +30,7 @@ class RotationTest:
                 if self.ready_since is None:self.ready_since=now
                 if now-self.ready_since>=1.:
                     self.manual_seen=True
-                    self.reason='ready_press_RB_once_to_start_left_turn'
+                    self.reason='ready_release_lb_to_start_left_turn'
             elif mode!='AUTO':
                 self.ready_since=None;self.manual_seen=False
                 self.reason='waiting_for_manual_and_fresh_sensors'

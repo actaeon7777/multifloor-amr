@@ -82,7 +82,8 @@ def test_invalid_pose(value):
 def live_state():
     shared = SharedState()
     shared.grids['map'] = Grid(3, 2, 1., [0, 0, 0], [0, 100, -1, 0, 0, 0])
-    shared.state.update(action_ready=True, robot=dict(x=0, y=0, yaw=0, received_at=time.monotonic()),
+    shared.state.update(action_ready=True, mode='AUTO',
+                        robot=dict(x=0, y=0, yaw=0, received_at=time.monotonic()),
                         velocity=dict(linear=0, angular=0, received_at=time.monotonic()))
     shared.update_localization(localization_status())
     return shared
@@ -151,6 +152,23 @@ def test_saved_map_preview_uses_real_map():
     load_preview(shared, filename)
     assert shared.grids['map'].info['width'] == 1014
     assert {0, 100} <= set(shared.grids['map'].data) <= {-1, 0, 100}
+
+
+@pytest.mark.parametrize('mode,message', [('MANUAL', '수동 조작'), ('UNKNOWN', '제어 모드')])
+def test_goal_requires_auto_mode_but_position_reset_does_not(mode, message):
+    shared = live_state()
+    shared.state['mode'] = mode
+    payload = dict(request_id='manual_goal', x=.5, y=.5, yaw=0, map_version=1)
+    with pytest.raises(ApiError, match=message) as exc:
+        shared.request('goal', payload)
+    assert exc.value.status == 409
+    assert shared.readiness_error('floor_goal')
+    assert shared.commands.empty()
+    shared.request('initialpose', dict(payload, request_id='manual_pose'))
+    assert shared.commands.qsize() == 1
+    shared = live_state()
+    shared.request('goal', payload)
+    assert shared.commands.qsize() == 1
 
 
 @pytest.mark.parametrize('state', ['WAITING_DATA', 'SEARCHING', 'VERIFYING', 'WAITING_INITIAL_POSE',
@@ -250,8 +268,8 @@ def test_malformed_localization_status_revokes_ready(text):
 
 
 @pytest.mark.parametrize('kind', ['initialpose', 'relocalize'])
-@pytest.mark.parametrize('navigation', ['WAITING_AUTO', 'WAITING_NAV2', 'RUNNING', 'PAUSED', 'STOPPING'])
-def test_position_reset_refuses_pending_or_paused_navigation(kind, navigation):
+@pytest.mark.parametrize('navigation', ['WAITING_NAV2', 'RUNNING', 'STOPPING', 'MANEUVER'])
+def test_position_reset_refuses_active_navigation(kind, navigation):
     shared = live_state()
     shared.state['navigation'] = navigation
     with pytest.raises(ApiError, match='목표'):
@@ -357,3 +375,98 @@ def test_relocalize_map_version_is_checked_without_pose_payload():
         shared.request('relocalize', dict(request_id='stale_map_reset', map_version=0))
     shared.grids.clear()
     assert shared.request('relocalize', dict(request_id='no_map_reset'))['status'] == 'QUEUED'
+
+
+def estop_status(state='READY', sequence=1, session='bridge', **values):
+    return json.dumps(dict(
+        session=session, sequence=sequence, stamp=time.time(), epoch=0, state=state,
+        healthy=state in ('READY', 'BYPASS'), latched=state in ('UNKNOWN', 'ESTOP', 'DISARMED'),
+        approval_required=state == 'DISARMED', detail='상태 안내', reason='', rx_error='',
+        stm32=dict(raw=False, stopped=state == 'ESTOP', drive_enabled=state == 'READY',
+                   trip_count=1, release_count=1), **values))
+
+
+@pytest.mark.parametrize('state,message', [
+    ('ESTOP', 'E-stop이 눌려'), ('DISARMED', '재개를 승인'), ('ARMING', '주행 준비'),
+    ('UNKNOWN', 'STM32 E-stop 상태'),
+])
+def test_required_estop_blocks_goals_until_ready(state, message):
+    shared = live_state()
+    shared.require_estop = True
+    shared.update_estop(estop_status(state))
+    with pytest.raises(ApiError, match=message) as exc:
+        shared.request('goal', dict(request_id='estop_goal', x=.5, y=.5, yaw=0, map_version=1))
+    assert exc.value.status == 409
+    assert shared.readiness_error('floor_goal')
+    # Stationary localization commands are not E-stop gated.
+    assert shared.readiness_error('relocalize') is None
+    shared.update_estop(estop_status('READY', sequence=2))
+    assert shared.readiness_error('goal') is None
+
+
+def test_missing_stale_or_malformed_estop_status_fails_closed():
+    shared = live_state()
+    assert shared.readiness_error('goal') is None  # Not required (simulation).
+    assert shared.snapshot()['estop']['required'] is False
+    shared.require_estop = True
+    assert 'CAN 브릿지' in shared.readiness_error('goal')
+    shared.update_estop(estop_status())
+    assert shared.readiness_error('goal') is None
+    shared.estop.received -= 1
+    assert shared.readiness_error('goal')
+    assert not shared.snapshot()['estop']['fresh']
+    shared.update_estop(estop_status(sequence=2))
+    shared.update_estop('garbage')
+    assert shared.readiness_error('goal')
+    shared.update_estop(estop_status(sequence=3, state='MADE_UP'))
+    assert shared.readiness_error('goal')
+    shared.update_estop(estop_status(sequence=4))
+    assert shared.readiness_error('goal') is None
+    shared.update_estop(estop_status(sequence=1))  # Reordered old heartbeat is ignored.
+    assert shared.estop.status['sequence'] == 4
+
+
+def test_estop_approve_only_when_bridge_reports_disarmed():
+    shared = live_state()
+    shared.require_estop = True
+    payload = dict(request_id='estop_approve_1')
+    with pytest.raises(ApiError, match='E-stop 상태를 받지 못해'):
+        shared.request('estop_approve', payload)
+    for sequence, state in enumerate(('ESTOP', 'ARMING', 'READY', 'BYPASS'), start=1):
+        shared.update_estop(estop_status(state, sequence=sequence))
+        with pytest.raises(ApiError) as exc:
+            shared.request('estop_approve', payload)
+        assert exc.value.status == 409
+    shared.update_estop(estop_status('DISARMED', sequence=10))
+    snapshot = shared.snapshot()['estop']
+    assert snapshot['approval_required'] and snapshot['state'] == 'DISARMED'
+    assert snapshot['stm32']['trip_count'] == 1
+    first = shared.request('estop_approve', payload)
+    assert first['status'] == 'QUEUED'
+    assert shared.request('estop_approve', payload) == first
+    assert shared.commands.get_nowait() == dict(kind='estop_approve', request_id='estop_approve_1', pose=None,
+                                                map_version=None, floor=None, room='')
+    # The ROS executor re-checks before calling the service.
+    shared.update_estop(estop_status('ESTOP', sequence=11))
+    assert shared.readiness_error('estop_approve', 'estop_approve_1')
+
+
+def test_http_estop_approve_endpoint_uses_command_checks():
+    shared = live_state()
+    shared.require_estop = True
+    shared.update_estop(estop_status('DISARMED'))
+    server = create_http_server(shared, Path(__file__).resolve().parents[1]/'web', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f'http://127.0.0.1:{server.server_port}/api/estop_approve'
+    payload = json.dumps(dict(request_id='http_estop_1')).encode()
+    try:
+        with pytest.raises(HTTPError) as exc:
+            urlopen(Request(url, data=payload, headers={'Content-Type': 'application/json'}))
+        assert exc.value.code == 403
+        headers = {'Content-Type': 'application/json', 'X-AMR-Request': '1'}
+        result = json.load(urlopen(Request(url, data=payload, headers=headers)))
+        assert result['status'] == 'QUEUED'
+        assert shared.commands.get_nowait()['kind'] == 'estop_approve'
+    finally:
+        server.shutdown(); server.server_close(); thread.join()

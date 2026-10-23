@@ -17,7 +17,7 @@ G동 실내를 자율 주행하고 엘리베이터로 층간 이동하는 **차�
 | 차량 컴퓨터 | NVIDIA Jetson, JetPack 7.2.1 / Ubuntu 24.04 / arm64 |
 | 시뮬레이션 PC | Ubuntu 24.04 x86_64, Isaac Sim 6.1.0 (pip 빌드 6.1.0-rc.26) |
 | 미들웨어 | ROS 2 Jazzy, `rmw_fastrtps_cpp` |
-| 하위 제어기 | STM32 (`firmware/stm32/main.c`) → ODrive 2축 (node 0 = 좌, node 1 = 우) |
+| 하위 제어기 | STM32 NUCLEO-F446RE → ODrive 2축 (node 0 = 좌, node 1 = 우). E-stop(0x202)·엘리베이터 RF 중계(0x210/0x310/0x311) 포함 실 펌웨어는 별도 STM32 프로젝트(`C:\STM32\AMR`) |
 | 통신 | SocketCAN `can0`, 500 kbit/s (`deploy/jetson/can0.service`로 부팅 시 설정) |
 | LiDAR | SLAMTEC S2 (`sllidar_ros2`, frame `laser`) |
 | IMU | STM32를 거쳐 CAN으로 수신 (0x301 가속도, 0x302 자이로) |
@@ -35,8 +35,12 @@ joy_node → /joy → joy_teleop → /cmd_vel_manual ─┐
 Nav2 (navigation_manager) → /cmd_vel_auto ──────┘   (바퀴 속도 제한)
 ```
 
-- **LB(버튼 6)**: 데드맨. MANUAL에서 누르는 동안만 수동 주행.
-- **RB(버튼 7)**: MANUAL ↔ AUTO 토글. AUTO → MANUAL 전환 시 정지(목표는 유지, 일시정지).
+- **기본은 AUTO.** 조이스틱 연결 여부와 상관없이 웹 UI·중앙 관제로 목표를 보내면 자율주행한다.
+  Bluetooth 연결·끊김·재연결은 모드를 바꾸지 않는다. RB 토글은 없다.
+- **LB(버튼 6)를 누르는 순간 수동 전환(MANUAL)**: 즉시 정지하고 목표를 중단(`OVERRIDDEN`)하며 수동 입력을 기다린다.
+  LB를 누른 채 스틱으로 수동 주행한다. LB를 누르고 있는 동안 자율주행 목표는 거절한다.
+- LB를 놓으면 수동 출력이 멈추고, 마지막 LB 입력 0.5초 뒤 AUTO로 돌아간다. 중단된 목표는 재개하지 않으며 목적지를 다시 지정해야 출발한다.
+  연결 시점에 LB가 이미 눌려 있으면 자율주행은 멈추지만 수동 주행은 LB를 한 번 놓았다 눌러야 한다.
 - `control_mux`가 바퀴 속도 상한 `U = π·d·rev_s`를 넘는 명령은 `(v, ω)`를 같은 비율로 축소해 회전 반경을 유지한다.
   STM32는 역기구학과 모터 방향만 적용하며, 통신 타임아웃·모터 오류 정지는 하위에 남아 있다.
 
@@ -116,7 +120,7 @@ Isaac Sim이 실차 드라이버 대신 같은 토픽을 발행한다 (`amr_sim_
 | `reports/` | 원본 형상 해시(`source_snapshot.json`). 그 밖의 검증 JSON은 스크립트가 재생성 (git 제외) |
 | `logs/` | 시뮬레이션 시험·벤치마크 결과 |
 | `runtime/` | Isaac Sim 런타임 링크와 캐시 (git 제외) |
-| `firmware/stm32/main.c` | STM32 펌웨어 참고본 (STM32 프로젝트 `Core/Src/main.c`에 반영 후 빌드·업로드). `amr_control` 테스트가 직접 컴파일해 검증 |
+| `firmware/stm32/main.c` | 실차 STM32 펌웨어의 `Core/Src/main.c` 사본(E-stop·RF 중계 포함, 2026-10-23 업로드본). `estop.c`·`elevator_rf.c`·`nrf24.c`는 STM32 프로젝트에만 있다. 주행 변환 함수를 `amr_control` 테스트가 직접 컴파일해 검증. CAN 동작은 [E-stop](docs/ESTOP_CAN_PROTOCOL.md)·[엘리베이터 CAN](docs/ELEVATOR_CAN_PROTOCOL.md) 문서가 기준 |
 | `deploy/jetson/` | Jetson 시스템 설정 (`can0.service`) |
 | 루트 `*.sh` | Isaac Sim 진입점 (`env.sh`, `isaac-sim.sh`, `python.sh`, `run_amr.sh`, `build_scene.sh`) |
 
@@ -186,6 +190,9 @@ python3 scripts/sim_demo.py --room 401 402   # 4층 호실 순회 데모
 - 시뮬레이션 센서·물리 모델은 **실물 보정 전**이다. 제동거리·절대 위치 정확도를 시뮬레이션 수치로 확정하지 않는다.
 - 주행 중 위치 추정 오차가 복도 진행 방향으로 남아 있음 (평균 0.149 m, 최대 0.512 m, 1회 재현).
 - AMR 자체 패키지 라이선스는 미정(`TODO`).
+- 조이스틱이 꺼졌거나 Bluetooth 범위 밖이면 LB로 끼어들 수 없다. 이때는 웹 **주행 목표 취소**·하드웨어 비상정지에 의존한다.
+  LB 끼어들기는 Bluetooth 재연결 후 `/joy`가 다시 나와야 성립한다(같은 이름의 컨트롤러가 여러 대면 재연결이 보장되지 않음).
+- LB를 놓은 0.5초 뒤부터 원격(중앙 관제) 목표를 받으므로, 수동 조작 직후 사람 옆에서 원격 목표로 출발할 수 있다.
 
 ## 9. 문서
 

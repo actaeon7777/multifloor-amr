@@ -1,4 +1,10 @@
-"""Mode selection, RB toggle and command expiry, independent of ROS."""
+"""LB-takeover mode selection and command expiry, independent of ROS.
+
+AUTO is the default, whether or not a joystick is connected. A valid Joy sample
+with LB held takes over at once (MANUAL) and discards autonomous commands. AUTO
+returns manual_holdoff after the last LB sample; Joy connection or loss alone
+never changes the mode.
+"""
 
 from math import isfinite
 
@@ -7,26 +13,28 @@ from amr_control.wheel_limiter import WheelSpeedLimiter
 
 
 class ControlGate:
-    def __init__(self, auto_toggle_button=7, auto_timeout=0.50,
-                 toggle_release_debounce=0.10, mode_stop_duration=0.10,
+    def __init__(self, auto_timeout=0.50, manual_holdoff=0.50, mode_stop_duration=0.10,
                  wheel_diameter=0.172, track_width=0.529, max_wheel_rev_s=1.8,
                  **manual_options):
         self.manual = ManualGate(**manual_options)
         self.wheel_limiter = WheelSpeedLimiter(wheel_diameter, track_width, max_wheel_rev_s)
-        if (type(auto_toggle_button) is not int or auto_toggle_button < 0
-                or auto_toggle_button == self.manual.deadman_button):
-            raise ValueError('auto_toggle_button must be a distinct non-negative integer')
         if not isfinite(auto_timeout) or auto_timeout <= 0:
             raise ValueError('auto_timeout must be finite and positive')
-        for value in (toggle_release_debounce, mode_stop_duration):
-            if not isfinite(value) or value < 0 or value >= self.manual.joy_timeout:
-                raise ValueError('debounce/transition time must be non-negative and < joy_timeout')
-        self.auto_toggle_button = auto_toggle_button
+        if not isfinite(manual_holdoff) or manual_holdoff < self.manual.joy_timeout:
+            raise ValueError('manual_holdoff must be finite and >= joy_timeout')
+        if (not isfinite(mode_stop_duration) or mode_stop_duration < 0
+                or mode_stop_duration >= self.manual.joy_timeout):
+            raise ValueError('mode_stop_duration must be non-negative and < joy_timeout')
         self.auto_timeout = auto_timeout
-        self.toggle_release_debounce = toggle_release_debounce
+        self.manual_holdoff = manual_holdoff
         self.mode_stop_duration = mode_stop_duration
-        self.joy_time = None
-        self._reset('awaiting_release')
+        self.lb_time = None
+        self.auto_enabled = True
+        self.auto_command = None
+        self.auto_time = None
+        self.auto_reason = 'auto_waiting_command'
+        self.stop_until = 0.0
+        self.manual.stop('awaiting_release')
 
     @property
     def mode(self):
@@ -36,64 +44,34 @@ class ControlGate:
     def reason(self):
         return self.auto_reason if self.auto_enabled else self.manual.reason
 
-    def _reset(self, reason):
-        self.auto_enabled = False
+    def _switch(self, auto, now):
+        # Leave the manual gate untouched: an LB press after an observed
+        # release both takes over and arms manual input.
+        self.auto_enabled = auto
         self.auto_command = None
         self.auto_time = None
         self.auto_reason = 'auto_waiting_command'
-        self.rb_ready = False
-        self.rb_release_since = None
-        self.stop_until = 0.0
-        self.manual.stop(reason)
-        self.manual.joy_time = None
+        self.stop_until = now + self.mode_stop_duration
 
     def _expire(self, now):
-        if self.joy_time is not None and now - self.joy_time >= self.manual.joy_timeout:
-            self.joy_time = None
-            self._reset('joy_timeout')
-        if (self.auto_enabled and self.auto_time is not None
-                and now - self.auto_time >= self.auto_timeout):
+        if not self.auto_enabled:
+            if self.lb_time is None or now - self.lb_time >= self.manual_holdoff:
+                self.lb_time = None
+                self._switch(True, now)
+        elif self.auto_time is not None and now - self.auto_time >= self.auto_timeout:
             self.auto_command = None
             self.auto_time = None
             self.auto_reason = 'auto_command_timeout'
 
     def receive_joy(self, axes, buttons, now):
         self._expire(now)
-        if (len(buttons) <= max(self.auto_toggle_button, self.manual.deadman_button)
-                or len(axes) <= max(self.manual.required_axes)
-                or any(button not in (0, 1) for button in buttons)
-                or any(not isfinite(axis) or abs(axis) > 1.001 for axis in axes)):
-            self.joy_time = None
-            self._reset('invalid_joy')
-            return
-        self.joy_time = now
-        toggled = False
-        if buttons[self.auto_toggle_button] == 0:
-            if self.rb_release_since is None:
-                self.rb_release_since = now
-            if now - self.rb_release_since >= self.toggle_release_debounce:
-                self.rb_ready = True
-        else:
-            # Also allow a press following a sufficiently long observed release
-            # without depending on an exact autorepeat sample at the boundary.
-            if (self.rb_release_since is not None
-                    and now - self.rb_release_since >= self.toggle_release_debounce):
-                self.rb_ready = True
-            self.rb_release_since = None
-            if self.rb_ready:
-                self.rb_ready = False
-                self.auto_enabled = not self.auto_enabled
-                self.auto_command = None
-                self.auto_time = None
-                self.auto_reason = 'auto_waiting_command'
-                self.stop_until = now + self.mode_stop_duration
-                self.manual.stop('awaiting_release')
-                self.manual.joy_time = None
-                toggled = True
-        # Never let the manual gate's release/invalid-command path stop AUTO.
-        # On AUTO exit, require a subsequent LB release before manual can arm.
-        if not self.auto_enabled and not toggled:
-            self.manual.receive_joy(axes, buttons, now)
+        # Track LB release/arming in AUTO too; manual commands still need MANUAL.
+        self.manual.receive_joy(axes, buttons, now)
+        if self.manual.joy_time != now or buttons[self.manual.deadman_button] != 1:
+            return  # Invalid Joy or LB up: no takeover.
+        self.lb_time = now
+        if self.auto_enabled:
+            self._switch(False, now)
 
     def receive_command(self, values, now):
         self._expire(now)
@@ -103,7 +81,7 @@ class ControlGate:
     def receive_auto_command(self, values, now):
         self._expire(now)
         if not self.auto_enabled:
-            return  # Do not cache commands received before AUTO entry.
+            return  # Do not cache commands received during a manual takeover.
         if (len(values) != 6 or any(not isfinite(value) for value in values)
                 or any(values[index] != 0.0 for index in (1, 2, 3, 4))):
             self.auto_command = None

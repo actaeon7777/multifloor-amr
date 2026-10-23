@@ -8,3 +8,5 @@ p { color: #526176; }
 .robot span { color: #68768b; font-size: 14px; }
 .robot.online { border-left: 5px solid #2563eb; }
 .robot:focus-visible { outline: 3px solid #2563eb; outline-offset: 3px; }
+.robot em { align-self: flex-start; font-style: normal; font-size: 13px; padding: 3px 8px; border-radius: 6px;
+  background: #fbe7e1; color: #b25948; }

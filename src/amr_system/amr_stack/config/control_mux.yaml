@@ -1,15 +1,21 @@
-# LB held: manual. RB press: toggle AUTO; manual is ignored while AUTO is on.
+# AUTO by default; joystick connection or loss alone never changes the mode.
+# LB pressed: MANUAL at once (autonomous commands ignored), hold LB to drive.
+# manual_holdoff after the last LB sample: AUTO again, manual is ignored.
 control_mux:
   ros__parameters:
     deadman_button: 6
-    auto_toggle_button: 7
     auto_timeout: 0.50      # seconds; stop without falling back to manual
-    toggle_release_debounce: 0.10  # stable RB release before accepting another press
+    manual_holdoff: 0.50    # seconds after the last LB-held /joy before AUTO; >= joy_timeout
     mode_stop_duration: 0.10  # zero output interval on each mode transition
     required_axes: [1, 2]
     joy_timeout: 0.50       # seconds; Joy loss still requires releasing LB again
     command_timeout: 0.50   # seconds; fresh commands resume while Joy/LB remain valid
     release_debounce: 0.10  # seconds to confirm LB release; 0.0 disables debounce
+    # E-stop restart approval at the robot: with LB up and sticks centred, hold
+    # this button approve_hold seconds while the bridge is DISARMED. 11 = Menu (≡)
+    # in the original /joy indices; check with `ros2 topic echo /joy`. -1 disables.
+    approve_button: 11
+    approve_hold: 2.0       # seconds
     publish_rate: 20.0      # periodic refresh Hz; new commands also publish immediately
     max_linear_speed: 1.00  # m/s
     max_angular_speed: 0.80 # rad/s

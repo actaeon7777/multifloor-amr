@@ -89,7 +89,7 @@ def test_maneuver_lease_gates_commands(ros):
     assert ros.spin(3., sent.done)
     assert not sent.result().accepted  # no Nav2 goal while the lease is held
 
-    mode.publish(String(data='MANUAL'))  # RB: lease revoked immediately
+    mode.publish(String(data='MANUAL'))  # LB takeover: lease revoked immediately
     ros.spin(.3)
     mode.publish(String(data='AUTO'))
     ros.spin(.3)

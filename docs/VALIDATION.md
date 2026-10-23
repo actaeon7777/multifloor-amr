@@ -92,12 +92,12 @@ python3 scripts/test_ros_integration.py
 
 | 스위트 | 시험 파일 | 환경변수 | 도메인 | 확인 내용 |
 |---|---|---|---|---|
-| manual | `amr_control/test/test_manual_pipeline.py` | `AMR_RUN_ROS_TESTS` | 173 | dry-run bringup + 가상 `/joy`: 수동 회귀, RB 토글, 타임아웃, `scripts/auto_turn_test.py` 실제 실행과 CAN 미리보기 |
-| can_bridge | `amr_can_bridge/test/test_bridge_ros.py` | `AMR_RUN_CAN_TESTS` | 174 | 독립 브리지 payload·watchdog |
+| manual | `amr_control/test/test_manual_pipeline.py` | `AMR_RUN_ROS_TESTS` | 173 | dry-run bringup + 가상 `/joy`: 수동 회귀, 연결된 조이스틱에서 AUTO 유지·LB 끼어들기·해제 후 AUTO, 타임아웃, `scripts/auto_turn_test.py` 실제 실행과 CAN 미리보기. E-stop 뒤 캐시 폐기, LB 재입력 필요, 조이스틱 길게 눌러 재개 승인 |
+| can_bridge | `amr_can_bridge/test/test_bridge_ros.py` | `AMR_RUN_CAN_TESTS` | 174 | 독립 브리지 payload·watchdog, E-stop 인터록(0x202: 승인 전 송신 없음, ARMING 영속도, gate 닫힘 재무장, 수신 끊김), `tx_rate` 하한 |
 | telemetry | `amr_can_bridge/test/test_telemetry_ros.py` | `AMR_RUN_TELEMETRY_TESTS` | 184 | 실제 CAN 없이 ROS 메시지 |
 | ekf | `amr_stack/test/test_ekf_ros.py` | `AMR_RUN_EKF_TESTS` | 187 | 모순된 입력 제외, 전진·gyro 응답, 평면 제약, TF 연결 |
 | localization | `amr_stack/test/test_localization_ros.py` | `AMR_RUN_LOCALIZATION_TESTS` | 189 | 저장 지도 해상도·원점·late subscriber, map server/AMCL 활성 |
-| navigation_manager | `amr_stack/test/test_navigation_manager_ros.py` | `AMR_RUN_NAVIGATION_TESTS` | 190 | 목표 보관·재개·취소, 기동 임대 |
+| navigation_manager | `amr_stack/test/test_navigation_manager_ros.py` | `AMR_RUN_NAVIGATION_TESTS` | 190 | 목표 취소, LB·E-stop 중단(재개 없음), 기동 임대 |
 | nav2_pipeline | `amr_stack/test/test_navigation_pipeline_ros.py` | `AMR_RUN_NAV2_INTEGRATION` | 191 | 실제 Smac 2D/DWB/복구 + mux + CAN dry-run |
 | web_ui | `amr_web_ui/test/test_web_ui_ros.py` | `AMR_RUN_WEB_UI_TESTS` | 193 | HTTP → 목표 관리기 → 가짜 Nav2, 초기 위치·relocalize, 공용 상태 구독 |
 | vehicle_status | `amr_vehicle_status/test/test_node_ros.py` | `AMR_RUN_VEHICLE_STATUS_TESTS` | 195 | 미연동 플래그, 만료, 시계 불연속, 명령 publisher 부재 |
@@ -173,14 +173,16 @@ ros2 topic echo /localization/status --once --qos-durability transient_local
 | 현장 항목 | 통과 기준 |
 |---|---|
 | CAN·센서 | CAN UP/500,000 bit/s, scan·wheel·IMU·EKF 지속 수신·유효 시각 |
-| 조이스틱 | 실제 이름 일치, LB·RB·축 매핑과 해제·단절 처리 ([확인 순서](REAL_VEHICLE.md#실제-컨트롤러-확인-순서)) |
+| 조이스틱 | 실제 이름 일치, LB·축 매핑과 해제·단절 처리, 전원 ON/OFF → AUTO 유지, LB → 즉시 MANUAL·목표 중단, LB 해제 → 0.5초 뒤 AUTO·재개 없음, 재연결 후 `/joy` 재수신 ([확인 순서](REAL_VEHICLE.md#실제-컨트롤러-확인-순서)) |
 | 위치 | 실제 지도·위치·방향·LiDAR 정합, 감독기 `READY`, 시간 `healthy=true` / `latched=false` |
 | 공용 상태 | 10 Hz, 유효 source와 신선도, 미연동 항목이 정상값으로 표시되지 않음 |
 | 실제 송신 | 점검 dry-run=True와 실제 운용=False를 각 실행에서 구분 |
-| 주행·정지 | 목표 접수·출발·도착, MANUAL 전환·목표 취소·실제 정지 |
+| 주행·정지 | 목표 접수·출발·도착(조이스틱 연결 무관), LB 끼어들기·목표 취소·실제 정지 |
 | 원격 | 실제 호스트 최신 배포, 인증·상태·목표·취소 왕복, 단절 뒤 새 명령 차단·재전송 없음, 층 탭·다른 층 목표 |
 | BMS·드라이버 | 실제 연결 후 값·단위·유효 플래그·입력 중단 판정 |
 | 펌웨어·구동 설정 | 장치 readback으로 STM32/ODrive 버전과 실제 제한값 |
+| E-stop | [ESTOP_CAN_PROTOCOL.md §10](ESTOP_CAN_PROTOCOL.md#10-검증-현황-2026-10-21) 1–7번: `0x202` 주기, 누름 → `ESTOP`·`0x201` 차단, 떼도 `DISARMED` 유지, 승인 → `(0,0)` → `READY` → 새 명령으로만 이동, 짧은 누름, 300 ms 공백 뒤 재무장, 수신 끊김 정지. 추가: 웹 2회 누름·조이스틱 2초 승인, LB·스틱을 누른 채 지난 E-stop 뒤 READY에서 움직이지 않음, 디버거 MCU 리셋 뒤 `DISARMED` 유지, 회전 중 E-stop 시 래치 동안 `/odometry/filtered` yaw 변화 기록 |
+| 엘리베이터 RF | `candump can0,310:7FE`로 0x310·0x311 수신, 카 PRESENCE에도 `invalid` 0, 4F 홀 호출 → `COMPLETED`·BUTTON_ACK, DOOR_OPEN repeat 10 실제 반복, 통과층 정차 뒤 계속 탑승, 문턱 E-stop 시 문 유지, 웹 "엘리베이터 RF" 패널 |
 
 ## 7. 기록 원칙
 

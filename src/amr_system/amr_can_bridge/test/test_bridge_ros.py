@@ -7,6 +7,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +17,9 @@ if os.environ.get('AMR_RUN_CAN_TESTS') != '1':
 import rclpy
 from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import Twist
+from rclpy.parameter import Parameter
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 from amr_can_bridge import cmd_vel_to_can
 
@@ -100,26 +103,42 @@ def test_standalone_watchdog_and_sigterm(ros_context):
         node.destroy_node()
 
 
+class FakeSender:
+    dry_run = False
+    channel = 'fake'
+    can_id = 0x201
+    fail = False
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.sent = []
+        self.incoming = []
+        self.closed_with = None
+
+    def send(self, payload):
+        if self.fail:
+            raise OSError('simulated write failure')
+        self.sent.append(payload)
+
+    def receive(self):
+        frames, self.incoming = self.incoming, []
+        return frames
+
+    def close(self, count=5, **kwargs):
+        self.closed_with = count
+        return []
+
+
+def status_frame(flags=0, trip=0, sequence=0, release=0):
+    return SimpleNamespace(
+        arbitration_id=0x202, is_extended_id=False, is_remote_frame=False, is_error_frame=False,
+        data=struct.pack('<BBHHBB', 1, flags, trip, sequence, release, 0))
+
+
 def test_send_failure_requires_recovery_stop_and_fresh_zero(ros_context, monkeypatch):
-    class FakeSender:
-        dry_run = False
-        channel = 'fake'
-        can_id = 0x201
-        fail = False
-
-        def __init__(self, **kwargs):
-            self.sent = []
-
-        def send(self, payload):
-            if self.fail:
-                raise OSError('simulated write failure')
-            self.sent.append(payload)
-
-        def close(self, **kwargs):
-            return []
-
     monkeypatch.setattr(cmd_vel_to_can, 'CanSender', FakeSender)
-    bridge = cmd_vel_to_can.CmdVelToCan()
+    bridge = cmd_vel_to_can.CmdVelToCan(parameter_overrides=[
+        Parameter('require_estop_status', value=False)])
     stop = Twist()
     moving = Twist()
     moving.linear.x = 0.2
@@ -147,6 +166,86 @@ def test_send_failure_requires_recovery_stop_and_fresh_zero(ros_context, monkeyp
     finally:
         bridge.close()
         bridge.destroy_node()
+
+
+def test_estop_interlock_blocks_until_approval_and_new_commands(ros_context, monkeypatch):
+    monkeypatch.setattr(cmd_vel_to_can, 'CanSender', FakeSender)
+    bridge = cmd_vel_to_can.CmdVelToCan()
+    sender = bridge.sender
+    assert sender.kwargs['receive_ids'] == (0x202,)
+    stop = Twist()
+    moving = Twist()
+    moving.linear.x = 0.2
+    moving.angular.z = 0.4
+    moving_hex = 'cdcc4c3ecdcccc3e'
+
+    def approve():
+        return bridge.approve_resume(Trigger.Request(), Trigger.Response())
+
+    def step(*frames, command=None):
+        sender.incoming.extend(frames)
+        if command is not None:
+            bridge.on_command(command)
+        count = len(sender.sent)
+        bridge.tick()
+        return sender.sent[count:]
+
+    try:
+        assert step(command=stop) == []  # UNKNOWN: no status yet.
+        assert step(status_frame(), command=moving) == []  # DISARMED: clear STM32 is not a restart.
+        assert bridge.state() == 'DISARMED'
+        assert approve().success
+        assert not approve().success  # Already arming.
+        assert step(status_frame(), command=moving) == [bytes(8)]  # ARMING sends zeros only.
+        assert step(status_frame(flags=0x80), command=moving) == [bytes(8)]
+        assert bridge.state() == 'READY'
+        assert step(status_frame(flags=0x80), command=moving) == [bytes(8)]  # Needs a fresh zero.
+        bridge.on_command(stop)
+        assert [p.hex() for p in step(status_frame(flags=0x80), command=moving)] == [moving_hex]
+
+        # Press: nothing is sent, and the release does not restart the robot.
+        assert step(status_frame(flags=0x0F, trip=1), command=moving) == []
+        assert bridge.state() == 'ESTOP'
+        assert not approve().success
+        assert step(status_frame(trip=1, release=1), command=moving) == []
+        assert bridge.state() == 'DISARMED'
+        assert approve().success
+        assert step(status_frame(trip=1, release=1), command=moving) == [bytes(8)]
+        bridge.on_command(stop)
+        assert step(status_frame(flags=0x80, trip=1, release=1)) == [bytes(8)]
+        assert [p.hex() for p in step(status_frame(flags=0x80, trip=1, release=1),
+                                      command=moving)] == [moving_hex]
+
+        # A closed STM32 gate (300 ms gap, fault) re-arms with zeros, without approval,
+        # and the held non-zero command is discarded.
+        assert step(status_frame(trip=1, release=1), command=moving) == [bytes(8)]
+        assert bridge.state() == 'ARMING'
+        assert step(status_frame(trip=1, release=1), command=moving) == [bytes(8)]
+        assert step(status_frame(flags=0x80, trip=1, release=1), command=moving) == [bytes(8)]
+        assert bridge.state() == 'READY'
+        bridge.on_command(stop)
+        assert [p.hex() for p in step(status_frame(flags=0x80, trip=1, release=1),
+                                      command=moving)] == [moving_hex]
+
+        # A short press seen only as a trip_count change still latches.
+        assert step(status_frame(flags=0x80, trip=2, release=2), command=moving) == []
+        assert bridge.state() == 'DISARMED'
+
+        # Losing 0x202 is an E-stop; no shutdown zeros while blocked.
+        bridge.estop.received_at -= 1.0
+        assert step(command=stop) == []
+        assert bridge.state() == 'ESTOP'
+        bridge.close()
+        assert sender.closed_with == 0
+    finally:
+        bridge.close()
+        bridge.destroy_node()
+
+
+def test_tx_rate_must_keep_the_stm32_gate_open(ros_context, monkeypatch):
+    monkeypatch.setattr(cmd_vel_to_can, 'CanSender', FakeSender)
+    with pytest.raises(ValueError, match='tx_rate'):
+        cmd_vel_to_can.CmdVelToCan(parameter_overrides=[Parameter('tx_rate', value=5.0)])
 
 
 @pytest.mark.parametrize('flags', [None, '0x280'])

@@ -48,7 +48,8 @@ def generate_launch_description():
         DeclareLaunchArgument('start_vehicle_status', default_value='true'),
         DeclareLaunchArgument(
             'start_elevator_link', default_value='false',
-            description='Elevator RF relay over CAN (0x210/0x310, proposed IDs); keep false until the STM32 firmware supports it'),
+            description='Elevator RF relay over CAN (0x210/0x310/0x311, ELEVATOR_CAN_PROTOCOL.md v1.1); '
+                        'firmware implemented, keep false until the integration test passes'),
         DeclareLaunchArgument('elevator_link_dry_run', default_value='true'),
         DeclareLaunchArgument('ekf_config', default_value=str(config_dir / 'ekf.yaml')),
         DeclareLaunchArgument('predict_to_current_time', default_value=LaunchConfiguration('use_sim_time'),
@@ -87,7 +88,9 @@ def generate_launch_description():
         ),
         Node(
             package='amr_control', executable='control_mux', name='control_mux',
-            parameters=[LaunchConfiguration('control_config'), {'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool), 'require_time_health': True}], output='screen',
+            parameters=[LaunchConfiguration('control_config'), {'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool), 'require_time_health': True,
+                        # cmd_vel_to_can publishes /estop/status whenever it runs.
+                        'require_estop': ParameterValue(LaunchConfiguration('start_can_bridge'), value_type=bool)}], output='screen',
         ),
         Node(
             package='amr_control', executable='time_health', name='time_health',

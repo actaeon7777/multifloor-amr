@@ -9,7 +9,7 @@ import pytest
 if os.environ.get('AMR_RUN_ELEVATOR_TESTS') != '1':
     pytest.skip('Set AMR_RUN_ELEVATOR_TESTS=1 in domain 193', allow_module_level=True)
 
-from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand
+from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -18,8 +18,8 @@ from std_msgs.msg import String
 
 from amr_can_bridge import elevator_can_link
 from amr_can_bridge.elevator_protocol import (
-    ELEVATOR_COMMAND_CAN_ID, ELEVATOR_EVENT_CAN_ID, EVENT_PRESENCE, LOCATION_HALL, ElevatorEvent,
-    encode_event,
+    ELEVATOR_COMMAND_CAN_ID, ELEVATOR_DIAG_CAN_ID, ELEVATOR_EVENT_CAN_ID, EVENT_PRESENCE,
+    LOCATION_HALL, STATUS_COMPLETED, CommandStatus, ElevatorEvent, encode_diagnostic, encode_event,
 )
 from amr_sim_bridge.elevator_node import ElevatorSimNode
 from amr_stack.floor_config import load_floor_config
@@ -33,11 +33,15 @@ def ros():
     executor = SingleThreadedExecutor()
     probe = rclpy.create_node('elevator_test_probe')
     executor.add_node(probe)
-    beacons, statuses = [], []
+    beacons, statuses, command_statuses, rf_statuses = [], [], [], []
     probe.create_subscription(ElevatorBeacon, 'elevator/beacon', beacons.append, 50)
+    probe.create_subscription(ElevatorCommandStatus, 'elevator/command_status',
+                              command_statuses.append, 20)
     latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     probe.create_subscription(String, 'sim/elevator/status',
                               lambda m: statuses.append(json.loads(m.data)), latched)
+    probe.create_subscription(String, 'elevator/rf_status',
+                              lambda m: rf_statuses.append(json.loads(m.data)), latched)
     command_pub = probe.create_publisher(ElevatorCommand, 'elevator/command', 10)
     inject_pub = probe.create_publisher(String, 'sim/elevator/inject', 10)
     truth_pub = probe.create_publisher(Odometry, 'sim/ground_truth', 10)
@@ -51,8 +55,12 @@ def ros():
         return until is None
 
     yield SimpleNamespace(executor=executor, beacons=beacons, statuses=statuses, spin=spin,
-                          command=command_pub, inject=inject_pub, truth=truth_pub)
+                          command=command_pub, inject=inject_pub, truth=truth_pub,
+                          command_statuses=command_statuses, rf_statuses=rf_statuses)
+    nodes = executor.get_nodes()
     executor.shutdown()
+    for node in nodes:
+        node.destroy_node()
     rclpy.shutdown()
 
 
@@ -72,6 +80,10 @@ def test_simulated_elevator_answers_commands_and_tracks_the_robot(ros):
     assert ros.spin(2., lambda: any(b.event == ElevatorBeacon.EVENT_BUTTON_ACK for b in ros.beacons))
     ack = next(b for b in ros.beacons if b.event == ElevatorBeacon.EVENT_BUTTON_ACK)
     assert (ack.location, ack.floor_code, ack.ack_sequence) == (LOCATION_HALL, 4, 21)
+    assert ros.spin(1., lambda: ros.command_statuses)
+    done = ros.command_statuses[-1]
+    assert (done.cmd_seq, done.status, done.target, done.source) == \
+        (21, ElevatorCommandStatus.STATUS_COMPLETED, 0x44, 'sim')
     assert ros.spin(4., lambda: ros.statuses and ros.statuses[-1]['door'] in ('OPENING', 'OPEN'))
     assert ros.statuses[-1]['car_floor'] == '4F' and ros.statuses[-1]['car_z_m'] == 0.
 
@@ -97,7 +109,8 @@ def test_simulated_elevator_answers_commands_and_tracks_the_robot(ros):
 class LoopbackBus:
     """Echo every elevator command as the STM32 would acknowledge it."""
     def __init__(self, **kwargs):
-        assert {f['can_id'] for f in kwargs['can_filters']} == {ELEVATOR_EVENT_CAN_ID}
+        assert [(f['can_id'], f['can_mask']) for f in kwargs['can_filters']] == [
+            (ELEVATOR_EVENT_CAN_ID, 0x7FE)]  # 0x310 events and 0x311 diagnostics
         self.inbox, self.sent = [], []
 
     def send(self, message, timeout):
@@ -109,6 +122,10 @@ class LoopbackBus:
             is_remote_frame=False, is_error_frame=False, is_fd=False,
             data=encode_event(ElevatorEvent(ElevatorBeacon.EVENT_BUTTON_ACK, 0,
                                             ElevatorBeacon.LOCATION_CAR, 5, sequence, -40))))
+        self.inbox.append(SimpleNamespace(
+            arbitration_id=ELEVATOR_DIAG_CAN_ID, timestamp=time.time(), is_extended_id=False,
+            is_remote_frame=False, is_error_frame=False, is_fd=False,
+            data=encode_diagnostic(CommandStatus(sequence, STATUS_COMPLETED, 0, 0x21, 1))))
 
     def recv(self, timeout):
         return self.inbox.pop(0) if self.inbox else None
@@ -130,8 +147,17 @@ def test_can_link_relays_commands_and_acknowledgements(ros):
     assert (ack.event, ack.location, ack.ack_sequence, ack.source) == \
         (ElevatorBeacon.EVENT_BUTTON_ACK, ElevatorBeacon.LOCATION_CAR, 77, 'can')
     assert node.link.bus.sent[0][1:5] == bytes([77, 2, 3, 0])
+    assert ros.spin(1., lambda: ros.command_statuses)
+    assert (ros.command_statuses[0].cmd_seq, ros.command_statuses[0].source) == (77, 'can')
+    assert ros.spin(1., lambda: ros.rf_statuses and ros.rf_statuses[-1]['last_command'])
+    assert ros.rf_statuses[-1]['last_command']['status'] == 'COMPLETED'
+    door = command(ElevatorCommand.CMD_DOOR_OPEN, 0, 0, 79)
+    door.repeat = 10
+    ros.command.publish(door)
+    assert ros.spin(1., lambda: len(node.link.bus.sent) == 2)
+    assert node.link.bus.sent[1][5] == 10  # repeat byte
     ros.command.publish(command(ElevatorCommand.CMD_HALL_CALL, 3, 0, 78))  # invalid: no direction
     ros.spin(.3)
-    assert len(node.link.bus.sent) == 1
+    assert len(node.link.bus.sent) == 2
     node.close()
     node.destroy_node()

@@ -87,7 +87,7 @@ def launch_mode(context):
             Node(package='amr_elevator', executable='elevator_monitor', name='elevator_monitor',
                  parameters=[{**params, 'initial_floor': start_floor}], output='screen'),
             Node(package='amr_elevator', executable='floor_mission_manager', name='floor_mission_manager',
-                 parameters=[{**params, 'simulation': sim}], output='screen'),
+                 parameters=[{**params, 'simulation': sim, 'require_estop': not sim}], output='screen'),
         ]
         if sim:
             actions.append(Node(package='amr_sim_bridge', executable='elevator_sim_relay',

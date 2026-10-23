@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Watch the AMR drive autonomously in the Isaac Sim GUI. Simulation only (domain 107).
 
-Starts the full sim stack with the Isaac window (RViz only with --rviz), switches control_mux to
-AUTO with the same synthetic Joy heartbeat as run_sim_trial.py, then sends a goal
+Starts the full sim stack with the Isaac window (RViz only with --rviz), waits for control_mux
+AUTO (no joystick is started) as in run_sim_trial.py, then sends a goal
 loop. Failed goals are reported and skipped. Ctrl-C stops everything.
 """
 import argparse

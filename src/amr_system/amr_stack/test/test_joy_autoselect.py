@@ -2,7 +2,7 @@
 
 import pytest
 
-from amr_stack.joy_autoselect import DeviceState, choose_device, wait_for_device
+from amr_stack.joy_autoselect import DeviceState, choose_device, driver_arguments, wait_for_device
 
 
 def controller(instance_id, index, *, axis=0, lb=0, axes=None):
@@ -296,3 +296,16 @@ def test_wait_cancellation_during_final_snapshot_does_not_return_selection():
         reader, lambda: running, lambda _: None, clock=clock, sleep=clock.sleep,
     )
     assert selected is None
+
+
+def test_unique_controller_keeps_name_matching_for_reconnect():
+    original = ['--ros-args', '--params-file', 'joy_teleop.yaml']
+    device = DeviceState(7, 2, 'Xbox Series X Controller', (0,), (0,))
+    assert driver_arguments(original, device, unique=True) == original
+
+
+def test_duplicate_controllers_pin_the_selected_index():
+    original = ['--ros-args', '--params-file', 'joy_teleop.yaml']
+    device = DeviceState(7, 2, 'Xbox Series X Controller', (0,), (0,))
+    assert driver_arguments(original, device, unique=False) == [
+        *original, '--ros-args', '-p', 'device_id:=2', '-p', 'device_name:=""']

@@ -18,6 +18,10 @@ FLOOR_LAYER = 'floor/'
 MAX_FLOORS = 16
 COMMANDS = frozenset(('goal', 'initialpose', 'cancel', 'relocalize'))
 AGED_FIELDS = ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization')
+# Status blocks with their own lease (age may be null before the first message, timeout
+# set by the AMR). The relay adds its delay and withdraws ``fresh`` once the lease ends.
+# E-stop restart approval is deliberately not in COMMANDS: it is given at the robot.
+LEASED_FIELDS = ('estop', 'elevator')
 IDENTIFIER = re.compile(r'[A-Za-z0-9_-]{1,64}')
 REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{8,80}')
 

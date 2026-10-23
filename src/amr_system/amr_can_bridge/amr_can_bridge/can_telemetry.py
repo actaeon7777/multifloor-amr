@@ -209,7 +209,7 @@ class CanTelemetry(Node):
         counters = dict(received=self.received, invalid=self.invalid, stale_frames=self.stale,
                         odometry_published=self.odom_count, imu_published=self.imu_count,
                         wheel_rebases=self.wheels.rebases, wheel_dropped=self.wheels.dropped,
-                        imu_dropped=self.imu.dropped,
+                        imu_dropped=self.imu.dropped, imu_seq_gaps=self.imu.gaps,
                         clock_resets=self.clock_resets,
                         wheel_age_s=now-self.last_wheel if self.last_wheel else -1.,
                         imu_age_s=now-self.last_imu if self.last_imu else -1.)

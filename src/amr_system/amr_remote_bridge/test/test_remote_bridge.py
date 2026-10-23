@@ -173,7 +173,7 @@ def test_local_validation_errors_reach_the_browser(system):
 
 def test_live_api_queue_receipt_is_not_reported_as_ros_acceptance(system):
     shared = system['shared']
-    shared.state.update(preview=False, action_ready=True,
+    shared.state.update(preview=False, action_ready=True, mode='AUTO',
                         robot=dict(x=.5, y=.5, yaw=0, received_at=time.monotonic()))
     shared.update_localization(json.dumps(dict(
         state='READY', ready=True, detail='Synthetic verified pose',
@@ -190,6 +190,21 @@ def test_live_api_queue_receipt_is_not_reported_as_ros_acceptance(system):
     shared.complete('remote_request_001', 'REJECTED', 'Fake Nav2 rejection')
     notice = wait_for(lambda: system['registry'].snapshot('amr-01')['notice'])
     assert notice['status'] == 'REJECTED' and notice['detail'] == 'Fake Nav2 rejection'
+
+
+def test_manual_takeover_rejection_reaches_the_control_server(system):
+    shared = system['shared']
+    shared.state.update(preview=False, action_ready=True, mode='MANUAL',
+                        robot=dict(x=.5, y=.5, yaw=0, received_at=time.monotonic()))
+    shared.update_localization(json.dumps(dict(
+        state='READY', ready=True, detail='Synthetic verified pose',
+        stamp=time.time(), session='relay-test', generation=1)))
+    system['start']()
+    status, _, body = system['request']('/api/goal', payload('takeover_goal_01'))
+    assert status == 409 and '수동 조작' in body.decode()
+    assert shared.commands.empty()
+    shared.state['mode'] = 'AUTO'
+    assert system['request']('/api/goal', payload('takeover_goal_02'))[0] == 202
 
 
 def test_relocalize_translates_map_version_and_deduplicates(system):
@@ -242,6 +257,29 @@ def test_localization_age_includes_relay_delay(system):
     assert state['localization']['age'] > first
     assert state['localization']['age'] >= 2
     assert state['localization']['ready'] is False
+
+
+def test_estop_lease_ages_with_the_relay_and_approval_stays_at_the_robot(system):
+    shared = system['shared']
+    shared.require_estop = True
+    shared.update_estop(json.dumps(dict(
+        session='bridge', sequence=1, stamp=time.time(), epoch=0, state='DISARMED', healthy=False,
+        latched=True, approval_required=True, detail='', reason='', rx_error='', stm32={})))
+    system['agent'].exchange()
+    registry = system['registry']
+    estop = registry.snapshot('amr-01')['estop']
+    assert estop['fresh'] and estop['approval_required'] and estop['state'] == 'DISARMED'
+    (robot,) = registry.roster()
+    assert (robot['estop'], robot['estop_required'], robot['elevator_rf']) == ('DISARMED', True, None)
+    with registry.lock:
+        # Transport still fresh, but the relayed E-stop lease has run out.
+        registry.robots['amr-01'].state['estop']['age'] = .5
+        registry.robots['amr-01'].captured -= .15
+    estop = registry.snapshot('amr-01')['estop']
+    assert estop['age'] >= estop['timeout'] and not estop['fresh'] and not estop['approval_required']
+    status, _, _ = system['request']('/api/estop_approve', dict(request_id='remote_approve_01'))
+    assert status in (400, 404)
+    assert not [kind for kind, _ in system['calls'] if kind == 'estop_approve']
 
 
 def test_vehicle_source_lease_is_separate_from_relay_age(system):

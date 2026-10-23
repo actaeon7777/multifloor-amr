@@ -23,6 +23,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <math.h>
+#include "estop.h"
+#include "elevator_rf.h"
+#include "nrf24.h"
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -39,12 +45,50 @@ typedef struct
 
   uint16_t seq;
 } ImuRawData_t;
+
+/* 0x210 as received from CAN; dlc 0 marks a remote frame. */
+typedef struct
+{
+  uint8_t dlc;
+  uint8_t data[8];
+} ElevCmdMsg_t;
+
+/* 0x310/0x311 waiting for CAN_Task; stamp enforces the 20 ms freshness rule. */
+typedef struct
+{
+  uint16_t id;
+  uint8_t data[8];
+  uint32_t stamp_ms;
+} ElevCanTx_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define CAN_ID_JETSON_DRIVE_CMD     0x201U
+#define CAN_ID_ESTOP_STATUS          0x202U
+#define ESTOP_CAN_PERIOD_MS          100U
+#define ODRV_CMD_ESTOP               0x002U
 #define JETSON_CMD_TIMEOUT_MS       300U
+
+/* Elevator RF relay (ELEVATOR_RF_PROTOCOL.md, ELEVATOR_CAN_PROTOCOL.md) */
+#define RF_FLAG_IRQ                 0x01U
+#define RF_FLAG_CMD                 0x02U
+#define RF_TICK_MS                  10U
+#define RF_TX_TIMEOUT_MS            20U    /* ARC 10 x ARD 500 us ~ 8.5 ms */
+#define RF_CHECK_PERIOD_MS          1000U
+#define ELEV_CAN_FRESH_MS           20U
+#define ELEV_SCAN_FIRST_CH          70U
+#define ELEV_SCAN_CHANNELS          14U    /* 70..83 */
+#define ELEV_SCAN_SAMPLES           100U
+#define ELEV_SCAN_CHUNK             10U    /* ~2 ms busy per chunk, then yield */
+
+/* Independent watchdog: LSI 32 kHz / 64 x 1000 = ~2 s (LSI tolerance 17-47 kHz -> 1.4-3.8 s).
+ * defaultTask kicks it only while CAN_Task, IMU_Task and RF_Task keep beating. */
+#define WDG_IWDG_PR_DIV64           4U
+#define WDG_IWDG_RELOAD             999U
+#define WDG_TASK_STALL_MS           1000U  /* > longest legitimate block (4 x 100 ms CAN TX wait) */
+#define WDG_TASKS                   3U
+#define SYS_STATS_PERIOD_MS         1000U
 
 /*
  * Differential-drive calibration parameters
@@ -144,6 +188,7 @@ typedef struct
 CAN_HandleTypeDef hcan1;
 
 SPI_HandleTypeDef hspi1;
+SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart2;
 
@@ -151,7 +196,7 @@ UART_HandleTypeDef huart2;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for CAN_Task */
@@ -269,6 +314,75 @@ volatile float ik_right_rev_s_raw = 0.0f;
 volatile float ik_left_rev_s_raw = 0.0f;
 volatile float ik_odrv0_cmd_rev_s = 0.0f;
 volatile float ik_odrv1_cmd_rev_s = 0.0f;
+/* Diagnostics only: this firmware intentionally suspends CAN and IMU tasks. */
+volatile uint32_t estop_input_test_mode = 0U;
+volatile uint32_t estop_can_inhibit = 0U;
+volatile uint32_t estop_can_stop_pending = 0U;
+volatile uint32_t estop_can_trip_count = 0U;
+volatile uint32_t estop_can_trip_ms = 0U;
+volatile uint32_t estop_can_stop_queued = 0U;
+volatile uint32_t estop_can_status_queued = 0U;
+volatile uint32_t estop_can_tx_ok = 0U;
+volatile uint32_t estop_can_tx_failed = 0U;
+volatile uint32_t estop_can_tx_timeout = 0U;
+volatile uint32_t estop_can_status_flags = 0U;
+volatile uint32_t estop_can_idle_observed = 0U;
+volatile uint32_t estop_drive_enabled = 0U;
+volatile uint32_t estop_drive_rejected = 0U;
+volatile uint32_t estop_can_task_suspended = 0U;
+volatile uint32_t estop_imu_task_suspended = 0U;
+/* 1 while E-stop frames are in flight or a burst is due: other senders must wait. */
+volatile uint32_t estop_can_mailbox_hold = 0U;
+
+/* Elevator RF relay: RF_Task owns SPI2 and the nRF24. */
+osThreadId_t RF_TaskHandle;
+const osThreadAttr_t RF_Task_attributes = {
+  .name = "RF_Task",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+osMessageQueueId_t elevCmdQueueHandle;
+osMessageQueueId_t elevCanTxQueueHandle;
+volatile uint32_t elev_radio_ok = 0U;
+volatile uint32_t elev_radio_init_count = 0U;
+volatile uint32_t elev_radio_lost_count = 0U;
+volatile uint32_t elev_rx_overflow_count = 0U;
+volatile uint32_t elev_tx_timeout_count = 0U;
+volatile uint32_t elev_cmd_queue_full = 0U;
+volatile uint32_t elev_can_tx_queued = 0U;
+volatile uint32_t elev_can_tx_dropped = 0U;
+volatile uint32_t elev_can_tx_sent = 0U;
+volatile uint32_t elev_can_tx_failed = 0U;
+volatile uint32_t elev_can_tx_stale = 0U;
+volatile uint32_t elev_lat_last_us = 0U;
+volatile uint32_t elev_lat_max_us = 0U;
+volatile uint32_t elev_heap_free = 0U;
+volatile uint32_t elev_rf_task_loops = 0U;
+/* Debugger injection (bench tests without CAN): fill elev_debug_cmd, then set the request. */
+volatile uint32_t elev_debug_cmd_request = 0U;
+volatile uint32_t elev_debug_cmd_count = 0U;
+volatile uint32_t elev_debug_scan_request = 0U;
+volatile uint32_t elev_scan_done = 0U;
+volatile uint8_t elev_debug_cmd[8] __attribute__((aligned(4)));
+volatile uint32_t elev_scan_hits[ELEV_SCAN_CHANNELS];
+static volatile uint32_t rf_irq_cycles;
+
+/* Watchdog and resource diagnostics (read with --prefix sys_). */
+volatile uint32_t sys_reset_csr = 0U;        /* RCC->CSR at boot; bit29 IWDGRSTF = last reset by watchdog */
+volatile uint32_t sys_iwdg_reset = 0U;
+volatile uint32_t sys_beat_can = 0U;
+volatile uint32_t sys_beat_imu = 0U;
+volatile uint32_t sys_beat_rf = 0U;
+volatile uint32_t sys_wdg_stall_mask = 0U;   /* bit0 CAN, bit1 IMU, bit2 RF: kicking stopped */
+volatile uint32_t sys_wdg_kicks = 0U;
+volatile uint32_t sys_stack_free_default = 0U; /* minimum ever free stack, words */
+volatile uint32_t sys_stack_free_can = 0U;
+volatile uint32_t sys_stack_free_imu = 0U;
+volatile uint32_t sys_stack_free_rf = 0U;
+volatile uint32_t sys_heap_free_min = 0U;
+/* Bench test of the reset path only: writing 0xDEAD via SWD stops the kicks (bit31 in the mask). */
+volatile uint32_t sys_debug_wdg_test = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -277,6 +391,7 @@ static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_SPI2_Init(void);
 void StartDefaultTask(void *argument);
 void Start_CAN_Task(void *argument);
 void Start_IMU_Task(void *argument);
@@ -313,6 +428,16 @@ static void ODrive_UpdateTargetFromBodyVelocity(float v_mps, float w_radps);
 static void ODrive_SetBothTargetVelocity(float target_rev_s);
 static void ODrive_SendBothZero(void);
 static void ODrive_SafeStopBoth(void);
+static uint32_t Estop_ReadLevel(void);
+static void Estop_Poll(void);
+static void Estop_Capture(void);
+static uint32_t Estop_Blocked(void);
+static uint32_t Estop_CAN_Service(uint32_t now);
+static uint32_t Elevator_CAN_Service(uint32_t now);
+void Start_RF_Task(void *argument);
+static void Wdg_Start(void);
+static uint32_t Wdg_Supervise(uint32_t now);
+static void Sys_UpdateResourceStats(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -328,7 +453,11 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* Keep the reset cause, then arm the watchdog before any init that could hang. */
+  sys_reset_csr = RCC->CSR;
+  sys_iwdg_reset = ((sys_reset_csr & RCC_CSR_IWDGRSTF) != 0U) ? 1U : 0U;
+  RCC->CSR |= RCC_CSR_RMVF;
+  Wdg_Start();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -352,6 +481,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_CAN1_Init();
   MX_SPI1_Init();
+  MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -376,12 +506,13 @@ int main(void)
   imuRawQueueHandle = osMessageQueueNew (16, sizeof(ImuRawData_t), &imuRawQueue_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  elevCmdQueueHandle = osMessageQueueNew(4, sizeof(ElevCmdMsg_t), NULL);
+  elevCanTxQueueHandle = osMessageQueueNew(16, sizeof(ElevCanTx_t), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* creation of defaultTask */
-  /* defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes); */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* creation of CAN_Task */
   CAN_TaskHandle = osThreadNew(Start_CAN_Task, NULL, &CAN_Task_attributes);
@@ -390,7 +521,15 @@ int main(void)
   IMU_TaskHandle = osThreadNew(Start_IMU_Task, NULL, &IMU_Task_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  /* CAN integration active; preserve the existing IMU producer. */
+  RF_TaskHandle = osThreadNew(Start_RF_Task, NULL, &RF_Task_attributes);
+  if ((defaultTaskHandle == NULL) || (CAN_TaskHandle == NULL) ||
+      (IMU_TaskHandle == NULL) || (imuRawQueueHandle == NULL) ||
+      (RF_TaskHandle == NULL) || (elevCmdQueueHandle == NULL) ||
+      (elevCanTxQueueHandle == NULL)) { Error_Handler(); }
+  estop_input_test_mode = 0U;
+  estop_can_task_suspended = 0U;
+  estop_imu_task_suspended = 0U;
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -535,6 +674,44 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -576,8 +753,10 @@ static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
+  uint32_t estop_saved_primask = __get_PRIMASK();
+  __disable_irq();
+  
+/* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -586,7 +765,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(NRF_CE_GPIO_Port, NRF_CE_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, NRF_CSN_Pin|SPI1_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -594,16 +776,49 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : SPI1_CS_Pin */
-  GPIO_InitStruct.Pin = SPI1_CS_Pin;
+  /*Configure GPIO pin : NRF_IRQ_Pin */
+  GPIO_InitStruct.Pin = NRF_IRQ_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(NRF_IRQ_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : NRF_CE_Pin */
+  GPIO_InitStruct.Pin = NRF_CE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(SPI1_CS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(NRF_CE_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : NRF_CSN_Pin SPI1_CS_Pin */
+  GPIO_InitStruct.Pin = NRF_CSN_Pin|SPI1_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ESTOP_Pin */
+  GPIO_InitStruct.Pin = ESTOP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(ESTOP_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
+  Estop_CoreBoot(Estop_ReadLevel(), HAL_GetTick());
+  Estop_Capture();
+  /* Preserve pending transitions that occurred during GPIO initialization. */
+  __set_PRIMASK(estop_saved_primask);
+  
+/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -644,7 +859,7 @@ static void CAN_Filter_Config(void)
    *  - 0x021: ODrive node 1 heartbeat
    *  - 0x029: ODrive node 1 encoder estimates
    *  - 0x037: ODrive node 1 bus voltage/current
-   * Fourth slot is filled with 0x021 again to avoid accepting an unused ID.
+   *  - 0x210: Jetson elevator button command
    */
   memset(&can_filter, 0, sizeof(can_filter));
 
@@ -655,7 +870,7 @@ static void CAN_Filter_Config(void)
   can_filter.FilterIdHigh = (uint16_t)(ODRV1_ID_HEARTBEAT << 5);
   can_filter.FilterIdLow = (uint16_t)(ODRV1_ID_ENCODER_ESTIMATES << 5);
   can_filter.FilterMaskIdHigh = (uint16_t)(ODRV1_ID_BUS_VOLTAGE_CURRENT << 5);
-  can_filter.FilterMaskIdLow = (uint16_t)(ODRV1_ID_HEARTBEAT << 5);
+  can_filter.FilterMaskIdLow = (uint16_t)(ELEV_CAN_ID_COMMAND << 5);
 
   can_filter.FilterFIFOAssignment = CAN_RX_FIFO0;
   can_filter.FilterActivation = ENABLE;
@@ -695,7 +910,20 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         (rx_header.RTR == CAN_RTR_DATA) &&
         (rx_header.DLC == 8U))
     {
+      float v = ODrive_GetFloat(&rx_data[0]);
+      float w = ODrive_GetFloat(&rx_data[4]);
       jetson_drive_rx_count++;
+      if (Estop_Blocked() || !isfinite(v) || !isfinite(w) || !odrv_both_ready)
+      {
+        estop_drive_rejected++;
+        continue;
+      }
+      /* A fresh zero command after initialization/reset is mandatory. */
+      if (!estop_drive_enabled)
+      {
+        if ((v != 0.0f) || (w != 0.0f)) { estop_drive_rejected++; continue; }
+        estop_drive_enabled = 1U;
+      }
       jetson_drive_last_tick = HAL_GetTick();
 
       jetson_cmd_v_mps = ODrive_GetFloat(&rx_data[0]);
@@ -709,6 +937,23 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
        */
       ODrive_UpdateTargetFromBodyVelocity(jetson_cmd_v_mps, jetson_cmd_w_radps);
 
+      continue;
+    }
+
+    if (rx_header.StdId == ELEV_CAN_ID_COMMAND)
+    {
+      /* Validation (BAD_FRAME/NO_ROUTE) runs in RF_Task, outside the ISR. */
+      ElevCmdMsg_t msg;
+      msg.dlc = (rx_header.RTR == CAN_RTR_DATA) ? (uint8_t)rx_header.DLC : 0U;
+      memcpy(msg.data, rx_data, sizeof(msg.data));
+      if (osMessageQueuePut(elevCmdQueueHandle, &msg, 0U, 0U) == osOK)
+      {
+        (void)osThreadFlagsSet(RF_TaskHandle, RF_FLAG_CMD);
+      }
+      else
+      {
+        elev_cmd_queue_full++;
+      }
       continue;
     }
 
@@ -991,6 +1236,7 @@ static void CAN_ResetOdriveRuntimeState(void)
   odrv1_hb_timeout = 1U;
 
   odrv_both_ready = 0U;
+  estop_drive_enabled = 0U;
   odrv_last_vel_cmd_tick = 0U;
   ODrive_SetBothTargetVelocity(TEST_STOP_REV_S);
 }
@@ -1058,6 +1304,11 @@ static uint8_t CAN_WaitTxComplete(uint32_t tx_mailbox, uint32_t timeout_ms)
 
   while (HAL_CAN_IsTxMessagePending(&hcan1, tx_mailbox))
   {
+    if (Estop_Blocked())
+    {
+      (void)HAL_CAN_AbortTxRequest(&hcan1, tx_mailbox);
+      return 0U;
+    }
     if ((osKernelGetTickCount() - start_tick) > timeout_ms)
     {
       HAL_CAN_AbortTxRequest(&hcan1, tx_mailbox);
@@ -1069,7 +1320,10 @@ static uint8_t CAN_WaitTxComplete(uint32_t tx_mailbox, uint32_t timeout_ms)
     osDelay(1);
   }
 
-  return 1U;
+  return ((hcan1.Instance->TSR &
+          ((tx_mailbox == CAN_TX_MAILBOX0) ? CAN_TSR_TXOK0 :
+           (tx_mailbox == CAN_TX_MAILBOX1) ? CAN_TSR_TXOK1 : CAN_TSR_TXOK2)) != 0U)
+         && !Estop_Blocked();
 }
 
 static uint8_t ODrive_RequestFrame(uint8_t node_id, uint32_t cmd_id)
@@ -1077,6 +1331,8 @@ static uint8_t ODrive_RequestFrame(uint8_t node_id, uint32_t cmd_id)
   CAN_TxHeaderTypeDef tx_header;
   uint8_t tx_data[1] = {0};
   uint32_t tx_mailbox;
+  uint32_t irq;
+  HAL_StatusTypeDef added;
 
   tx_header.StdId = ODRV_CAN_ID(node_id, cmd_id);
   tx_header.ExtId = 0x00;
@@ -1085,7 +1341,12 @@ static uint8_t ODrive_RequestFrame(uint8_t node_id, uint32_t cmd_id)
   tx_header.DLC = 0;
   tx_header.TransmitGlobalTime = DISABLE;
 
-  if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) != HAL_OK)
+  irq = __get_PRIMASK();
+  __disable_irq();
+  if (Estop_Blocked()) { __set_PRIMASK(irq); return 0U; }
+  added = HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+  __set_PRIMASK(irq);
+  if (added != HAL_OK)
   {
     can_tx_add_error_count++;
     odrv_req_error_count++;
@@ -1107,6 +1368,8 @@ static uint8_t ODrive_SendFrame(uint8_t node_id, uint32_t cmd_id, const uint8_t 
   CAN_TxHeaderTypeDef tx_header;
   uint8_t tx_data[8] = {0};
   uint32_t tx_mailbox;
+  uint32_t irq;
+  HAL_StatusTypeDef added;
   uint8_t i;
 
   if (dlc > 8U)
@@ -1127,7 +1390,12 @@ static uint8_t ODrive_SendFrame(uint8_t node_id, uint32_t cmd_id, const uint8_t 
   tx_header.DLC = dlc;
   tx_header.TransmitGlobalTime = DISABLE;
 
-  if (HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox) != HAL_OK)
+  irq = __get_PRIMASK();
+  __disable_irq();
+  if (Estop_Blocked()) { __set_PRIMASK(irq); return 0U; }
+  added = HAL_CAN_AddTxMessage(&hcan1, &tx_header, tx_data, &tx_mailbox);
+  __set_PRIMASK(irq);
+  if (added != HAL_OK)
   {
     can_tx_add_error_count++;
     odrv_tx_error_count++;
@@ -1338,6 +1606,478 @@ static void ODrive_SafeStopBoth(void)
   odrv_safe_stop_count++;
   odrv_both_ready = 0U;
 }
+
+static uint32_t Estop_ReadLevel(void)
+{
+  return (HAL_GPIO_ReadPin(ESTOP_GPIO_Port, ESTOP_Pin) == GPIO_PIN_SET) ? 1U : 0U;
+}
+
+static void Estop_Poll(void)
+{
+  uint32_t saved_primask = __get_PRIMASK();
+  uint32_t level;
+  uint32_t now;
+  uint32_t pending;
+  __disable_irq();
+  level = Estop_ReadLevel();
+  now = HAL_GetTick();
+  pending = (__HAL_GPIO_EXTI_GET_IT(ESTOP_Pin) != RESET) ? 1U : 0U;
+  Estop_CorePoll(level, now, pending | estop_can_stop_pending);
+  Estop_CoreGuard(Estop_ReadLevel());
+  Estop_Capture();
+  __set_PRIMASK(saved_primask);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == ESTOP_Pin)
+  {
+    uint32_t level = Estop_ReadLevel();
+    uint32_t now = HAL_GetTick();
+    Estop_CoreEdge(level, now);
+    Estop_Capture();
+  }
+  else if (GPIO_Pin == NRF_IRQ_Pin)
+  {
+    rf_irq_cycles = DWT->CYCCNT;
+    if (RF_TaskHandle != NULL) { (void)osThreadFlagsSet(RF_TaskHandle, RF_FLAG_IRQ); }
+  }
+  /* PC13/B1 (EXTI15_10) is not the E-stop input. */
+}
+
+
+/* ISR publishes a sticky event; only CAN_Task calls the CAN HAL. */
+static void Estop_Capture(void)
+{
+  if (estop_latched && !estop_can_inhibit)
+  {
+    estop_can_inhibit = 1U;
+    estop_can_stop_pending = 1U;
+    estop_can_trip_count++;
+    estop_can_trip_ms = HAL_GetTick();
+    estop_drive_enabled = 0U;
+  }
+}
+
+static uint32_t Estop_Blocked(void)
+{
+  uint32_t irq = __get_PRIMASK(), blocked;
+  __disable_irq();
+  Estop_CoreGuard(Estop_ReadLevel());
+  Estop_Capture();
+  blocked = estop_latched | estop_can_inhibit;
+  __set_PRIMASK(irq);
+  return blocked;
+}
+
+/* A burst owns all three mailboxes until completion/abort. TX interrupts stay
+ * disabled: TSR.TXOK is collected before any mailbox is reused. No busy wait. */
+static uint32_t Estop_CAN_Service(uint32_t now)
+{
+  static uint32_t active, tracked, sent_at, phase, last_round;
+  static uint32_t last_status, sequence, last_flags = UINT32_MAX;
+  uint32_t irq, flags, mb, i, tsr, aborting = 0U, released = 0U;
+  uint8_t data[8] = {0};
+  CAN_TxHeaderTypeDef h = {0};
+  const uint32_t all = CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2;
+  estop_can_mailbox_hold = 0U;
+  (void)Estop_Blocked();
+  irq = __get_PRIMASK();
+  __disable_irq();
+  if (estop_can_stop_pending)
+  {
+    (void)HAL_CAN_AbortTxRequest(&hcan1, all);
+    tracked = 0U;
+    active = 1U;
+    phase = 0U;
+    last_round = now - ESTOP_CAN_PERIOD_MS;
+    last_flags = UINT32_MAX;
+    estop_can_stop_pending = 0U;
+    odrv_both_ready = 0U;
+    estop_drive_enabled = 0U;
+    ODrive_SetBothTargetVelocity(0.0f);
+    jetson_cmd_v_mps = jetson_cmd_w_radps = 0.0f;
+    jetson_drive_last_tick = 0U;
+    aborting = 1U;
+  }
+  else if (active && !estop_latched)
+  {
+    /* Only a debounced release (ESTOP_AUTO_RELEASE) or explicit reset reaches here. */
+    (void)HAL_CAN_AbortTxRequest(&hcan1, all);
+    tracked = 0U;
+    active = 0U;
+    estop_can_inhibit = 0U;
+    CAN_ResetOdriveRuntimeState();
+    jetson_drive_last_tick = 0U;
+    jetson_cmd_v_mps = jetson_cmd_w_radps = 0.0f;
+    odrv_control_step = 0U;
+    odrv_step_tick = now;
+    last_flags = UINT32_MAX;
+    aborting = 1U;
+    released = 1U;
+  }
+  __set_PRIMASK(irq);
+  /* IMU frames are held back while stopped; drop samples that went stale. */
+  if (released) { (void)osMessageQueueReset(imuRawQueueHandle); }
+  if (aborting) { return 1U; }
+
+  if (tracked)
+  {
+    if (HAL_CAN_IsTxMessagePending(&hcan1, tracked))
+    {
+      if ((uint32_t)(now - sent_at) >= CAN_CRITICAL_TX_TIMEOUT_MS)
+      {
+        (void)HAL_CAN_AbortTxRequest(&hcan1, tracked);
+        estop_can_tx_timeout++;
+        sent_at = now;
+      }
+      estop_can_mailbox_hold = 1U; /* own frames in flight: TXOK must stay ours */
+      return 1U;
+    }
+    tsr = hcan1.Instance->TSR;
+    for (i = 0U; i < 3U; i++)
+    {
+      if (!(tracked & (1UL << i))) { continue; }
+      if (tsr & (CAN_TSR_TXOK0 << (8U * i))) { estop_can_tx_ok++; }
+      else { estop_can_tx_failed++; }
+    }
+    tracked = 0U;
+  }
+  ODrive_UpdateTimeouts(now);
+  CAN_UpdateDebugRegisters();
+  estop_can_idle_observed =
+      (!odrv0_hb_timeout && !odrv1_hb_timeout &&
+       odrv0_axis_state == ODRV_AXIS_STATE_IDLE && odrv1_axis_state == ODRV_AXIS_STATE_IDLE &&
+       (!active || ((int32_t)(odrv0_last_rx_tick - estop_can_trip_ms) > 0 &&
+                    (int32_t)(odrv1_last_rx_tick - estop_can_trip_ms) > 0))) ? 1U : 0U;
+  flags = (estop_raw ? 1U : 0U) | (estop_debounced ? 2U : 0U) |
+          (estop_latched ? 4U : 0U) | (estop_can_inhibit ? 8U : 0U) |
+          (estop_can_idle_observed ? 16U : 0U) | (can_busoff ? 32U : 0U) |
+          ((!odrv0_hb_timeout && !odrv1_hb_timeout) ? 64U : 0U) |
+          (estop_drive_enabled ? 128U : 0U);
+  estop_can_status_flags = flags;
+  if (!active && flags == last_flags &&
+      (uint32_t)(now - last_status) < ESTOP_CAN_PERIOD_MS) { return 0U; }
+  if (active && phase == 0U &&
+      (uint32_t)(now - last_round) < ESTOP_CAN_PERIOD_MS &&
+      flags == last_flags) { return 1U; }
+
+  /* Prior IMU/elevator sends must finish before reserving the three-mailbox burst.
+   * While stopping they are aborted at once; otherwise after 100 ms, so a
+   * disconnected bus cannot leave stale frames occupying slots forever. */
+  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) != 3U)
+  {
+    estop_can_mailbox_hold = 1U;
+    if (active || ((uint32_t)(now - last_status) >= CAN_CRITICAL_TX_TIMEOUT_MS))
+    { (void)HAL_CAN_AbortTxRequest(&hcan1, all); }
+    return 1U;
+  }
+  h.IDE = CAN_ID_STD;
+  h.RTR = CAN_RTR_DATA;
+  irq = __get_PRIMASK();
+  __disable_irq();
+  /* Recheck after building flags: a new EXTI must be handled first. */
+  if (estop_can_stop_pending) { __set_PRIMASK(irq); return 1U; }
+  if (active)
+  {
+    for (i = 0U; i < 2U; i++)
+    {
+      h.StdId = ODRV_CAN_ID(i, phase == 0U ? ODRV_CMD_ESTOP : ODRV_CMD_SET_AXIS_STATE);
+      h.DLC = phase == 0U ? 0U : 4U;
+      data[0] = 1U; /* little endian IDLE, ignored for DLC=0 */
+      if (HAL_CAN_AddTxMessage(&hcan1, &h, data, &mb) == HAL_OK)
+      { tracked |= mb; estop_can_stop_queued++; }
+      else { estop_can_tx_failed++; }
+    }
+    if (phase == 0U) { last_round = now; phase = 1U; }
+    else { phase = 0U; }
+  }
+  h.StdId = CAN_ID_ESTOP_STATUS;
+  h.DLC = 8U;
+  data[0] = 1U;
+  data[1] = (uint8_t)flags;
+  data[2] = (uint8_t)estop_can_trip_count;
+  data[3] = (uint8_t)(estop_can_trip_count >> 8);
+  data[4] = (uint8_t)sequence;
+  data[5] = (uint8_t)(sequence >> 8);
+  data[6] = (uint8_t)estop_reset_accepted;
+  data[7] = (uint8_t)estop_reset_rejected;
+  if (HAL_CAN_AddTxMessage(&hcan1, &h, data, &mb) == HAL_OK)
+  {
+    tracked |= mb;
+    sequence++;
+    estop_can_status_queued++;
+    last_flags = flags;
+    last_status = now;
+  }
+  else { estop_can_tx_failed++; }
+  sent_at = now;
+  estop_can_mailbox_hold = (tracked != 0U) ? 1U : 0U;
+  __set_PRIMASK(irq);
+  return active || tracked;
+}
+
+/* Sends at most one queued 0x310/0x311 per call, never ahead of an E-stop burst. */
+static uint32_t Elevator_CAN_Service(uint32_t now)
+{
+  ElevCanTx_t m;
+  CAN_TxHeaderTypeDef h = {0};
+  uint32_t mb;
+  (void)now;
+  if (estop_can_stop_pending || estop_can_mailbox_hold) { return 0U; }
+  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0U) { return 0U; }
+  while (osMessageQueueGet(elevCanTxQueueHandle, &m, NULL, 0U) == osOK)
+  {
+    /* Delayed reports are dropped, not sent late (Jetson discards > 0.5 s anyway). */
+    if ((int32_t)(HAL_GetTick() - m.stamp_ms) > (int32_t)ELEV_CAN_FRESH_MS)
+    {
+      elev_can_tx_stale++;
+      continue;
+    }
+    h.StdId = m.id;
+    h.IDE = CAN_ID_STD;
+    h.RTR = CAN_RTR_DATA;
+    h.DLC = 8U;
+    h.TransmitGlobalTime = DISABLE;
+    if (HAL_CAN_AddTxMessage(&hcan1, &h, m.data, &mb) == HAL_OK) { elev_can_tx_sent++; }
+    else { elev_can_tx_failed++; }
+    return 1U;
+  }
+  return 0U;
+}
+
+/* elevator_rf.c adapter: called only from RF_Task. */
+void Elev_PortEmitCan(uint32_t std_id, const uint8_t data[ELEV_CAN_LEN])
+{
+  ElevCanTx_t m;
+  m.id = (uint16_t)std_id;
+  memcpy(m.data, data, sizeof(m.data));
+  m.stamp_ms = HAL_GetTick();
+  if (osMessageQueuePut(elevCanTxQueueHandle, &m, 0U, 0U) == osOK) { elev_can_tx_queued++; }
+  else { elev_can_tx_dropped++; }
+}
+
+/* nrf24.c adapter: SPI2 + PB12 CSN + PB2 CE, called only from RF_Task. */
+void Nrf24_PortCsn(uint32_t high)
+{
+  HAL_GPIO_WritePin(NRF_CSN_GPIO_Port, NRF_CSN_Pin, high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+void Nrf24_PortCe(uint32_t high)
+{
+  HAL_GPIO_WritePin(NRF_CE_GPIO_Port, NRF_CE_Pin, high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+uint32_t Nrf24_PortTransfer(const uint8_t *tx, uint8_t *rx, uint32_t len)
+{
+  return HAL_SPI_TransmitReceive(&hspi2, (uint8_t *)tx, rx, (uint16_t)len, 5U) == HAL_OK;
+}
+
+/* Long waits yield to the RTOS; short ones spin on the DWT cycle counter. */
+void Nrf24_PortDelayUs(uint32_t us)
+{
+  uint32_t start;
+  uint32_t cycles;
+  if (us >= 1000U)
+  {
+    osDelay((us + 999U) / 1000U + 1U);
+    return;
+  }
+  start = DWT->CYCCNT;
+  cycles = us * (SystemCoreClock / 1000000U);
+  while ((DWT->CYCCNT - start) < cycles) { }
+}
+
+static void RF_RecordLatency(void)
+{
+  uint32_t us = (DWT->CYCCNT - rf_irq_cycles) / (SystemCoreClock / 1000000U);
+  elev_lat_last_us = us;
+  if (us > elev_lat_max_us) { elev_lat_max_us = us; }
+}
+
+static void RF_ScanChannels(void)
+{
+  uint32_t hits;
+  for (uint32_t c = 0U; c < ELEV_SCAN_CHANNELS; c++)
+  {
+    uint32_t total = 0U;
+    for (uint32_t done = 0U; done < ELEV_SCAN_SAMPLES; done += ELEV_SCAN_CHUNK)
+    {
+      Nrf24_Scan((uint8_t)(ELEV_SCAN_FIRST_CH + c), 1U, ELEV_SCAN_CHUNK, &hits);
+      total += hits;
+      sys_beat_rf++;
+      osDelay(1); /* keep E-stop polling and CAN_Task running */
+    }
+    elev_scan_hits[c] = total;
+  }
+}
+
+/* RF_Task: nRF24 IRQ -> read FIFO -> core -> COMMAND within 3 ms (RF doc 7.5). */
+void Start_RF_Task(void *argument)
+{
+  ElevCmdMsg_t cmd;
+  uint8_t frames[NRF24_RX_MAX][NRF24_PAYLOAD_LEN];
+  uint8_t tx[ELEV_RF_LEN];
+  uint8_t dst = 0U;
+  uint32_t now;
+  uint32_t n;
+  uint32_t rpd;
+  uint32_t ovf;
+  uint32_t tx_active = 0U;
+  uint32_t tx_started = 0U;
+  uint32_t last_check;
+  (void)argument;
+
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  now = HAL_GetTick();
+  Elev_CoreInit(now);
+  elev_radio_ok = Nrf24_Init(ELEV_AMR_NODE, ELEV_BROADCAST_NODE);
+  elev_radio_init_count++;
+  Elev_SetRadioOk(elev_radio_ok);
+  last_check = now;
+
+  for (;;)
+  {
+    (void)osThreadFlagsWait(RF_FLAG_IRQ | RF_FLAG_CMD, osFlagsWaitAny, RF_TICK_MS);
+    now = HAL_GetTick();
+    elev_rf_task_loops++;
+    sys_beat_rf++;
+
+    if (elev_radio_ok)
+    {
+      if (tx_active)
+      {
+        uint32_t outcome = Nrf24_PollTx();
+        if (outcome != NRF24_TX_BUSY)
+        {
+          tx_active = 0U;
+          Elev_OnTxResult(outcome == NRF24_TX_OK, now);
+        }
+        else if ((uint32_t)(now - tx_started) > RF_TX_TIMEOUT_MS)
+        {
+          Nrf24_AbortTx();
+          tx_active = 0U;
+          elev_tx_timeout_count++;
+          Elev_NoteTxTimeout();
+          Elev_OnTxResult(0U, now);
+        }
+      }
+      /* IRQ is level-low until cleared; polling the pin also covers a missed edge. */
+      if (!tx_active && (HAL_GPIO_ReadPin(NRF_IRQ_GPIO_Port, NRF_IRQ_Pin) == GPIO_PIN_RESET))
+      {
+        n = Nrf24_ReadRx(frames, NRF24_RX_MAX, &rpd, &ovf);
+        if (ovf) { elev_rx_overflow_count++; Elev_NoteRxOverflow(); }
+        for (uint32_t i = 0U; i < n; i++)
+        {
+          if (Elev_OnRfFrame(frames[i], NRF24_PAYLOAD_LEN, rpd, now, tx, &dst) && !tx_active)
+          {
+            Nrf24_StartTx(dst, tx);
+            RF_RecordLatency();
+            tx_active = 1U;
+            tx_started = now;
+          }
+        }
+      }
+    }
+
+    while (osMessageQueueGet(elevCmdQueueHandle, &cmd, NULL, 0U) == osOK)
+    {
+      Elev_OnCanCommand(cmd.data, cmd.dlc, now);
+    }
+    if (elev_debug_cmd_request != 0U)
+    {
+      uint8_t d[8];
+      for (uint32_t i = 0U; i < sizeof(d); i++) { d[i] = elev_debug_cmd[i]; }
+      elev_debug_cmd_request = 0U;
+      elev_debug_cmd_count++;
+      Elev_OnCanCommand(d, sizeof(d), now);
+    }
+    if ((elev_debug_scan_request != 0U) && elev_radio_ok && !tx_active)
+    {
+      elev_debug_scan_request = 0U;
+      RF_ScanChannels();
+      elev_scan_done++;
+      now = HAL_GetTick();
+    }
+
+    /* Re-verify the radio every second; a supply dip resets the module's registers. */
+    if (((uint32_t)(now - last_check) >= RF_CHECK_PERIOD_MS) && !tx_active)
+    {
+      last_check = now;
+      if (elev_radio_ok && !Nrf24_CheckConfig())
+      {
+        elev_radio_ok = 0U;
+        elev_radio_lost_count++;
+      }
+      if (!elev_radio_ok)
+      {
+        elev_radio_ok = Nrf24_Init(ELEV_AMR_NODE, ELEV_BROADCAST_NODE);
+        elev_radio_init_count++;
+      }
+      Elev_SetRadioOk(elev_radio_ok);
+      elev_heap_free = xPortGetFreeHeapSize();
+    }
+    Elev_Tick(now);
+  }
+}
+
+/* IWDG cannot be stopped once started. It freezes while a debugger halts the core. */
+static void Wdg_Start(void)
+{
+  DBGMCU->APB1FZ |= DBGMCU_APB1_FZ_DBG_IWDG_STOP;
+  IWDG->KR = 0xCCCCU;   /* start (LSI turns on) */
+  IWDG->KR = 0x5555U;   /* unlock PR/RLR */
+  IWDG->PR = WDG_IWDG_PR_DIV64;
+  IWDG->RLR = WDG_IWDG_RELOAD;
+  while (IWDG->SR != 0U) { }
+  IWDG->KR = 0xAAAAU;
+}
+
+/* Called from defaultTask (2 ms). Kicks only while every monitored task beat within
+ * WDG_TASK_STALL_MS; a hung defaultTask, scheduler or ISR stops the kicks as well. */
+static uint32_t Wdg_Supervise(uint32_t now)
+{
+  static uint32_t seen[WDG_TASKS];
+  static uint32_t changed_ms[WDG_TASKS];
+  static uint32_t started;
+  const uint32_t beat[WDG_TASKS] = {sys_beat_can, sys_beat_imu, sys_beat_rf};
+  uint32_t stalled = 0U;
+
+  for (uint32_t i = 0U; i < WDG_TASKS; i++)
+  {
+    if (!started || (beat[i] != seen[i]))
+    {
+      seen[i] = beat[i];
+      changed_ms[i] = now;
+    }
+    else if ((uint32_t)(now - changed_ms[i]) > WDG_TASK_STALL_MS)
+    {
+      stalled |= 1UL << i;
+    }
+  }
+  started = 1U;
+  if (sys_debug_wdg_test == 0xDEADU) { stalled |= 0x80000000UL; }
+  sys_wdg_stall_mask = stalled;
+  if (stalled == 0U)
+  {
+    IWDG->KR = 0xAAAAU;
+    sys_wdg_kicks++;
+  }
+  return stalled;
+}
+
+/* Minimum-ever free stack per task (words) and heap, for sizing checks. */
+static void Sys_UpdateResourceStats(void)
+{
+  sys_stack_free_default = uxTaskGetStackHighWaterMark(NULL);
+  sys_stack_free_can = uxTaskGetStackHighWaterMark((TaskHandle_t)CAN_TaskHandle);
+  sys_stack_free_imu = uxTaskGetStackHighWaterMark((TaskHandle_t)IMU_TaskHandle);
+  sys_stack_free_rf = uxTaskGetStackHighWaterMark((TaskHandle_t)RF_TaskHandle);
+  sys_heap_free_min = xPortGetMinimumEverFreeHeapSize();
+}
+
 /* USER CODE END 4 */
 
 
@@ -1351,12 +2091,23 @@ static void ODrive_SafeStopBoth(void)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
+  (void)argument;
+  uint32_t period_ticks = (osKernelGetTickFreq() * ESTOP_POLL_MS + 999U) / 1000U;
+  if (period_ticks == 0U) { period_ticks = 1U; }
+  uint32_t stats_tick = HAL_GetTick() - SYS_STATS_PERIOD_MS;
+  for (;;)
   {
-    osDelay(1);
+    Estop_Poll();
+    (void)Wdg_Supervise(HAL_GetTick());
+    if ((uint32_t)(HAL_GetTick() - stats_tick) >= SYS_STATS_PERIOD_MS)
+    {
+      stats_tick = HAL_GetTick();
+      Sys_UpdateResourceStats();
+    }
+    osDelay(period_ticks);
   }
-  /* USER CODE END 5 */
+  
+/* USER CODE END 5 */
 }
 
 /* USER CODE BEGIN Header_Start_CAN_Task */
@@ -1392,12 +2143,19 @@ void Start_CAN_Task(void *argument)
   for (;;)
   {
     now_tick = HAL_GetTick();
+    sys_beat_can++;
 
+    uint32_t safety_busy = Estop_CAN_Service(now_tick);
     if (CAN_RecoverIfBusOff(now_tick) != 0U)
     {
       osDelay(10);
       continue;
     }
+
+    /* Elevator relay keeps reporting during an E-stop latch (CAN doc 6). */
+    (void)Elevator_CAN_Service(now_tick);
+
+    if (safety_busy || Estop_Blocked()) { osDelay(1); continue; }
 
     if (osMessageQueueGet(imuRawQueueHandle, &imu_sample, NULL, 1U) == osOK)
     {
@@ -1454,6 +2212,7 @@ void Start_CAN_Task(void *argument)
       }
 
       jetson_cmd_timeout = 1U;
+      estop_drive_enabled = 0U;
       jetson_cmd_v_mps = 0.0f;
       jetson_cmd_w_radps = 0.0f;
       ODrive_SetBothTargetVelocity(TEST_STOP_REV_S);
@@ -1463,6 +2222,7 @@ void Start_CAN_Task(void *argument)
       jetson_cmd_timeout = 0U;
     }
 
+    if (Estop_Blocked()) { continue; }
     switch (odrv_control_step)
     {
     case 0:
@@ -1715,6 +2475,7 @@ void Start_IMU_Task(void *argument)
   for (;;)
   {
     now_tick = HAL_GetTick();
+    sys_beat_imu++;
 
     /*
      * WHO_AM_I is checked periodically, not every sample.

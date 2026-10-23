@@ -14,6 +14,11 @@ class FakeBus:
         self.messages = []
         self.is_shutdown = False
         self.fail = False
+        self.incoming = []
+
+    def recv(self, timeout):
+        assert timeout == 0.0
+        return self.incoming.pop(0) if self.incoming else None
 
     def send(self, message, timeout):
         self.messages.append((message, timeout))
@@ -71,8 +76,26 @@ def test_shutdown_attempts_all_stops_and_closes_on_send_error():
     assert bus.is_shutdown
 
 
+def test_receive_filters_and_drains_without_blocking():
+    pytest.importorskip('can')
+    bus = FakeBus()
+    sender = CanSender(dry_run=False, receive_ids=(0x202,), bus_factory=lambda **kwargs: bus)
+    seen = {}
+    CanSender(dry_run=False, receive_ids=(0x202,),
+              bus_factory=lambda **kwargs: seen.update(kwargs) or FakeBus())
+    assert seen['can_filters'] == [{'can_id': 0x202, 'can_mask': 0x7ff, 'extended': False}]
+    seen.clear()
+    CanSender(dry_run=False, bus_factory=lambda **kwargs: seen.update(kwargs) or FakeBus())
+    assert 'can_filters' not in seen  # TX-only sockets keep their previous configuration.
+    bus.incoming = ['a', 'b', 'c']
+    assert sender.receive(limit=2) == ['a', 'b']
+    assert sender.receive() == ['c']
+    assert sender.receive() == []
+    assert CanSender(dry_run=True, receive_ids=(0x202,)).receive() == []
+
+
 @pytest.mark.parametrize('kwargs', [
-    {'can_id': -1}, {'can_id': 0x800}, {'channel': ''},
+    {'receive_ids': (0x800,)}, {'can_id': -1}, {'can_id': 0x800}, {'channel': ''},
     {'dry_run': 'false'}, {'send_timeout': -1},
 ])
 def test_bad_sender_configuration(kwargs):

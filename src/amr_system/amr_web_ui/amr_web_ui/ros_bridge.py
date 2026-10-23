@@ -23,10 +23,10 @@ from amr_vehicle_interfaces.msg import VehicleStatus
 
 try:  # Multi-floor support is optional: the web UI still runs without the elevator packages.
     from amr_elevator_interfaces.action import NavigateToFloorPose
-    from amr_elevator_interfaces.msg import FloorState
+    from amr_elevator_interfaces.msg import ElevatorCommandStatus, FloorState
     from amr_stack.floor_config import load_floor_config
 except ImportError:  # pragma: no cover - depends on the installed workspace
-    NavigateToFloorPose = FloorState = load_floor_config = None
+    NavigateToFloorPose = ElevatorCommandStatus = FloorState = load_floor_config = None
 import json
 
 from .geometry import Grid, transform_xy, yaw
@@ -38,6 +38,7 @@ class WebBridge(Node):
         super().__init__('amr_web_ui', **kwargs)
         self.shared = shared
         self.shared.require_time_health = self.declare_parameter('require_time_health', False).value
+        self.shared.require_estop = self.declare_parameter('require_estop', False).value
         self.clock_monitor = ClockMonitor()
         self.reset_requested = False
         self.seen_epoch = shared.connection_epoch
@@ -57,6 +58,8 @@ class WebBridge(Node):
                 self.get_logger().warning(f'Multi-floor goals disabled: {error}')
         self.relocalize_client = self.create_client(Trigger, '/localization/relocalize')
         self.pending_relocalize = None
+        self.estop_client = self.create_client(Trigger, '/estop/approve_resume')
+        self.pending_estop = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
         self.goal_handle = None
         self.goal_id = None
@@ -92,12 +95,19 @@ class WebBridge(Node):
         self.subscriptions_list.append(self.create_subscription(
             String, '/system/time_health', lambda m: self.shared.time_health.receive(m.data), latched))
         self.subscriptions_list.append(self.create_subscription(
+            String, '/estop/status', lambda m: self.shared.update_estop(m.data), latched))
+        self.subscriptions_list.append(self.create_subscription(
             Odometry, '/odometry/filtered', self.on_velocity, 5))
         if self.floor_client is not None:
             self.subscriptions_list.append(self.create_subscription(
                 FloorState, '/floor/state', self.on_floor_state, latched))
             self.subscriptions_list.append(self.create_subscription(
                 String, '/floor_mission/status', self.on_floor_mission, latched))
+            self.subscriptions_list.append(self.create_subscription(
+                String, '/elevator/rf_status', lambda m: self.shared.update_elevator_rf(m.data), latched))
+            self.subscriptions_list.append(self.create_subscription(
+                ElevatorCommandStatus, '/elevator/command_status', lambda m: self.shared.update_elevator_command(
+                    m.cmd_seq, m.status, m.device_result, m.target, m.attempts, m.source), 10))
         self.subscriptions_list.append(self.create_subscription(
             VehicleStatus, '/vehicle/status', self.on_vehicle_status, QoSProfile(depth=1)))
         self.create_timer(.05, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
@@ -120,10 +130,11 @@ class WebBridge(Node):
         self.pending_scan = None
         self.pending_vectors.clear()
         self.robot_stamp = self.goal_id = self.goal_handle = None
-        if self.pending_relocalize:
-            future = self.pending_relocalize[0]
-            self.pending_relocalize = None
-            future.cancel()
+        for name in ('pending_relocalize', 'pending_estop'):
+            pending = getattr(self, name)
+            if pending:
+                setattr(self, name, None)
+                pending[0].cancel()
         self.seen_epoch = self.shared.connection_epoch
         self.reset_requested = False
 
@@ -161,7 +172,10 @@ class WebBridge(Node):
     def on_floor_state(self, msg):
         self.set_state(floor=dict(zone=msg.zone, floor=msg.floor, confidence=msg.confidence,
                                   transit_from=msg.transit_from, transit_to=msg.transit_to,
-                                  floor_conflict=msg.floor_conflict, last_event=msg.last_event))
+                                  floor_conflict=msg.floor_conflict, last_event=msg.last_event,
+                                  duplicate_count=msg.duplicate_count,
+                                  out_of_order_count=msg.out_of_order_count,
+                                  stale_count=msg.stale_count))
 
     def on_floor_mission(self, msg):
         try:
@@ -363,6 +377,13 @@ class WebBridge(Node):
             future = self.relocalize_client.call_async(Trigger.Request())
             self.pending_relocalize = (future, request_id, time.monotonic())
             future.add_done_callback(lambda f: self.on_relocalize_response(request_id, f))
+        elif kind == 'estop_approve':
+            if not self.estop_client.service_is_ready():
+                self.shared.complete(request_id, 'FAILED', 'E-stop 재개 승인 서비스에 연결되지 않았습니다.')
+                return
+            future = self.estop_client.call_async(Trigger.Request())
+            self.pending_estop = (future, request_id, time.monotonic())
+            future.add_done_callback(lambda f: self.on_estop_response(request_id, f))
         elif kind == 'cancel':
             if not self.goal_handle or not self.goal_handle.accepted:
                 self.shared.complete(request_id, 'FAILED', '취소할 목표가 없습니다.')
@@ -430,6 +451,18 @@ class WebBridge(Node):
                                                     if result.success else '자동 위치 찾기가 거절되었습니다.'))
         except Exception as error:
             self.shared.complete(request_id, 'FAILED', f'자동 위치 찾기 응답을 확인하지 못했습니다: {error}')
+
+    def on_estop_response(self, request_id, future):
+        if self.pending_estop is None or self.pending_estop[0] is not future:
+            return
+        self.pending_estop = None
+        try:
+            result = future.result()
+            self.shared.complete(request_id, 'APPROVED' if result.success else 'FAILED',
+                                 result.message or ('재개를 승인했습니다.' if result.success
+                                                    else '재개 승인이 거절되었습니다.'))
+        except Exception as error:
+            self.shared.complete(request_id, 'FAILED', f'재개 승인 응답을 확인하지 못했습니다: {error}')
 
     def on_goal_response(self, request_id, future, floor=False):
         if self.goal_id != request_id:
@@ -504,6 +537,11 @@ class WebBridge(Node):
             self.pending_relocalize = None
             future.cancel()
             self.shared.complete(request_id, 'FAILED', '자동 위치 찾기 응답이 지연됩니다. 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
+        if self.pending_estop and time.monotonic()-self.pending_estop[2] > 5:
+            future, request_id, _received = self.pending_estop
+            self.pending_estop = None
+            future.cancel()
+            self.shared.complete(request_id, 'FAILED', '재개 승인 응답이 지연됩니다. E-stop 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
         try:
             self.process_command(self.shared.commands.get_nowait())
         except queue.Empty:

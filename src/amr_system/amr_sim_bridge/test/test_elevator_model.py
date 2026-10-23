@@ -4,7 +4,7 @@ import pytest
 
 from amr_sim_bridge.elevator_model import (
     CMD_CAR_FLOOR, CMD_DOOR_OPEN, CMD_HALL_CALL, DIR_DOWN, DIR_NONE, DIR_UP, EVENT_BUTTON_ACK,
-    EVENT_PRESENCE, LOCATION_CAR, LOCATION_HALL, ElevatorSim,
+    EVENT_PRESENCE, LOCATION_CAR, LOCATION_HALL, STATUS_COMPLETED, STATUS_NO_ROUTE, ElevatorSim,
 )
 
 FLOORS = [('3F', 3), ('4F', 4), ('5F', 5)]
@@ -29,8 +29,9 @@ def acks(frames):
     return [f for f in frames if f.event == EVENT_BUTTON_ACK]
 
 
-def presence(frames, code=None):
-    return [f for f in frames if f.event == EVENT_PRESENCE and (code is None or f.floor_code == code)]
+def presence(frames, code=None, location=LOCATION_HALL):
+    return [f for f in frames if f.event == EVENT_PRESENCE and f.location == location
+            and (code is None or f.floor_code == code)]
 
 
 def test_hall_call_brings_the_car_and_door_cycles():
@@ -114,7 +115,45 @@ def test_unknown_floor_and_malformed_commands_do_nothing():
     model.command(0., CMD_HALL_CALL, 4, DIR_NONE, 2)
     model.command(0., CMD_CAR_FLOOR, 9, DIR_NONE, 3)
     model.command(0., 77, 4, DIR_NONE, 4)
+    model.command(0., CMD_DOOR_OPEN, 0, DIR_NONE, 5, repeat=16)
     assert acks(run(model, 2.)) == [] and not model.status()['moving']
+    # The relay reports a hall call it cannot route (0x311 NO_ROUTE).
+    assert [(s.cmd_seq, s.status) for s in model.take_statuses()] == [(1, STATUS_NO_ROUTE)]
+
+
+def test_door_open_repeat_presses_every_period_and_restarts():
+    model = sim(start_floor='4F', faults={'hold_time_s': 6.})
+    model.step(0.)
+    model.command(0., CMD_HALL_CALL, 4, DIR_UP, 1)
+    run(model, 7.)
+    model.command(7., CMD_DOOR_OPEN, 0, DIR_NONE, 2, repeat=10)
+    frames = run(model, 8.)
+    assert len(acks(frames)) == 1  # One acknowledgement: the repeats have started.
+    statuses = model.take_statuses()
+    assert [(s.cmd_seq, s.status, s.target) for s in statuses][-1] == (2, STATUS_COMPLETED, 0x21)
+    run(model, 19.)  # Last of 10 presses at ~16.2 s, then the 6 s hold.
+    assert model.status()['door'] == 'OPEN' and model.status()['door_open_repeats_left'] == 0
+    run(model, 24.)
+    assert model.status()['door'] in ('CLOSING', 'CLOSED')
+    model.command(24., CMD_DOOR_OPEN, 0, DIR_NONE, 3, repeat=3)
+    run(model, 26.)
+    assert model.status()['door_open_repeats_left'] == 1
+    model.command(26., CMD_DOOR_OPEN, 0, DIR_NONE, 4, repeat=5)  # Restart, not add.
+    run(model, 26.5)
+    assert model.status()['door_open_repeats_left'] == 4
+
+
+def test_car_beacon_is_heard_inside_or_through_the_open_door():
+    model = sim(start_floor='4F', leak_probability=0., faults={'hold_time_s': 6.})
+    model.step(0.)
+    assert presence(run(model, 3.), location=LOCATION_CAR) == []  # Door closed, robot in the hall.
+    model.command(3., CMD_HALL_CALL, 4, DIR_UP, 1)
+    heard = presence(run(model, 7.), location=LOCATION_CAR)
+    assert heard and {f.floor_code for f in heard} == {0}
+    model.set_robot(1., True)
+    run(model, 20.)
+    inside = presence(run(model, 23.), location=LOCATION_CAR)
+    assert model.status()['door'] == 'CLOSED' and inside
 
 
 def test_faults_drop_delay_duplicate_and_lag():

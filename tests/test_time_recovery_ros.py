@@ -18,7 +18,7 @@ from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from rosgraph_msgs.msg import Clock
-from sensor_msgs.msg import Imu, Joy, LaserScan
+from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
@@ -127,7 +127,6 @@ def test_robot_side_gate_blocks_stale_data_clock_fault_and_guard_loss(ros):
         ('imu', Imu, '/imu/data_raw'), ('odom', Odometry, '/odometry/filtered')]}
     tf = TransformBroadcaster(probe)
     command = probe.create_publisher(Twist, '/cmd_vel_auto', 1)
-    joy = probe.create_publisher(Joy, '/joy', 1)
     outputs = []
     probe.create_subscription(Twist, '/cmd_vel', lambda m: outputs.append(m.linear.x), 100)
     enabled = {'scan': True}
@@ -137,12 +136,11 @@ def test_robot_side_gate_blocks_stale_data_clock_fault_and_guard_loss(ros):
             if kind == 'scan' and not enabled['scan']: continue
             msg = pub.msg_type(); msg.header.stamp = Time(seconds=now).to_msg(); pub.publish(msg)
         tf.sendTransform(transform('odom', 'base_footprint', now))
-        joy.publish(Joy(axes=[0., 0., 0.], buttons=[0]*8))
         msg = Twist(); msg.linear.x = .1; command.publish(msg)
     probe.create_timer(.02, publish)
-    mux.gate.auto_enabled = True
+    # No /joy publisher: the mux starts in AUTO (no LB takeover).
     goal = NavigateToPose.Goal(); goal.pose.header.frame_id = 'map'; goal.pose.pose.orientation.w = 1.
-    until(lambda: mux.time_health.healthy() and outputs and outputs[-1] > 0)
+    until(lambda: mux.time_health.healthy() and outputs and outputs[-1] > 0 and manager.mode == 'AUTO')
     assert manager.on_goal(goal) == GoalResponse.ACCEPT
     enabled['scan'] = False
     until(lambda: not mux.time_health.healthy() and outputs[-1] == 0.)

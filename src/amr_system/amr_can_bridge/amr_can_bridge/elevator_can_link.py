@@ -1,30 +1,40 @@
-"""/elevator/command <-> CAN 0x210 and CAN 0x310 -> /elevator/beacon (STM32 RF relay).
+"""/elevator/command <-> CAN 0x210; CAN 0x310/0x311 -> /elevator/beacon, command status, RF status.
 
-The link owns its own SocketCAN socket filtered to the elevator event ID, so the
-existing drive (cmd_vel_to_can) and telemetry (can_telemetry) sockets are untouched.
+The link owns its own SocketCAN socket filtered to the elevator event and diagnostic
+IDs, so the existing drive (cmd_vel_to_can) and telemetry (can_telemetry) sockets are
+untouched. The RF relay is independent of the E-stop: it keeps running while latched.
 dry_run (default) never imports CAN: commands are only previewed on ~/tx_preview.
 """
 
+import json
 from math import isfinite
 import signal
 from threading import Event
 from time import time
+import uuid
 
-from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand
+from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.clock import Clock, ClockType
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from std_msgs.msg import String
 
 from amr_can_bridge.can_sender import require_interface_up
 from amr_can_bridge.elevator_protocol import (
-    ELEVATOR_COMMAND_CAN_ID, ELEVATOR_EVENT_CAN_ID, decode_event, encode_command,
+    ELEVATOR_COMMAND_CAN_ID, ELEVATOR_DIAG_CAN_ID, ELEVATOR_EVENT_CAN_ID, CommandStatus,
+    ElevatorEvent, decode_diagnostic, decode_event, encode_command,
 )
+from amr_can_bridge.elevator_rf_status import ERROR, OK, WARN, RfStatusBoard
+
+# One kernel filter entry passes 0x310 (events) and 0x311 (diagnostics).
+CAN_FILTER = {'can_id': ELEVATOR_EVENT_CAN_ID, 'can_mask': 0x7FE, 'extended': False}
+RECENT_ERROR_WINDOW = 10.  # s; a decode or TX error warns for this long, not forever.
 
 
 class ElevatorLink:
@@ -37,12 +47,13 @@ class ElevatorLink:
         self.max_frame_age = max_frame_age
         self.sent = self.received = self.invalid = self.stale = self.tx_errors = 0
         self.last_error = ''
+        self.last_error_at = None
         if bus is not None:
             import can
             self.can = can
 
-    def command_frame(self, command, floor_code, direction, sequence):
-        payload = encode_command(command, floor_code, direction, sequence)
+    def command_frame(self, command, floor_code, direction, sequence, repeat=0):
+        payload = encode_command(command, floor_code, direction, sequence, repeat)
         if self.bus is not None:
             try:
                 self.bus.send(self.can.Message(
@@ -50,22 +61,27 @@ class ElevatorLink:
                     is_remote_frame=False, is_error_frame=False, is_fd=False, check=True), timeout=.01)
             except Exception as error:
                 self.tx_errors += 1
-                self.last_error = str(error)
+                self.last_error, self.last_error_at = str(error), time()
                 raise
         self.sent += 1
         return payload
 
     def poll(self, now, limit=100):
-        """Return [(event, kernel_stamp)] of fresh, valid frames."""
-        events = []
+        """Return [(record, kernel_stamp)] of fresh, valid frames.
+
+        record is an ElevatorEvent (0x310) or a CommandStatus/LinkStatus/DeviceStatus (0x311).
+        """
+        records = []
         if self.bus is None:
-            return events
+            return records
+        decoders = {ELEVATOR_EVENT_CAN_ID: decode_event, ELEVATOR_DIAG_CAN_ID: decode_diagnostic}
         for _ in range(limit):
             message = self.bus.recv(timeout=0.)
             if message is None:
                 break
-            if (message.arbitration_id != ELEVATOR_EVENT_CAN_ID or message.is_extended_id
-                    or message.is_remote_frame or message.is_error_frame or message.is_fd):
+            decode = decoders.get(message.arbitration_id)
+            if (decode is None or message.is_extended_id or message.is_remote_frame
+                    or message.is_error_frame or message.is_fd):
                 continue
             self.received += 1
             stamp = message.timestamp
@@ -73,11 +89,14 @@ class ElevatorLink:
                 self.stale += 1
                 continue
             try:
-                events.append((decode_event(message.data), stamp))
+                records.append((decode(message.data), stamp))
             except ValueError as error:
                 self.invalid += 1
-                self.last_error = str(error)
-        return events
+                self.last_error, self.last_error_at = str(error), now
+        return records
+
+    def recent_error(self, now):
+        return self.last_error_at is not None and now - self.last_error_at < RECENT_ERROR_WINDOW
 
     def close(self):
         if self.bus is not None:
@@ -106,10 +125,16 @@ class ElevatorCanLink(Node):
                     require_interface_up(channel)
                     bus_factory = SocketcanBus
                 bus = bus_factory(channel=channel, receive_own_messages=False, fd=False,
-                                  can_filters=[{'can_id': ELEVATOR_EVENT_CAN_ID, 'can_mask': 0x7ff,
-                                                'extended': False}])
+                                  can_filters=[dict(CAN_FILTER)])
             self.link = ElevatorLink(bus, max_age)
+            self.board = RfStatusBoard()
+            self.session, self.sequence = str(uuid.uuid4()), 0
             self.beacon_pub = self.create_publisher(ElevatorBeacon, 'elevator/beacon', 20)
+            self.command_status_pub = self.create_publisher(
+                ElevatorCommandStatus, 'elevator/command_status', 20)
+            self.rf_status_pub = self.create_publisher(
+                String, 'elevator/rf_status',
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
             self.preview_pub = self.create_publisher(String, '~/tx_preview', 10)
             self.diag_pub = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
             self.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 10)
@@ -124,35 +149,77 @@ class ElevatorCanLink(Node):
             raise
         self.get_logger().info(
             f'Elevator RF relay on {channel}: TX 0x{ELEVATOR_COMMAND_CAN_ID:03X}, '
-            f'RX 0x{ELEVATOR_EVENT_CAN_ID:03X} (proposed IDs, TODO firmware). '
+            f'RX 0x{ELEVATOR_EVENT_CAN_ID:03X}/0x{ELEVATOR_DIAG_CAN_ID:03X} '
+            '(docs/ELEVATOR_CAN_PROTOCOL.md v1.1). '
             + ('DRY RUN: no CAN socket.' if dry_run else 'LIVE.'))
 
     def on_command(self, message):
         try:
             payload = self.link.command_frame(message.command, message.floor_code,
-                                              message.direction, message.sequence)
+                                              message.direction, message.sequence, message.repeat)
         except Exception as error:  # noqa: BLE001 - report and keep relaying
             self.get_logger().error(f'Elevator command rejected: {error}')
             return
         self.preview_pub.publish(String(data=f'0x{ELEVATOR_COMMAND_CAN_ID:03X} {payload.hex(" ")}'))
 
     def poll(self):
-        for event, stamp in self.link.poll(time()):
-            beacon = ElevatorBeacon(
-                event=event.event, location=event.location, floor_code=event.floor_code,
-                sequence=event.sequence, ack_sequence=event.ack_sequence,
-                rssi_dbm=event.rssi_dbm, source='can')
-            beacon.header.stamp = Time(nanoseconds=round(stamp * 1e9)).to_msg()
-            self.beacon_pub.publish(beacon)
+        now = time()
+        for record, stamp in self.link.poll(now):
+            header_stamp = Time(nanoseconds=round(stamp * 1e9)).to_msg()
+            if isinstance(record, ElevatorEvent):
+                beacon = ElevatorBeacon(
+                    event=record.event, location=record.location, floor_code=record.floor_code,
+                    sequence=record.sequence, ack_sequence=record.ack_sequence,
+                    rssi_dbm=record.rssi_dbm, source='can')
+                beacon.header.stamp = header_stamp
+                self.beacon_pub.publish(beacon)
+                self.board.event(record, now)
+                continue
+            if isinstance(record, CommandStatus):
+                status = ElevatorCommandStatus(
+                    cmd_seq=record.cmd_seq, status=record.status,
+                    device_result=record.device_result, target=record.target,
+                    attempts=record.attempts, source='can')
+                status.header.stamp = header_stamp
+                self.command_status_pub.publish(status)
+            self.board.diagnostic(record, now)
+        if self.board.changed:
+            self.publish_rf_status(now)
+
+    def publish_rf_status(self, now):
+        self.board.changed = False
+        self.sequence += 1
+        link = self.link
+        report = self.board.report(now, live=link.bus is not None)
+        report.update(session=self.session, sequence=self.sequence, stamp=now, counters={
+            k: getattr(link, k) for k in ('sent', 'received', 'invalid', 'stale', 'tx_errors')})
+        self.rf_status_pub.publish(String(data=json.dumps(report)))
 
     def publish_health(self):
+        now = time()
+        self.publish_rf_status(now)
         link = self.link
+        live = link.bus is not None
+        problems = self.board.problems(now, live)
+        level = max([DiagnosticStatus.OK] + [
+            {OK: DiagnosticStatus.OK, WARN: DiagnosticStatus.WARN,
+             ERROR: DiagnosticStatus.ERROR}[severity] for severity, _ in problems])
+        message = '; '.join(text for _, text in problems)
+        if link.recent_error(now):
+            level = max(level, DiagnosticStatus.WARN)
+            message = '; '.join(filter(None, [link.last_error, message]))
         status = DiagnosticStatus(
-            name='amr/elevator_can_link', hardware_id='can',
-            level=DiagnosticStatus.WARN if (link.invalid or link.tx_errors) else DiagnosticStatus.OK,
-            message=link.last_error or ('dry run' if link.bus is None else 'ok'),
+            name='amr/elevator_can_link', hardware_id='can', level=level,
+            message=message or ('dry run' if not live else 'ok'),
             values=[KeyValue(key=k, value=str(getattr(link, k)))
                     for k in ('sent', 'received', 'invalid', 'stale', 'tx_errors')])
+        report = self.board.report(now, live)
+        if report['link'] is not None:
+            status.values += [KeyValue(key=f'link_{k}', value=str(v))
+                              for k, v in report['link'].items()]
+        for beacon in report['beacons']:
+            status.values.append(KeyValue(key=f'beacon_{beacon["label"]}', value=json.dumps(
+                {k: beacon[k] for k in ('presence_age', 'rssi_dbm', 'battery_mv', 'flags')})))
         array = DiagnosticArray(status=[status])
         array.header.stamp = self.get_clock().now().to_msg()
         self.diag_pub.publish(array)

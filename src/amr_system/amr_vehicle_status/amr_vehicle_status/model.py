@@ -4,7 +4,7 @@ from copy import deepcopy
 import math
 
 TIMEOUTS = dict(scan=1., wheel=.75, imu=.75, ekf=.75, joints=.75, command=.75,
-                diagnostics=3., pose=2., localization=2., time=.6)
+                diagnostics=3., pose=2., localization=2., time=.6, estop=.6)
 for _side in ('left', 'right'):
     TIMEOUTS[_side+'_power'] = 2.5  # Bus voltage broadcasts at 1 Hz.
     TIMEOUTS[_side+'_heartbeat'] = .75

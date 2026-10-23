@@ -152,6 +152,16 @@ def test_imu_wrap_duplicate_and_reboot():
     assert imu_pair(imu, 100, 1.3).sequence == 100
     assert imu_pair(imu, 1, 1.4) is None  # Out of order/reset not yet trusted.
     assert imu_pair(imu, 2, 2.).sequence == 2  # Reboot recovery after timeout.
+    assert imu.gaps == 2  # 0 -> 100 and 100 -> 2; the wrap 65535 -> 0 is not a gap.
+
+
+def test_imu_resumes_after_estop_gap():
+    # The STM32 sends no IMU while latched and flushes its queue on release.
+    imu = ImuPairer()
+    assert imu_pair(imu, 10, 1.).sequence == 10
+    assert imu_pair(imu, 11, 1.1).sequence == 11
+    assert imu_pair(imu, 42, 4.2).sequence == 42
+    assert imu.gaps == 1 and imu.dropped == 0
     with pytest.raises(ValueError):
         ImuPairer(gyro_range_dps=42)
     with pytest.raises(ValueError):

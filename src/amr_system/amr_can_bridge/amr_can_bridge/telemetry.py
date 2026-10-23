@@ -160,6 +160,8 @@ class ImuPairer:
         self.bias = tuple(gyro_bias)
         self.pending, self.last = {}, None
         self.dropped = 0
+        # The STM32 stops IMU frames during an E-stop latch, so gaps are expected.
+        self.gaps = 0
 
     def reset_time(self):
         self.pending.clear()
@@ -193,6 +195,8 @@ class ImuPairer:
             self.dropped += 1
             return None
         sample_stamp = max(at, gt)
+        if self.last is not None and (sequence - self.last[0]) & 0xffff > 1:
+            self.gaps += 1
         self.last = (sequence, sample_stamp)
         return ImuSample(sample_stamp, sequence,
                          tuple(v * self.accel_scale for v in accel),

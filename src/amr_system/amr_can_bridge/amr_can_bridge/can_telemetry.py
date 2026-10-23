@@ -2,7 +2,7 @@
 
 from math import cos, isfinite, sin
 import signal
-from threading import Event
+from threading import Event, Lock, Thread
 from time import time, monotonic
 
 from amr_vehicle_interfaces.msg import MotorStatus
@@ -78,8 +78,14 @@ class CanTelemetry(Node):
                 can_filters=[{'can_id': cid, 'can_mask': 0x7ff, 'extended': False}
                              for cid in TELEMETRY_IDS])
             steady = Clock(clock_type=ClockType.STEADY_TIME)
-            self.poll_timer = self.create_timer(.005, self.poll, clock=steady)
+            # A 5 ms poll timer woke the rclpy executor 200 times a second for
+            # ~60 frames (30 % of a Jetson core, 2026-10-24). A thread blocking
+            # in the kernel's recv wakes only when a frame arrives.
+            self.lock = Lock()
+            self.stop_receiving = Event()
             self.health_timer = self.create_timer(1., self.publish_health, clock=steady)
+            self.receiver = Thread(target=self.receive_loop, name='can_telemetry_rx', daemon=True)
+            self.receiver.start()
             self.add_on_set_parameters_callback(lambda _: SetParametersResult(
                 successful=False, reason='Restart telemetry to apply parameter changes'))
         except Exception:
@@ -95,24 +101,41 @@ class CanTelemetry(Node):
     def stamp(seconds):
         return Time(nanoseconds=round(seconds * 1e9)).to_msg()
 
-    def poll(self):
-        try:
+    def receive_loop(self):
+        while not self.stop_receiving.is_set():
+            try:
+                message = self.bus.recv(timeout=.1)
+                self.check_clock()
+                if message is not None:
+                    self.process_message(message, time())
+                self.rx_error = ''
+            except Exception as error:
+                self.rx_error = str(error)
+                self.stop_receiving.wait(.1)
+
+    def check_clock(self):
+        with self.lock:
             if self.clock_monitor.observe(time(), monotonic()):
                 self.wheels.reset_time()
                 self.imu.reset_time()
                 self.last_wheel = self.last_imu = None
                 self.clock_resets += 1
                 self.get_logger().error('System clock changed; sensor time history rebased, pose retained')
-            for _ in range(500):  # Bound executor work even during bus flooding.
-                message = self.bus.recv(timeout=0.)
-                if message is None:
-                    break
-                self.process_message(message, time())
-            self.rx_error = ''
-        except Exception as error:
-            self.rx_error = str(error)
+
+    def poll(self):
+        """Drain frames synchronously (tests and callers without the thread)."""
+        self.check_clock()
+        for _ in range(500):
+            message = self.bus.recv(timeout=0.)
+            if message is None:
+                break
+            self.process_message(message, time())
 
     def process_message(self, message, now):
+        with self.lock:
+            self._process_message(message, now)
+
+    def _process_message(self, message, now):
         try:
             decoded = decode_frame(message.arbitration_id, message.data,
                                    extended=message.is_extended_id, remote=message.is_remote_frame,
@@ -193,6 +216,10 @@ class CanTelemetry(Node):
         self.last_imu, self.imu_count = sample.stamp, self.imu_count + 1
 
     def publish_health(self):
+        with self.lock:
+            self._publish_health()
+
+    def _publish_health(self):
         now = time()
         problems = []
         for name, stamp, limit in [('wheel', self.last_wheel, self.config['wheel_timeout']),
@@ -220,6 +247,10 @@ class CanTelemetry(Node):
         self.diag_pub.publish(msg)
 
     def close(self):
+        if getattr(self, 'stop_receiving', None) is not None:
+            self.stop_receiving.set()
+            if self.receiver.is_alive():
+                self.receiver.join(timeout=1.)
         if self.bus is not None:
             self.bus.shutdown()
             self.bus = None
@@ -235,7 +266,7 @@ def main(args=None):
             previous[signum] = signal.signal(signum, lambda *_: stop.set())
         node = CanTelemetry()
         while rclpy.ok() and not stop.is_set():
-            rclpy.spin_once(node, timeout_sec=.05)
+            rclpy.spin_once(node, timeout_sec=.2)  # 1 Hz health timer only
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as error:

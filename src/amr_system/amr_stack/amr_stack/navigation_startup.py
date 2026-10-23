@@ -100,6 +100,7 @@ class NavigationStartup(Node):
             initialization_update_interval=0.25, tracking_update_interval=1.0,
             tracking_verification_duration=1.0, tracking_verification_samples=4,
             tracking_tf_jump_xy=1.0, tracking_tf_jump_yaw=0.5,
+            tracking_max_xy_std=0.6, tracking_max_yaw_std=0.35,
             max_xy_std=0.35, max_yaw_std=0.25, min_particle_concentration=0.90,
             min_match_ratio=0.70, min_known_ratio=0.85, min_valid_beams=30,
             initialization_max_beams=1080, tracking_max_beams=60,
@@ -1027,12 +1028,20 @@ class NavigationStartup(Node):
                 or not covariance_is_bounded(self.pose.pose.covariance, math.inf, math.inf)):
             return None, 'AMCL 공분산이 유효하지 않습니다.'
         confidence_problem = None
-        if not covariance_is_bounded(self.pose.pose.covariance, self.cfg['max_xy_std'], self.cfg['max_yaw_std']):
+        # Admission limits apply while initializing. Along a long corridor AMCL
+        # legitimately carries 0.36-0.39 m of longitudinal uncertainty between
+        # distinctive features (real vehicle, 2026-10-23), so tracking uses its
+        # own wider limits before raising the diagnostic.
+        phase = 'tracking' if self.prior_verified else 'initial'
+        max_xy = self.cfg['tracking_max_xy_std'] if self.prior_verified else self.cfg['max_xy_std']
+        max_yaw = self.cfg['tracking_max_yaw_std'] if self.prior_verified else self.cfg['max_yaw_std']
+        if not covariance_is_bounded(self.pose.pose.covariance, max_xy, max_yaw):
             xy, heading = self.metrics.get('xy_std'), self.metrics.get('yaw_std')
-            xy_text = '알 수 없음' if xy is None else f'{xy:.3f}m/{self.cfg["max_xy_std"]:.3f}m'
+            xy_text = '알 수 없음' if xy is None else f'{xy:.3f}m/{max_xy:.3f}m'
             yaw_text = ('알 수 없음' if heading is None else
-                        f'{math.degrees(heading):.2f}도/{math.degrees(self.cfg["max_yaw_std"]):.2f}도')
-            confidence_problem = f'초기 위치 검증 기준보다 불확실성이 큽니다. 위치 표준편차 {xy_text}, 방향 표준편차 {yaw_text}.'
+                        f'{math.degrees(heading):.2f}도/{math.degrees(max_yaw):.2f}도')
+            label = '주행 추적 기준' if phase == 'tracking' else '초기 위치 검증 기준'
+            confidence_problem = f'{label}보다 불확실성이 큽니다. 위치 표준편차 {xy_text}, 방향 표준편차 {yaw_text}.'
         try:
             when = Time.from_msg(self.scan.header.stamp)
             transform = self.tf_buffer.lookup_transform(self.cfg['global_frame'], self.scan.header.frame_id, when)
@@ -1056,10 +1065,10 @@ class NavigationStartup(Node):
                     or (not self.prior_verified
                         and (jump_xy > self.cfg['max_xy_std'] or jump_yaw > self.cfg['max_yaw_std']))):
                 return None, 'AMCL 추정 위치와 지도 좌표 변환이 일치하지 않습니다.'
-            if jump_xy > self.cfg['max_xy_std'] or jump_yaw > self.cfg['max_yaw_std']:
+            if jump_xy > max_xy or jump_yaw > max_yaw:
                 confidence_problem = confidence_problem or (
                     f'AMCL 보정 직후 추정 위치와 지도 좌표 변환의 차이가 큽니다. '
-                    f'{jump_xy:.2f}m/{self.cfg["max_xy_std"]:.2f}m, {math.degrees(jump_yaw):.1f}도.')
+                    f'{jump_xy:.2f}m/{max_xy:.2f}m, {math.degrees(jump_yaw):.1f}도.')
             # AMCL must have actually processed a contemporary scan, rather
             # than borrowing an old covariance for a newly published TF.
             if abs(stamp_ns(self.scan.header.stamp)-stamp_ns(self.pose.header.stamp)) > self.cfg['pose_timeout']*1e9:

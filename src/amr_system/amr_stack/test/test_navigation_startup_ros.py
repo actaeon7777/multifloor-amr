@@ -1437,7 +1437,7 @@ def test_tracking_transient_soft_mismatch_preserves_ready_and_verified_prior(
     _assert_tracking_prior_retained(h, faults, saved)
 
 
-@pytest.mark.parametrize('offset,expect_ready', [(.5, True), (1.5, False)])
+@pytest.mark.parametrize('offset,expect_ready', [(.7, True), (1.5, False)])
 def test_tracking_bounded_amcl_tf_jump_is_a_warning_and_a_large_one_closes_the_gate(
         harnesses, monkeypatch, offset, expect_ready):
     h, faults, saved = _ready_tracking_fixture(harnesses, monkeypatch)
@@ -1462,6 +1462,22 @@ def test_tracking_bounded_amcl_tf_jump_is_a_warning_and_a_large_one_closes_the_g
     _assert_tracking_prior_retained(h, faults, saved)
 
 
+def test_tracking_corridor_covariance_below_the_tracking_limit_raises_no_warning(harnesses, monkeypatch):
+    h, faults, saved = _ready_tracking_fixture(harnesses, monkeypatch)
+    original_pose = h.backend.estimated_pose
+
+    def corridor_pose(stamp=None):
+        pose = original_pose(stamp)
+        pose.pose.covariance[0] = pose.pose.covariance[7] = .39 ** 2  # above the 0.35 m admission limit
+        return pose
+
+    monkeypatch.setattr(h.backend, 'estimated_pose', corridor_pose)
+    h.spin(.8)
+    assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
+    assert h.supervisor.metrics['xy_std'] == pytest.approx(.39, abs=.01)
+    _assert_tracking_prior_retained(h, faults, saved)
+
+
 @pytest.mark.parametrize('warning', ['match_ratio', 'known_ratio', 'xy_covariance', 'yaw_covariance'])
 def test_tracking_initial_confidence_limits_are_diagnostics_after_ready(
         harnesses, monkeypatch, warning):
@@ -1473,8 +1489,9 @@ def test_tracking_initial_confidence_limits_are_diagnostics_after_ready(
     def estimated_pose(stamp=None):
         pose = original_pose(stamp)
         if warning == 'xy_covariance':
-            # Exact threshold crossing that aborted the closed-loop Isaac run.
-            pose.pose.covariance[0] = pose.pose.covariance[7] = .352 ** 2
+            # Just past the tracking limit (0.6 m); the former 0.352 m crossing
+            # that aborted the closed-loop Isaac run is now inside it.
+            pose.pose.covariance[0] = pose.pose.covariance[7] = .61 ** 2
         elif warning == 'yaw_covariance':
             pose.pose.covariance[35] = .8
         return pose

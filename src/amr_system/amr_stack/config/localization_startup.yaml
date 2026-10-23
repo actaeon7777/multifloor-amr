@@ -51,6 +51,11 @@ navigation_startup:
     # beyond them the gate closes as before.
     tracking_tf_jump_xy: 1.0
     tracking_tf_jump_yaw: 0.5
+    # Covariance limits for the tracking_warning after READY. The admission
+    # limits (0.35 m / 0.25 rad) stay for initialization; a long corridor
+    # legitimately reaches 0.36-0.39 m between distinctive features.
+    tracking_max_xy_std: 0.6
+    tracking_max_yaw_std: 0.35
     max_xy_std: 0.35
     max_yaw_std: 0.25
     min_particle_concentration: 0.90

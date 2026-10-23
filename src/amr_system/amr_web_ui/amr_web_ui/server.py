@@ -114,6 +114,11 @@ class SharedState:
                 raise ValueError('Invalid localization tracking diagnostics')
             status.update(tracking_warning=warning[:1000], prior_verified=prior_verified,
                           tracking_bad_samples=bad_samples, tracking_bad_duration=bad_duration)
+            # Advisory only: a malformed saved pose is dropped, never trusted.
+            last = value.get('last_pose')
+            keys = ('x', 'y', 'yaw', 'saved_at')
+            status['last_pose'] = ({k: float(last[k]) for k in keys} if isinstance(last, dict) and all(
+                type(last.get(k)) in (int, float) and math.isfinite(last[k]) for k in keys) else None)
             stamp, generation, session = value.get('stamp'), value.get('generation'), value.get('session')
             if (not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not math.isfinite(stamp)
                     or not isinstance(generation, int) or isinstance(generation, bool)
@@ -417,7 +422,12 @@ class SharedState:
 
     def snapshot(self):
         with self.lock:
-            result = deepcopy(self.state)
+            # Writers replace whole entries (set_state), never mutate them, so
+            # one level of copying is enough for the per-call edits below. A
+            # deepcopy of the 3,240-point scan at 5 Hz per client was 30 % of
+            # this process's CPU on the Jetson (py-spy, 2026-10-23).
+            result = {key: (dict(value) if isinstance(value, dict) else value)
+                      for key, value in self.state.items()}
             result['connection_epoch'] = self.connection_epoch
             result['layers'] = {name: grid.metadata() for name, grid in self.grids.items()}
             result['telemetry'] = self.telemetry.snapshot()
@@ -494,7 +504,7 @@ class SharedState:
             if kind == 'floor_goal':
                 grid = self.floor_grid(floor_name)
                 if not (self.simulation or self.state['preview'] or self.building.floor(floor_name).real_enabled):
-                    raise ApiError(409, f'{floor_name}은 임시 지도라 실차 층간 이동이 꺼져 있습니다.')
+                    raise ApiError(409, f'{floor_name}은 실차 층간 이동이 꺼져 있습니다.')
                 if payload.get('map_version') != grid.version:
                     raise ApiError(409, '지도가 갱신되었습니다. 목적지를 다시 선택해 주세요.')
                 occupancy = grid.cell(pose[0], pose[1])
@@ -682,12 +692,11 @@ def main(args=None):
         node = executor = None
     else:
         import rclpy
-        from rclpy.executors import SingleThreadedExecutor
-        from .ros_bridge import WebBridge
+        from .ros_bridge import WebBridge, spin_executor
         from rclpy.signals import SignalHandlerOptions
         rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
         node = WebBridge(shared)
-        executor = SingleThreadedExecutor()
+        executor = spin_executor()
         executor.add_node(node)
         thread = threading.Thread(target=executor.spin, daemon=True)
         thread.start()

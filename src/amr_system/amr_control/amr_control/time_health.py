@@ -8,6 +8,20 @@ import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
@@ -111,8 +125,10 @@ class TimeHealth(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TimeHealth()
+    executor = spin_executor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

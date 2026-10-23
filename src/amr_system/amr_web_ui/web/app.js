@@ -99,7 +99,7 @@
     if (kind === 'goal' && viewingOther() && !state.floor_action_ready)
       return '층간 이동 관리자 연결을 기다리고 있습니다.';
     if (kind === 'goal' && viewingOther() && !floorInfo(viewFloor)?.selectable)
-      return `${viewFloor}은 임시 지도라 실차 층간 이동이 꺼져 있습니다.`;
+      return `${viewFloor}은 실차 층간 이동이 꺼져 있습니다.`;
     if (kind === 'initialpose' && viewingOther()) return '초기 위치는 현재 층 지도에서만 지정할 수 있습니다.';
     if (kind === 'goal' && ['SENDING','CANCELING'].includes(state?.goal?.status))
       return '이전 목표 요청을 처리 중입니다. 잠시 기다려 주세요.';
@@ -154,6 +154,9 @@
     $('relocalize').disabled = Boolean(commandError('relocalize')) || pending ||
       (!state?.preview && (localizationRequest || state?.localization_reset_pending ||
         (state?.localization?.age < 2 && ['SEARCHING','VERIFYING','STARTING_NAVIGATION'].includes(state.localization.state))));
+    const last = state?.localization?.last_pose;
+    $('last-pose').hidden = !connected || Boolean(state?.preview) || !last || localized() || viewingOther();
+    $('last-pose').disabled = Boolean(commandError('initialpose')) || pending || !activeMap().info;
   }
   function updateSidebar() {
     const s = state, goal = s.goal;
@@ -278,7 +281,7 @@
     tabs.replaceChildren(...floors.map(f => {
       const b = document.createElement('button');
       b.type = 'button'; b.dataset.floor = f.name; b.textContent = f.name;
-      b.title = f.selectable ? (f.provisional ? '임시 지도(4층 복사본)' : '') : '실차 층간 이동 비활성(임시 지도)';
+      b.title = f.selectable ? (f.provisional ? '임시 지도(4층 복사본)' : '') : '실차 층간 이동 비활성';
       b.disabled = !f.selectable && f.name !== currentFloor();
       b.addEventListener('click', () => { viewFloor = f.name; renderFloorTabs(); fitted = false; fit(); updateSidebar(); });
       return b;
@@ -395,7 +398,8 @@
         headers:{'Content-Type':'application/json', 'X-AMR-Request':'1'},
         body:JSON.stringify({request_id, ...(kind === 'relocalize' ? {map_version:state.layers.map?.version} :
           kind === 'goal' && floorsEnabled() ? {...pose, floor:viewFloor, room:pose.room || ''} :
-          kind === 'goal' ? {x:pose.x, y:pose.y, yaw:pose.yaw, map_version:pose.map_version} : pose || {})}),
+          // The server accepts floor/room only on goals; a tapped pose carries the viewed floor.
+          ['goal','initialpose'].includes(kind) ? {x:pose.x, y:pose.y, yaw:pose.yaw, map_version:pose.map_version} : pose || {})}),
         signal:AbortSignal.timeout(5000)});
       const result = await response.json();
       if (!response.ok) {
@@ -566,6 +570,10 @@
   $('send').addEventListener('click',()=>{if(selected)command(mode==='initialpose'?'initialpose':'goal',selected);});
   $('cancel').addEventListener('click',()=>command('cancel'));
   $('relocalize').addEventListener('click',()=>command('relocalize'));
+  // Only previews the saved pose; the operator still confirms with '초기 위치 적용'.
+  $('last-pose').addEventListener('click',()=>{const last=state?.localization?.last_pose,info=activeMap().info;
+    if(!last||!info)return;setMode('initialpose');setSelected({x:last.x,y:last.y,yaw:last.yaw,map_version:info.version});
+    activity('마지막으로 확인된 위치를 표시했습니다. 지도에서 로봇 위치와 맞으면 ‘초기 위치 적용’을 누르세요.');});
   $('estop-approve').addEventListener('click',approveClicked);
   $('fit').addEventListener('click',fit);$('zoom-in').addEventListener('click',()=>zoom(1.3));$('zoom-out').addEventListener('click',()=>zoom(1/1.3));
   $('follow').addEventListener('click',()=>{follow=!follow;$('follow').classList.toggle('active',follow);$('follow').setAttribute('aria-pressed',String(follow));});

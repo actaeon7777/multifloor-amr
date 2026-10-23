@@ -5,7 +5,7 @@ OVERRIDDEN. A goal is never resumed after AUTO returns; a new goal is required.
 An E-stop (/estop/status from the CAN bridge) aborts the active goal as ESTOP;
 after the operator approves a restart a new goal is required as well.
 
-All state is owned by a SingleThreadedExecutor. Action execution awaits an rclpy
+All state is owned by one single-threaded executor. Action execution awaits an rclpy
 Future rather than blocking the executor. An old internal goal must reach a
 terminal result before any replacement/resumed goal can be dispatched.
 """
@@ -23,10 +23,24 @@ from rclpy._rclpy_pybind11 import RCLError
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.clock import Clock, ClockType
-from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.task import Future
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 from amr_control.time_guard import HealthLease, SessionOrder
@@ -78,7 +92,10 @@ class NavigationManager(Node):
         defaults = {'command_timeout': .20, 'publish_rate': 20.0,
                     'max_linear_speed': 1.0, 'max_angular_speed': .8,
                     'backend_response_timeout': 5.0, 'restart_quiet_period': .10,
-                    'localization_status_timeout': 2.0, 'maneuver_lease_timeout': 30.0}
+                    'localization_status_timeout': 2.0, 'maneuver_lease_timeout': 30.0,
+                    # A verified tracker re-checking fresh data (late TF on a loaded
+                    # CPU) holds the goal at zero velocity this long before aborting.
+                    'localization_hold_grace': 5.0}
         self.settings = {k: self.declare_parameter(k, v).value for k, v in defaults.items()}
         if any(not isfinite(v) or v <= 0 for v in self.settings.values()):
             raise ValueError('Navigation manager timing and limits must be positive and finite')
@@ -92,6 +109,9 @@ class NavigationManager(Node):
         self.localization_is_ready = False
         self.localization_detail = '위치 준비 상태를 기다립니다.'
         self.localization_status_time = 0.0
+        self.localization_state = ''
+        self.localization_prior_verified = False
+        self.readiness_lost_at = None
         self.localization_generation = -1
         self.last_ready_generation = -1
         self.initial_pose_generation_barrier = -1
@@ -240,6 +260,8 @@ class NavigationManager(Node):
             self.localization_detail = detail[:1000] if isinstance(detail, str) else ''
             self.localization_generation = generation
             self.localization_status_time = monotonic() - max(0.0, age)
+            self.localization_state = status.get('state') if isinstance(status.get('state'), str) else ''
+            self.localization_prior_verified = status.get('prior_verified') is True
             self.localization_is_ready = (
                 status.get('state') == 'READY' and status.get('ready') is True
                 and -1.0 <= age <= self.settings['localization_status_timeout']
@@ -249,6 +271,7 @@ class NavigationManager(Node):
         except (ValueError, TypeError, KeyError):
             self.localization_detail = '위치 상태 메시지가 유효하지 않습니다.'
             self.localization_is_ready = False
+            self.localization_state, self.localization_prior_verified = '', False
         self.reconcile()
 
     def on_initial_pose(self, message):
@@ -261,10 +284,34 @@ class NavigationManager(Node):
         self.localization_is_ready = False
         self.reconcile()
 
+    def localization_hold(self):
+        """The supervisor is re-verifying a prior it already accepted, in the same generation.
+
+        It withdraws READY while it waits for a stopped robot and fresh, transformable
+        observations (TF behind on a loaded CPU). The goal is kept and the output
+        muted so the tracker can settle; a stale heartbeat, a new generation, a time
+        fault or any other supervisor state still aborts immediately.
+        """
+        return (self.localization_state in ('WAITING_DATA', 'VERIFYING')
+                and self.localization_prior_verified
+                and self.localization_generation == self.last_ready_generation
+                and self.localization_generation > self.initial_pose_generation_barrier
+                and monotonic() - self.localization_status_time <= self.settings['localization_status_timeout']
+                and (not self.require_time_health or self.time_health.healthy()))
+
     def enforce_localization_readiness(self):
         if self.localization_ready():
+            self.readiness_lost_at = None
             return True
         request = self.desired
+        if request is not None and self.localization_hold():
+            now = monotonic()
+            if self.readiness_lost_at is None:
+                self.readiness_lost_at = now
+                self.get_logger().warning('Localization is re-verifying; holding the goal at zero velocity')
+            if now - self.readiness_lost_at <= self.settings['localization_hold_grace']:
+                self.stop_output()
+                return False
         if self.run is not None:
             self.run.stopping = True
         if self.run is not None or request is not None:
@@ -410,6 +457,7 @@ class NavigationManager(Node):
         if request.finished:
             return
         request.finished = True
+        self.readiness_lost_at = None
         if request.handle.is_cancel_requested:
             status = 'CANCELED'
         if status == 'SUCCEEDED':
@@ -571,7 +619,7 @@ class NavigationManager(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = NavigationManager()
-    executor = SingleThreadedExecutor()
+    executor = spin_executor()
     executor.add_node(node)
     try:
         executor.spin()

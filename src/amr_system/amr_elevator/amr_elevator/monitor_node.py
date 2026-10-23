@@ -23,6 +23,20 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
@@ -61,7 +75,7 @@ class ElevatorMonitor(Node):
         self.machine = FloorStateMachine(self.building, p['initial_floor'] or None)
         self.detector = DoorDetector()
         self.tf = Buffer()
-        self.tf_listener = TransformListener(self.tf, self)
+        self.tf_listener = TransformListener(self.tf, self, spin_thread=False)
         self.anchor = None          # map->odom on the map of anchor_floor
         self.anchor_floor = None
         self.odom_pose = None
@@ -278,7 +292,9 @@ def main(args=None):
     node = None
     try:
         node = ElevatorMonitor()
-        rclpy.spin(node)
+        executor = spin_executor()
+        executor.add_node(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

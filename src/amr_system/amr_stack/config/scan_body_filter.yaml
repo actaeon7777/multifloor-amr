@@ -1,11 +1,15 @@
 # Robot parts in the S2 scan plane (base_link Z 0.108605 m), from
 # AMR_MASTER_Linear v80.step. Each row: x_min, x_max, y_min, y_max in base_link.
 # With the margin every box must stay inside the Nav2 footprint
-# (x +-0.328, y +-0.287), so no return outside the robot is ever removed.
+# (x +-0.328, y +-0.287). Outside the robot, only returns within shadow_range
+# in each upright's bearing span +-shadow_margin_deg are removed: the S2 reports
+# edge-grazing beams at 0.36-0.50 m, up to ~2.9 deg beyond the span (2026-10-23).
 scan_body_filter:
   ros__parameters:
     base_frame: base_link
     margin: 0.03
+    shadow_margin_deg: 3.0
+    shadow_range: 0.7
     body_boxes: [
        0.260,  0.280,  0.1126,  0.1526,   # front-left 2020 upright
        0.260,  0.280, -0.1526, -0.1126,   # front-right

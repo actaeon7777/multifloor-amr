@@ -1,5 +1,7 @@
 """The public navigation Action is the same manager used by RViz /goal_pose."""
 import math
+
+import numpy as np
 import queue
 import time
 
@@ -18,6 +20,20 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 from amr_control.time_guard import ClockMonitor, SessionOrder
 from amr_vehicle_interfaces.msg import VehicleStatus
 
@@ -253,14 +269,25 @@ class WebBridge(Node):
         msg, received = self.pending_scan
         try:
             tf = self.transform(msg.header.frame_id, msg.header.stamp)
-            points = []
             # Keep all valid rays; decimation is not needed for a single 2D scan.
-            for index, distance in enumerate(msg.ranges):
-                if math.isfinite(distance) and msg.range_min <= distance <= msg.range_max:
-                    angle = msg.angle_min + index*msg.angle_increment
-                    point = self.point(distance*math.cos(angle), distance*math.sin(angle), tf)
-                    intensity = msg.intensities[index] if index < len(msg.intensities) else None
-                    points.append(point + [intensity if intensity is not None and math.isfinite(intensity) else None])
+            # Vectorised: the per-ray Python loop was 13 % of this process on
+            # the Jetson at 3,240 rays x 8 Hz.
+            ranges = np.asarray(msg.ranges, dtype=float)
+            keep = np.isfinite(ranges) & (ranges >= msg.range_min) & (ranges <= msg.range_max)
+            index = np.flatnonzero(keep)
+            angle = msg.angle_min + index*msg.angle_increment
+            x, y = ranges[index]*np.cos(angle), ranges[index]*np.sin(angle)
+            if tf is not None:
+                q, t = tf.rotation, tf.translation
+                x, y = (t.x + (1-2*(q.y*q.y + q.z*q.z))*x + 2*(q.x*q.y-q.z*q.w)*y,
+                        t.y + 2*(q.x*q.y+q.z*q.w)*x + (1-2*(q.x*q.x+q.z*q.z))*y)
+            intensities = np.asarray(msg.intensities, dtype=float)
+            if len(intensities) == len(ranges):
+                intensity = intensities[index]
+                intensity = [v if math.isfinite(v) else None for v in intensity.tolist()]
+            else:
+                intensity = [None]*len(index)
+            points = [[px, py, pi] for px, py, pi in zip(x.tolist(), y.tolist(), intensity)]
             self.set_state(scan=dict(points=points, received_at=received))
             self.pending_scan = None
         except TransformException:

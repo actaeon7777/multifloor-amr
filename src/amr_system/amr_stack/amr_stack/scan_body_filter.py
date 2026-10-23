@@ -3,6 +3,10 @@
 The v80 2020 uprights cross the scan plane at 0.27-0.28 m from the sensor.
 Returns inside the configured base_link boxes become NaN (no measurement), so
 AMCL, costmaps and the elevator clearance checks neither mark nor clear on them.
+A beam that only grazes an upright edge returns a mixed range 0.36-0.50 m out,
+outside the footprint (real vehicle, 2026-10-23). Each upright's shadow sector,
+widened by shadow_margin_deg, is therefore also cleared up to shadow_range.
+Nothing real is visible behind an upright, so only the margin costs coverage.
 Scans are dropped, never passed through unfiltered, until the laser TF is known.
 """
 
@@ -18,6 +22,20 @@ from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
+
+
 def body_boxes(values, margin):
     """[x_min, x_max, y_min, y_max] rows in base_link, grown by the margin."""
     boxes = np.asarray(values, dtype=float)
@@ -30,6 +48,34 @@ def body_boxes(values, margin):
     if not math.isfinite(margin) or margin < 0:
         raise ValueError('margin must be finite and non-negative')
     return boxes + np.array([-margin, margin, -margin, margin])
+
+
+def shadow_sectors(boxes, pose, margin):
+    """(centre, half width) bearing in base_link of each box seen from the laser.
+
+    Use the boxes without their range margin: growing a box towards the
+    sensor would widen its sector far beyond the part it models.
+    """
+    sectors = []
+    for x_min, x_max, y_min, y_max in boxes:
+        corners = np.arctan2(np.array([y_min, y_max, y_min, y_max]) - pose[1],
+                             np.array([x_min, x_min, x_max, x_max]) - pose[0])
+        centre = math.atan2(np.sin(corners).sum(), np.cos(corners).sum())
+        offsets = np.angle(np.exp(1j * (corners - centre)))
+        if offsets.max() - offsets.min() >= math.pi:
+            raise ValueError('body box surrounds the laser')
+        middle = (offsets.max() + offsets.min()) / 2
+        sectors.append((centre + middle, (offsets.max() - offsets.min()) / 2 + margin))
+    return np.array(sectors).reshape(-1, 2)
+
+
+def shadow_mask(ranges, angle_min, angle_increment, pose, sectors, max_range):
+    """True for finite returns within max_range inside any shadow sector."""
+    r = np.asarray(ranges, dtype=float)
+    finite = np.isfinite(r)
+    angle = angle_min + angle_increment * np.arange(r.size) + pose[2]
+    offset = np.abs(np.angle(np.exp(1j * (angle[:, None] - sectors[:, 0]))))
+    return finite & (r <= max_range) & (offset <= sectors[:, 1]).any(axis=1)
 
 
 def laser_pose(transform):
@@ -60,11 +106,17 @@ class ScanBodyFilter(Node):
     def __init__(self):
         super().__init__('scan_body_filter')
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
-        self.boxes = body_boxes(self.declare_parameter('body_boxes', [0.0]).value,
-                                self.declare_parameter('margin', 0.03).value)
+        values = self.declare_parameter('body_boxes', [0.0]).value
+        self.parts = body_boxes(values, 0.0)
+        self.boxes = body_boxes(values, self.declare_parameter('margin', 0.03).value)
+        self.shadow_margin = math.radians(self.declare_parameter('shadow_margin_deg', 3.0).value)
+        self.shadow_range = self.declare_parameter('shadow_range', 0.7).value
+        if not (math.isfinite(self.shadow_margin) and 0 <= self.shadow_margin < math.pi / 4
+                and math.isfinite(self.shadow_range) and self.shadow_range >= 0):
+            raise ValueError('shadow_margin_deg must be in [0, 45) and shadow_range >= 0')
         self.poses = {}
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         # Same reliable depth-10 profile as sllidar_node, so both best-effort
         # and reliable consumers of /scan keep working.
         self.publisher = self.create_publisher(LaserScan, 'scan', QoSProfile(depth=10))
@@ -72,19 +124,23 @@ class ScanBodyFilter(Node):
 
     def on_scan(self, msg):
         frame = msg.header.frame_id
-        pose = self.poses.get(frame)
-        if pose is None:
+        entry = self.poses.get(frame)
+        if entry is None:
             try:
                 transform = self.tf_buffer.lookup_transform(self.base_frame, frame, Time())
             except TransformException as error:
                 self.get_logger().warn(f'Dropping scan until {self.base_frame} <- {frame} is known: {error}',
                                        throttle_duration_sec=2.0)
                 return
-            pose = self.poses[frame] = laser_pose(transform.transform)
+            pose = laser_pose(transform.transform)
+            entry = self.poses[frame] = (pose, shadow_sectors(self.parts, pose, self.shadow_margin))
             self.get_logger().info(f'{frame} at x={pose[0]:.3f} y={pose[1]:.3f} yaw={pose[2]:.3f}; '
-                                   f'{len(self.boxes)} body boxes')
+                                   f'{len(self.boxes)} body boxes, shadows to {self.shadow_range:.2f} m')
+        pose, sectors = entry
         ranges = np.array(msg.ranges, dtype=np.float32)
-        ranges[body_mask(ranges, msg.angle_min, msg.angle_increment, pose, self.boxes)] = np.nan
+        hidden = body_mask(ranges, msg.angle_min, msg.angle_increment, pose, self.boxes)
+        hidden |= shadow_mask(ranges, msg.angle_min, msg.angle_increment, pose, sectors, self.shadow_range)
+        ranges[hidden] = np.nan
         msg.ranges = array.array('f', ranges.tobytes())
         self.publisher.publish(msg)
 
@@ -92,8 +148,10 @@ class ScanBodyFilter(Node):
 def main():
     rclpy.init()
     node = ScanBodyFilter()
+    executor = spin_executor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

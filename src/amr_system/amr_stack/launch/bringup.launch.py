@@ -45,7 +45,10 @@ def generate_launch_description():
         DeclareLaunchArgument('can_config', default_value=str(config_dir / 'can_bridge.yaml')),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_can_bridge', default_value='true'),
-        DeclareLaunchArgument('start_vehicle_status', default_value='true'),
+        DeclareLaunchArgument(
+            'start_vehicle_status', default_value='false',
+            description='Shared /vehicle/status publisher (10 Hz, Python). Off: it took ~60 % of a '
+                        'Jetson core and only feeds the web telemetry card (2026-10-23).'),
         DeclareLaunchArgument(
             'start_elevator_link', default_value='false',
             description='Elevator RF relay over CAN (0x210/0x310/0x311, ELEVATOR_CAN_PROTOCOL.md v1.1); '

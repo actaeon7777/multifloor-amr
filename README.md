@@ -92,7 +92,7 @@ Isaac Sim이 실차 드라이버 대신 같은 토픽을 발행한다 (`amr_sim_
 | `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(휠 오도메트리·관절·IMU 수신), 구동 프로토콜, 엘리베이터 RF 중계 `elevator_can_link`(기본 꺼짐) |
 | `amr_web_ui` | 터치 지도 기반 목표 지정 웹 UI + 로컬 ROS 2 HTTP 브리지 (포트 8080) |
 | `amr_remote_bridge` | AMR → 중앙 서버 상태·지도 전송, 명령 중계 (Tailscale 사설망) |
-| `amr_vehicle_status` / `amr_vehicle_interfaces` | UI와 독립된 공용 차량 상태 발행(10 Hz)과 메시지 정의 |
+| `amr_vehicle_status` / `amr_vehicle_interfaces` | UI와 독립된 공용 차량 상태 발행(10 Hz)과 메시지 정의. CPU 부하로 bringup 기본값은 꺼짐(`start_vehicle_status:=true`로 켬) |
 | `amr_tim_localization` / `amr_localization_interfaces` | 전역 재위치 추정 서비스와 인터페이스 |
 | `amr_nav2_plugins` | 바퀴 속도 실현 가능성을 평가하는 DWB critic |
 | `amr_rviz_plugins` | RViz TF 데드락 회피 플러그인 |
@@ -177,7 +177,7 @@ python3 scripts/sim_demo.py --room 401 402   # 4층 호실 순회 데모
 
 - 단위·HTTP 시험 351개 통과(7개 opt-in ROS 모듈 skip), Control_Server 60개 통과. 네이티브 LiDAR·colcon 빌드 성공.
 - 시뮬레이션: arena·floor4 통합 시험, 4층 호실 401~406 주행, 층간 이동 11개 시나리오 통과([docs/ELEVATOR.md](docs/ELEVATOR.md#시나리오-결과-2026-10-14)).
-  3F·5F는 4층 지도 복사본이며 실차 층간 이동은 꺼져 있다.
+  3F·5F 실차 지도는 실측 지도를 4층 좌표계로 정렬해 넣었다(2026-10-23). 시뮬레이션 장면은 아직 4층 복사본이며 실차 층간 이동은 꺼져 있다.
 - 중앙 관제(8081)에서도 층 탭·다른 층 호실 지정이 가능하다(2026-10-16).
 - 전역 경로 평활화(`navigation.yaml`, 실차 공용)는 실차 반영 시 코너 안쪽 여유를 확인해야 한다.
 - 실차 주행·BMS·펌웨어 readback·실제 호스트 배포는 현장 검증이 남아 있다. 날짜별 결과는 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).

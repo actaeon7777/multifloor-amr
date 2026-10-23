@@ -561,7 +561,7 @@
   <joint name="imu_joint" type="fixed">
     <parent link="base_link" />
     <child link="imu_link" />
-    <origin rpy="0 0 0" xyz="0.160 0.0035 0.016" />
+    <origin rpy="0 0 0" xyz="0.097 0 0.021" />
   </joint>
   <link name="camera_link" />
   <joint name="camera_joint" type="fixed">

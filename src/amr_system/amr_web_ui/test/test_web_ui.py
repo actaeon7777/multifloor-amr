@@ -199,6 +199,21 @@ def test_tracking_warning_is_visible_without_changing_supervisor_readiness():
     assert shared.commands.qsize() == 1
 
 
+@pytest.mark.parametrize('last_pose, expected', [
+    (dict(x=1, y=2.5, yaw=-.5, saved_at=10.), dict(x=1., y=2.5, yaw=-.5, saved_at=10.)),
+    (None, None),
+    (dict(x=1, y=2.5, yaw=None, saved_at=10.), None),
+    (dict(x=True, y=2.5, yaw=0, saved_at=10.), None),
+    ([1, 2, 3], None),
+])
+def test_saved_last_pose_is_passed_through_only_when_well_formed(last_pose, expected):
+    shared = live_state()
+    shared.update_localization(localization_status('WAITING_INITIAL_POSE', last_pose=last_pose))
+    status = shared.snapshot()['localization']
+    assert status['state'] == 'WAITING_INITIAL_POSE'
+    assert status['last_pose'] == expected
+
+
 def test_tracking_recovery_state_still_blocks_goals_and_clears_old_warning():
     shared = live_state()
     shared.update_localization(localization_status(

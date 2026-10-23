@@ -29,10 +29,24 @@ from nav2_msgs.srv import LoadMap
 import rclpy
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.task import Future
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
@@ -506,7 +520,7 @@ class FloorMissionManager(Node):
             self.get_logger().warning(str(error))
             return GoalResponse.REJECT
         if not self.p['simulation'] and not floor.real_enabled:
-            self.get_logger().warning(f'Rejecting {request.floor}: real_enabled is false (provisional map)')
+            self.get_logger().warning(f'Rejecting {request.floor}: real_enabled is false')
             return GoalResponse.REJECT
         state = self.floor_state
         if (state is None or state.zone != FloorState.ZONE_OUTSIDE
@@ -948,7 +962,7 @@ class FloorMissionManager(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = None
-    executor = SingleThreadedExecutor()
+    executor = spin_executor()
     try:
         node = FloorMissionManager()
         executor.add_node(node)

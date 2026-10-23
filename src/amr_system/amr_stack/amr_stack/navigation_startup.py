@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import time
 import uuid
 
@@ -25,7 +26,7 @@ from rcl_interfaces.srv import GetParameters, SetParametersAtomically
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
-from rclpy.serialization import serialize_message
+from rclpy.serialization import deserialize_message, serialize_message
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
@@ -67,6 +68,20 @@ def valid_planar_pose(position, rotation):
             and abs(sum(v*v for v in values[3:])-1) <= .01)
 
 
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
+
+
 class NavigationStartup(Node):
     def __init__(self, **kwargs):
         super().__init__('navigation_startup', **kwargs)
@@ -78,8 +93,13 @@ class NavigationStartup(Node):
             base_frame='base_footprint', data_timeout=1.5, pose_timeout=3.0,
             search_timeout=60.0, verification_duration=2.5, verification_samples=6,
             manual_verification_duration=1.0, manual_verification_samples=4,
+            manual_refinement=True, refinement_position_window=1.0,
+            refinement_yaw_window=math.radians(25), refinement_timeout=5.0,
+            # Off unless configured, so tests never touch the vehicle's file.
+            last_pose_file='',
             initialization_update_interval=0.25, tracking_update_interval=1.0,
             tracking_verification_duration=1.0, tracking_verification_samples=4,
+            tracking_tf_jump_xy=1.0, tracking_tf_jump_yaw=0.5,
             max_xy_std=0.35, max_yaw_std=0.25, min_particle_concentration=0.90,
             min_match_ratio=0.70, min_known_ratio=0.85, min_valid_beams=30,
             initialization_max_beams=1080, tracking_max_beams=60,
@@ -119,6 +139,7 @@ class NavigationStartup(Node):
         self.map_key = None
         self.map_snapshot = None
         self.map_revision = 0
+        self._cloud = self._cloud_raw = None
         self.scan = self.odom = self.pose = self.cloud = None
         self.scan_samples = deque(maxlen=30)
         self.pose_samples = deque(maxlen=30)
@@ -150,8 +171,17 @@ class NavigationStartup(Node):
         self.last_checked_pose = 0
         self.last_candidate = None
         self.metrics = {}
+        self.evidence_cache = None
         self.tim_metrics = {'tim_status': 'idle'}
         self.tim_operation = None
+        self.refinement = None
+        self.refinement_metrics = {}
+        # Last READY pose per map. Only offered to the operator as a prior;
+        # the robot may have been moved while switched off.
+        self.map_id = None
+        self.last_pose_file = os.path.expanduser(self.cfg['last_pose_file'])
+        self.saved_poses = self.load_saved_poses()
+        self.last_pose_saved = -math.inf
         self.auto_seed_echoes = deque(maxlen=8)
         self.beam_phase = 'initialization'
         self.beam_revision = 0
@@ -168,6 +198,7 @@ class NavigationStartup(Node):
         # Elevator car: verification paused; resume always waits for a new /initialpose.
         self.suspended = False
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='localization_rival')
+        self.refine_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='localization_refine')
         self.rival_future = None
         self.rival_result = None
         self.rival_generation = None
@@ -190,7 +221,8 @@ class NavigationStartup(Node):
         self.beam_get_client = self.create_client(GetParameters, '/amcl/get_parameters')
         self.start_client = self.create_client(ManageLifecycleNodes, '/lifecycle_manager_navigation/manage_nodes')
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10))
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # No listener thread: that is a second SingleThreadedExecutor on this node.
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = self.create_publisher(String, '/localization/status', latched)
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
@@ -198,8 +230,14 @@ class NavigationStartup(Node):
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odometry/filtered', self.on_odom, qos_profile_sensor_data)
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', lambda m: self.receive('pose', m), latched)
-        self.create_subscription(ParticleCloud, '/particle_cloud', lambda m: self.receive('cloud', m), qos_profile_sensor_data)
-        self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.on_initialpose_message, 10)
+        # Raw bytes: 2,000 particles deserialize to 4,000 Python objects per
+        # message, needed only while the initialization gate is open.
+        self.create_subscription(ParticleCloud, '/particle_cloud', lambda m: self.receive('cloud', m),
+                                 qos_profile_sensor_data, raw=True)
+        # A MessageInfo callback is unsupported by the EventsExecutor (SystemError)
+        # and Jazzy omits publisher_gid anyway; the fingerprint path handles echoes.
+        self.create_subscription(PoseWithCovarianceStamped, '/initialpose',
+                                 lambda m: self.on_initialpose_message(m, {}), 10)
         self.create_subscription(String, '/navigation/status', self.on_navigation_status, latched)
         self.create_subscription(Twist, '/cmd_vel', self.on_command, 10)
         self.create_service(Trigger, '/localization/relocalize', self.on_relocalize)
@@ -209,6 +247,19 @@ class NavigationStartup(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.1, self.tick, clock=self.wall_clock)
         self.publish_status()
+
+    @property
+    def cloud(self):
+        if self._cloud_raw is not None and self._cloud is None:
+            self._cloud = deserialize_message(self._cloud_raw, ParticleCloud)
+        return self._cloud
+
+    @cloud.setter
+    def cloud(self, value):
+        self._cloud = value
+        self._cloud_raw = value if isinstance(value, (bytes, bytearray)) else None
+        if self._cloud_raw is not None:
+            self._cloud = None
 
     def receive(self, name, message):
         setattr(self, name, message)
@@ -279,11 +330,13 @@ class NavigationStartup(Node):
     def valid_scan(self, scan):
         metadata = (scan.angle_min, scan.angle_max, scan.angle_increment, scan.range_min,
                     scan.range_max, scan.time_increment)
-        return (all(math.isfinite(v) for v in metadata) and scan.angle_increment != 0
+        if not (all(math.isfinite(v) for v in metadata) and scan.angle_increment != 0
                 and 0 <= scan.time_increment * max(0, len(scan.ranges)-1) <= self.cfg['data_timeout']
-                and 0 <= scan.range_min < scan.range_max
-                and sum(math.isfinite(r) and scan.range_min <= r <= scan.range_max
-                        for r in scan.ranges) >= self.cfg['min_valid_beams'])
+                and 0 <= scan.range_min < scan.range_max):
+            return False
+        ranges = np.asarray(scan.ranges, dtype=float)
+        return int(np.count_nonzero(np.isfinite(ranges) & (ranges >= scan.range_min)
+                                    & (ranges <= scan.range_max))) >= self.cfg['min_valid_beams']
 
     def latch_tim_failure(self, status, detail):
         if self.tim_operation is not None and self.tim_operation['failure'] is None:
@@ -335,6 +388,13 @@ class NavigationStartup(Node):
             self.latch_tim_failure('discarded_excursion', 'TIM 계산 중 오도메트리 최대 편차가 보상 한도를 초과했습니다.')
             self.record_motion()
 
+    def map_transform_available(self, when):
+        try:
+            self.tf_buffer.lookup_transform(self.cfg['global_frame'], self.scan.header.frame_id, when)
+            return True
+        except (TransformException, ValueError):
+            return False
+
     def checked_transform(self, target, source, when):
         transform = self.tf_buffer.lookup_transform(target, source, when)
         t = transform.transform
@@ -366,6 +426,7 @@ class NavigationStartup(Node):
             return
         changed = self.map_key is not None
         self.map_key, self.map_quality = key, quality
+        self.map_id = hashlib.sha256(repr(key[:4]).encode() + key[4]).hexdigest()[:16]
         self.map_snapshot = copy.deepcopy(message)
         self.map_revision += 1
         if changed:
@@ -383,6 +444,8 @@ class NavigationStartup(Node):
         self.generation += 1
         self.source = source
         self.prior_verified = False
+        self.refinement = None
+        self.refinement_metrics = {}
         self.clear_tracking_warning()
         self.beam_phase = 'initialization'
         self.beam_revision += 1
@@ -455,6 +518,8 @@ class NavigationStartup(Node):
             self.get_logger().info(
                 f'수동 초기 위치 수신: ({x:.3f}, {y:.3f}, {heading:.3f}rad). '
                 '새 위치를 기준으로 검증을 시작합니다.')
+            if self.cfg['manual_refinement']:
+                self.refinement = dict(generation=self.generation, hint=(x, y, heading), future=None)
         self.set_state('VERIFYING' if valid else 'WAITING_INITIAL_POSE',
                        '지정된 초기 위치에서 스캔·지도 정렬을 확인합니다.' if valid else '유효한 지도 좌표계 초기 위치를 지정하세요.')
 
@@ -689,6 +754,88 @@ class NavigationStartup(Node):
                 self.reject_tim('invalid_result', 'TIM 응답 또는 좌표 변환을 검증할 수 없습니다.')
         return True
 
+    def advance_refinement(self):
+        """Scan-match a human prior locally, then reseed AMCL near the optimum.
+
+        A click is typically tens of centimetres and degrees away from the
+        true pose; AMCL alone settles slowly or into a nearby wrong basin.
+        Only a pose that passes the normal admission thresholds replaces the
+        operator's prior; otherwise that prior is verified unchanged. Returns
+        False while the search runs so no AMCL evidence is consumed.
+        """
+        operation = self.refinement
+        if operation['generation'] != self.generation:
+            self.refinement = None
+            return True
+        now = time.monotonic()
+        if operation['future'] is None:
+            scan = self.scan
+            try:
+                extrinsic = self.checked_transform(self.cfg['base_frame'], scan.header.frame_id,
+                                                   Time.from_msg(scan.header.stamp))
+            except (TransformException, ValueError) as exc:
+                self.refinement = None
+                self.get_logger().warning(f'수동 초기 위치 보정을 건너뜁니다: {exc}')
+                return True
+            args = self.scan_args()
+            args['score_beams'] = args.pop('max_beams')
+            operation.update(started=now, scan=scan, extrinsic=extrinsic, map_key=self.map_key,
+                             motion_revision=self.motion_revision,
+                             future=self.refine_worker.submit(
+                                 self.map_quality.refine_pose, **args,
+                                 laser_pose=compose_se2(operation['hint'], extrinsic),
+                                 position_window=self.cfg['refinement_position_window'],
+                                 yaw_window=self.cfg['refinement_yaw_window']))
+        if not operation['future'].done():
+            if now-operation['started'] > self.cfg['refinement_timeout']:
+                operation['future'].cancel()
+                self.refinement = None
+                self.get_logger().warning('수동 초기 위치 보정 시간이 초과되어 지정한 위치를 그대로 검증합니다.')
+                return True
+            self.set_state('VERIFYING', '지정한 위치 주변에서 스캔과 지도를 맞춰 위치를 보정합니다.')
+            return False
+        self.refinement = None
+        try:
+            result = operation['future'].result()
+        except Exception as exc:
+            self.get_logger().warning(f'수동 초기 위치 보정 실패: {type(exc).__name__}: {exc}')
+            return True
+        if operation['motion_revision'] != self.motion_revision or operation['map_key'] != self.map_key:
+            self.get_logger().info('보정 중 로봇이 움직였거나 지도가 바뀌어 지정한 위치를 그대로 검증합니다.')
+            return True
+        quality, hint = result.quality, result.hint_quality
+        base_pose = compose_se2(result.pose, inverse_se2(operation['extrinsic']))
+        delta = compose_se2(inverse_se2(operation['hint']), base_pose)
+        self.refinement_metrics = dict(
+            refinement_hint_match_ratio=hint.match_ratio, refinement_match_ratio=quality.match_ratio,
+            refinement_translation=math.hypot(*delta[:2]), refinement_yaw=abs(delta[2]),
+            refinement_sec=now-operation['started'], refinement_accepted=False)
+        if (not quality.origin_free or quality.valid_beams < self.cfg['min_valid_beams']
+                # Strict scores are beam-count quantized; allow a hair of noise.
+                or quality.match_ratio < max(self.cfg['min_match_ratio'], hint.match_ratio-.02)
+                or quality.known_ratio < self.cfg['min_known_ratio']):
+            self.get_logger().info(
+                f'주변 스캔 정합 결과가 기준 미달이라 지정한 위치를 그대로 검증합니다. '
+                f'일치율 {hint.match_ratio:.1%} -> {quality.match_ratio:.1%}.')
+            return True
+        self.refinement_metrics['refinement_accepted'] = True
+        seed = PoseWithCovarianceStamped()
+        seed.header.frame_id = self.cfg['global_frame']
+        seed.header.stamp = copy.deepcopy(operation['scan'].header.stamp)
+        seed.pose.pose.position.x, seed.pose.pose.position.y = base_pose[:2]
+        seed.pose.pose.orientation.z = math.sin(base_pose[2]/2)
+        seed.pose.pose.orientation.w = math.cos(base_pose[2]/2)
+        seed.pose.covariance[0] = seed.pose.covariance[7] = .01
+        seed.pose.covariance[35] = .003
+        self.clear_evidence()
+        self.auto_seed_echoes.append(hashlib.sha256(serialize_message(seed)).digest())
+        self.initial_pose_pub.publish(seed)
+        self.get_logger().info(
+            f'수동 초기 위치를 스캔 정합으로 보정했습니다: ({base_pose[0]:.3f}, {base_pose[1]:.3f}, '
+            f'{base_pose[2]:.3f}rad), 이동 {math.hypot(*delta[:2]):.2f}m, 회전 {math.degrees(abs(delta[2])):.1f}도, '
+            f'일치율 {hint.match_ratio:.1%} -> {quality.match_ratio:.1%}.')
+        return True
+
     def fail_beams(self, reason):
         self.beam_failed = True
         self.good_since, self.good_count = None, 0
@@ -897,10 +1044,22 @@ class NavigationStartup(Node):
             reported = planar(self.pose.pose.pose)
             implied = (pose_tf.transform.translation.x, pose_tf.transform.translation.y,
                        yaw(pose_tf.transform.rotation))
+            jump_xy = math.hypot(reported[0]-implied[0], reported[1]-implied[1])
+            jump_yaw = abs(math.atan2(math.sin(reported[2]-implied[2]), math.cos(reported[2]-implied[2])))
+            # AMCL stamps map->odom transform_tolerance into the future, so a
+            # lookup at the pose stamp blends the previous correction with this
+            # one. A bounded jump while tracking is that blend after a genuine
+            # AMCL correction (0.39 m seen at 0.5 m/s, 2026-10-23), not a
+            # foreign or stale publisher, which diverges without bound.
             if (not all(math.isfinite(v) for v in reported)
-                    or math.hypot(reported[0]-implied[0], reported[1]-implied[1]) > self.cfg['max_xy_std']
-                    or abs(math.atan2(math.sin(reported[2]-implied[2]), math.cos(reported[2]-implied[2]))) > self.cfg['max_yaw_std']):
+                    or jump_xy > self.cfg['tracking_tf_jump_xy'] or jump_yaw > self.cfg['tracking_tf_jump_yaw']
+                    or (not self.prior_verified
+                        and (jump_xy > self.cfg['max_xy_std'] or jump_yaw > self.cfg['max_yaw_std']))):
                 return None, 'AMCL 추정 위치와 지도 좌표 변환이 일치하지 않습니다.'
+            if jump_xy > self.cfg['max_xy_std'] or jump_yaw > self.cfg['max_yaw_std']:
+                confidence_problem = confidence_problem or (
+                    f'AMCL 보정 직후 추정 위치와 지도 좌표 변환의 차이가 큽니다. '
+                    f'{jump_xy:.2f}m/{self.cfg["max_xy_std"]:.2f}m, {math.degrees(jump_yaw):.1f}도.')
             # AMCL must have actually processed a contemporary scan, rather
             # than borrowing an old covariance for a newly published TF.
             if abs(stamp_ns(self.scan.header.stamp)-stamp_ns(self.pose.header.stamp)) > self.cfg['pose_timeout']*1e9:
@@ -908,8 +1067,12 @@ class NavigationStartup(Node):
             ray_poses = self.tracking_ray_poses(laser_pose)
             quality = self.map_quality.score(**self.scan_args(), laser_pose=laser_pose,
                                             ray_poses=ray_poses)
-            raw_quality = (self.map_quality.score(**self.scan_args(), laser_pose=laser_pose)
-                           if ray_poses is not None else quality)
+            # The uncompensated score is a diagnostic for a failed alignment;
+            # scoring it on every passing scan doubled this node's scoring cost.
+            raw_quality = quality
+            if ray_poses is not None and (quality.match_ratio < self.cfg['min_match_ratio']
+                                          or quality.known_ratio < self.cfg['min_known_ratio']):
+                raw_quality = self.map_quality.score(**self.scan_args(), laser_pose=laser_pose)
         except (TransformException, ValueError) as exc:
             self.metrics['observation_error'] = str(exc)[:600]
             return None, '지도 좌표 변환 또는 유효한 스캔을 기다립니다. ' + str(exc)[:300]
@@ -984,13 +1147,27 @@ class NavigationStartup(Node):
         inverse_start = inverse_se2(start)
         delta = compose_se2(inverse_start, end)
         translation, rotation = math.hypot(delta[0], delta[1]), abs(delta[2])
-        for index in indices:
-            odom_laser = self.checked_transform(
-                self.cfg['odom_frame'], scan.header.frame_id,
-                Time(nanoseconds=start_ns + round(int(index)*scan.time_increment*1e9)))
+        # One lookup per ray (360 per tick) was 15 % of this node's CPU on the
+        # Jetson. Odometry TF arrives at 30 Hz and tf2 interpolates linearly
+        # between samples, so 10 ms knots lose nothing; interpolate the rest.
+        knot_times = np.arange(0.0, duration, 0.01)
+        if not len(knot_times) or knot_times[-1] < duration:
+            knot_times = np.append(knot_times, duration)
+        knots = []
+        for elapsed in knot_times:
+            odom_laser = (end if elapsed >= duration else self.checked_transform(
+                self.cfg['odom_frame'], scan.header.frame_id, Time(nanoseconds=start_ns + round(elapsed*1e9))))
             delta = compose_se2(inverse_start, odom_laser)
             translation = max(translation, math.hypot(delta[0], delta[1]))
             rotation = max(rotation, abs(delta[2]))
+            knots.append(odom_laser)
+        knots = np.asarray(knots, dtype=float)
+        unwrapped = np.unwrap(knots[:, 2])
+        ray_times = np.asarray(indices, dtype=float)*scan.time_increment
+        for ray_time in ray_times:
+            odom_laser = (float(np.interp(ray_time, knot_times, knots[:, 0])),
+                          float(np.interp(ray_time, knot_times, knots[:, 1])),
+                          float(np.interp(ray_time, knot_times, unwrapped)))
             poses.append(compose_se2(correction, odom_laser))
         self.metrics.update(scan_motion_compensated=True, scan_duration=duration,
                             scan_motion_translation=translation, scan_motion_yaw=rotation)
@@ -1104,6 +1281,7 @@ class NavigationStartup(Node):
             state=self.state, ready=self.state == 'READY', detail=self.detail,
             source=self.source, generation=self.generation, session=self.session,
             stamp=time.time(), amcl_beam_phase=self.beam_phase,
+            last_pose=self.saved_poses.get(self.map_id),
             amcl_max_beams=self.applied_beams, quality_max_beams=self.cfg['quality_max_beams'],
             quality_max_range=self.quality_range(),
             initializer_backend=self.cfg['global_localization_backend'],
@@ -1115,7 +1293,7 @@ class NavigationStartup(Node):
             verification_elapsed=(0.0 if self.good_since is None
                                   else max(0.0, time.monotonic()-self.good_since)),
             verification_required_duration=duration,
-            **self.tim_metrics, **self.metrics), ensure_ascii=False, allow_nan=False)))
+            **self.tim_metrics, **self.refinement_metrics, **self.metrics), ensure_ascii=False, allow_nan=False)))
 
     def tick(self):
         try:
@@ -1124,7 +1302,57 @@ class NavigationStartup(Node):
             self.good_since, self.good_count = None, 0
             self.set_state('FAILED', f'시작 상태 확인 오류: {type(exc).__name__}. navigation을 재시작하세요.')
             self.get_logger().error(str(exc))
+        self.remember_pose()
         self.publish_status()
+
+    def load_saved_poses(self):
+        if not self.last_pose_file:
+            return {}
+        try:
+            with open(self.last_pose_file) as stream:
+                raw = json.load(stream)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            self.get_logger().warning(f'마지막 위치 파일을 읽을 수 없습니다: {exc}')
+            return {}
+        poses = {}
+        for map_id, entry in (raw.items() if isinstance(raw, dict) else ()):
+            try:
+                values = [float(entry[k]) for k in ('x', 'y', 'yaw', 'saved_at')]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if all(math.isfinite(v) for v in values):
+                poses[str(map_id)] = dict(zip(('x', 'y', 'yaw', 'saved_at'), values))
+        return poses
+
+    def remember_pose(self):
+        """Persist a verified, stopped READY pose for the operator's next start."""
+        now = time.monotonic()
+        if (not self.last_pose_file or self.map_id is None or self.state != 'READY'
+                or not self.prior_verified or self.tracking_warning or self.pose is None
+                or not self.stationary() or self.goal_in_progress()
+                or now-self.last_pose_saved < 2.0):
+            return
+        x, y, heading = planar(self.pose.pose.pose)
+        saved = self.saved_poses.get(self.map_id)
+        if (saved is not None and math.hypot(x-saved['x'], y-saved['y']) < .05
+                and abs(math.atan2(math.sin(heading-saved['yaw']), math.cos(heading-saved['yaw']))) < .02):
+            return
+        self.last_pose_saved = now
+        poses = dict(self.saved_poses)
+        poses[self.map_id] = dict(x=x, y=y, yaw=heading, saved_at=time.time())
+        try:
+            directory = os.path.dirname(self.last_pose_file) or '.'
+            os.makedirs(directory, exist_ok=True)
+            temporary = self.last_pose_file + '.tmp'
+            with open(temporary, 'w') as stream:
+                json.dump(poses, stream)
+            os.replace(temporary, self.last_pose_file)
+        except OSError as exc:
+            self.get_logger().warning(f'마지막 위치를 저장할 수 없습니다: {exc}')
+            return
+        self.saved_poses = poses
 
     def advance(self):
         now = time.monotonic()
@@ -1196,6 +1424,8 @@ class NavigationStartup(Node):
             return
         if self.state == 'WAITING_INITIAL_POSE':
             return
+        if self.refinement is not None and not self.advance_refinement():
+            return
         if not self.ensure_beams():
             return
         if self.global_pending:
@@ -1223,7 +1453,20 @@ class NavigationStartup(Node):
             self.clear_tracking_warning()
             self.set_state('FAILED', 'Nav2 활성 상태를 잃었습니다. navigation을 재시작하세요.')
             return
-        evidence, problem = self.pose_evidence()
+        # While READY the same scan/pose pair scores the same; the 10 Hz tick
+        # otherwise re-ran two 360-beam scorings and the TF work per tick.
+        scan_time = Time.from_msg(self.scan.header.stamp)
+        cache_key = (self.state, self.evidence_epoch, self.beam_confirmed_revision,
+                     stamp_ns(self.scan.header.stamp), id(self.scan),
+                     None if self.pose is None else (stamp_ns(self.pose.header.stamp), id(self.pose)),
+                     # TF can disappear without new sensor data (buffer loss).
+                     self.map_transform_available(scan_time))
+        if (self.state == 'READY' and self.prior_verified and self.evidence_cache is not None
+                and self.evidence_cache[0] == cache_key and self.fresh('pose', self.cfg['pose_timeout'])):
+            evidence, problem = self.evidence_cache[1]
+        else:
+            evidence, problem = self.pose_evidence()
+            self.evidence_cache = (cache_key, (evidence, problem))
         if not problem and self.source == 'auto' and not self.prior_verified:
             problem = self.check_rivals(*evidence)
         soft_problem = None
@@ -1334,14 +1577,17 @@ class NavigationStartup(Node):
     def destroy_node(self):
         self.cancel_tim('shutdown')
         self.worker.shutdown(wait=False, cancel_futures=True)
+        self.refine_worker.shutdown(wait=False, cancel_futures=True)
         return super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = NavigationStartup()
+    executor = spin_executor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:

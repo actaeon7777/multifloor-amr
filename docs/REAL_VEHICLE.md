@@ -237,7 +237,7 @@ STM32는 하드웨어 E-stop을 `0x202` 상태 프레임으로 알리고, 버튼
 ```text
 base_footprint
 └── base_link                      z = 0.086 m
-    ├── imu_link                   xyz = (0.160, 0.0035, 0.016) m
+    ├── imu_link                   xyz = (0.097, 0, 0.021) m  (최신 CAD, 2026-10-23)
     ├── lidar_mount_link           z = -0.029 m
     │   └── lidar_link             z = 0.137605 m
     │       └── laser              yaw = pi
@@ -248,7 +248,10 @@ base_footprint
 - `/scan.header.frame_id=laser`, `inverted=false`를 유지한다. S2 런치 인자 `serial_port`, `serial_baudrate`, `scan_mode`로 드라이버를 바꿀 수 있다.
 - v80 차체의 2020 기둥 4개가 스캔 평면을 지나 약 ±22~30°, ±149~157° 방향 0.27~0.28 m에 보인다. 드라이버는 `/scan_raw`로 내보내고
   `scan_body_filter`가 `scan_body_filter.yaml`의 `base_link` 상자(기둥 외곽 + 0.03 m) 안에 떨어지는 점을 NaN으로 바꿔 `/scan`을 낸다.
-  상자는 Nav2 footprint 안쪽이라 로봇 밖의 점은 지우지 않는다. 기둥 너머는 실제로 가려져 보이지 않는다.
+  상자는 Nav2 footprint 안쪽이다. 기둥 모서리를 스친 빔은 기둥보다 10~20 cm 먼 0.36~0.50 m에 중간 거리 점을 내고(최대 2.9°
+  바깥), footprint 밖이라 상자로는 지워지지 않아 코스트맵에 로봇에 붙은 장애물로 남았다(2026-10-23, DWB "No valid trajectories").
+  그래서 각 기둥이 가리는 방향 ± `shadow_margin_deg`(3°) 안에서 `shadow_range`(0.7 m) 이내 점도 지운다. 기둥 너머는 원래 보이지 않으므로
+  잃는 영역은 여유 각도뿐이다(0.7 m에서 폭 약 3.7 cm). 실측: 로봇 밖 0.7 m 이내 점이 스캔당 32.6개에서 0개, 추가로 지운 점은 유효 점의 1.3 %.
   `laser` TF를 받기 전에는 스캔을 내보내지 않는다. `start_lidar:=false`이면 필터도 뜨지 않는다. `record_trial.sh`는 두 토픽을 모두 기록한다.
 - URDF는 `src/amr_description/urdf/capstone_amr.urdf.xacro`와 확장본 `.urdf`. 런치는 확장본을 읽어 mesh 경로를
   `package://amr_description/meshes/visual/`로 바꿔 `/robot_description`으로 제공한다. Xacro 수정 시 확장본도 재생성한다.
@@ -337,6 +340,23 @@ base_footprint
   `Transformation -> Current` 선택을 유지한다. 플러그인이 설치되지 않았으면 navigation launch가 빌드 안내와 함께 중단한다.
 - Navigation 2 패널·GoalTool·ParticleCloud는 기본 화면에서 뺐다. 15 fps, CAD 모델·전역 costmap·경로 화살표는 기본으로 끈다.
 - 초록 **Robot Footprint**는 충돌 검사 외곽(0.656×0.574 m + 0.02 m), 장애물 주변 색 띠는 inflation 비용(1.60 m 전체가 통행 금지는 아님).
+
+## 9a. CPU 부하 (Jetson Orin Nano, 2026-10-23)
+
+- 실차 스택 전체를 올리면 부하 평균이 코어 6개에 12~13까지 올라 `odom → base_footprint` TF가 평균 0.3초, 최대 3초 늦게 도착했다.
+  그러면 `navigation_startup`이 최신 스캔을 변환하지 못해 READY를 잠시 풀고 `navigation_manager`가 목표를 중단했다
+  (`Localization readiness lost`). 컨트롤러 주기도 20 Hz에서 9~15 Hz로 떨어졌다.
+- 코어 1개 기준 CPU: `vehicle_status` 67 %, `navigation_startup` 58 %, `web_ui` 42 %, `can_telemetry` 33 %, `control_mux`·`time_health`·
+  `elevator_monitor`·`floor_mission_manager` 각 25 %. 모두 Python이며 대부분 `/tf`(57 msg/s)를 구독한다.
+- `vehicle_status`는 웹 텔레메트리 카드만 쓰므로 bringup 기본값을 `start_vehicle_status:=false`로 바꿨다. 필요하면 인자로 켠다.
+- 주행 중 Chromium은 웹 UI 탭 하나만 둔다. 다른 VS Code 서버·Codex·cpptools를 띄워 두면 RAM 100 MB·스왑 0까지 떨어진 적이 있다.
+- 주행 4회에서 멈춤 13회가 모두 `navigation_startup`의 "odom·base·LiDAR 좌표 변환을 기다립니다"였고, 그때 이 노드는 CPU 92 %였다
+  (DDS 지연은 정상). 파이썬 노드라 TF 수신 스레드가 자기 연산에 밀린 것이다. py-spy(`sudo sysctl kernel.yama.ptrace_scope=0` 후
+  `py-spy record -p <pid> -d 15 -f raw`)로 잰 비중: 빔별 TF 조회 360회/틱 27 %, 입자 2,000개 역직렬화 9 %, `valid_scan` 파이썬 루프 6 %,
+  10 Hz 틱마다 같은 스캔 재채점. 조치: TF는 10 ms 간격 지점만 조회해 보간, 입자 구름은 초기 검증 때만 역직렬화, 스캔 검사 numpy,
+  READY에서는 새 스캔·AMCL 추정이 왔을 때만 채점, 보정 전 점수는 정렬 실패 때만 계산. 재시작 직후 측정 42 %(채점 전 두 항목 적용 전).
+- `web_ui` 50~75 %: `/api/state`마다 상태 deepcopy(30 %), 스캔 3,240점 파이썬 변환(13 %), 코스트맵 갱신마다 PNG 인코딩(9 %).
+  얕은 복사, numpy 변환, 요청 시 인코딩으로 바꿨다. `can_telemetry` 30~40 %는 CAN 폴링·발행 자체라 다음 대상이다.
 
 ## 10. 시간 이상 처리
 

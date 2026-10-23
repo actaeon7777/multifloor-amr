@@ -21,7 +21,7 @@
 
 ## 2. 핵심 설계 결정
 
-1. **층 판별의 1차 근거는 비콘, 2차는 미션 문맥.** 3F·5F 지도가 4F 복사본이라 지도 매칭으로 층을 구분할 수 없다.
+1. **층 판별의 1차 근거는 비콘, 2차는 미션 문맥.** 층마다 복도 골격이 같아 지도 매칭으로 층을 구분할 수 없다.
 2. **엘리베이터 구간(탑승·카 안·하차)은 Nav2가 아닌 전용 저속 기동 제어기**가 맡는다. inflation 1.6 m·`robot_radius` 0.44 m로는
    1.1 m 출입구 경로가 나오지 않고, `navigation.yaml`을 바꾸면 실차 복도 주행 전체가 영향을 받으므로 **바꾸지 않는다.**
 3. **카 안에서는 위치 추정을 일시 정지(SUSPENDED)** 한다. 하차 후 새 층 지도에서 `/initialpose`로 기존 수동 검증 경로를 거쳐 READY를 회복한다.
@@ -50,7 +50,8 @@
 | `elevator_can_link` | `amr_can_bridge` | `/elevator/*` ↔ CAN | 실차 전용, 기본 꺼짐 |
 | `elevator_sim_relay` | `amr_sim_bridge` | Isaac JSON 토픽 ↔ `/elevator/*` | 시뮬레이션 전용 |
 
-`experiment.sh sim world:=building`이면 monitor·mission·relay가 자동으로 실행된다. 실차는 `elevator:=true`로 켤 수 있으며 기본은 꺼져 있다.
+`experiment.sh sim world:=building`이면 monitor·mission·relay가 자동으로 실행된다. 실차(`experiment.sh real`)도 2026-10-23부터 monitor·mission을
+기본으로 실행해 웹에 층 탭·호실 목록이 나온다(`elevator:=false`로 끔). `real_enabled: false` 층은 계속 거절되고 `elevator_can_link`는 꺼져 있다.
 
 ### 토픽·서비스·액션
 
@@ -185,8 +186,8 @@ IDLE ─(같은 층)────────────────────
 |---|---|
 | `elevators.<id>` | 카 치수, 출입구 폭·위치, 문턱 깊이, 문 열림 시간 |
 | `floors.<층>.level`, `beacon_floor_code` | 층 순서, 비콘 층 코드 |
-| `real_enabled` | 실차 층간 이동 허용. 3F·5F는 실측 지도 전까지 `false` |
-| `provisional_copy_of` | 다른 층 지도를 복사한 임시본이면 원본 층 (3F·5F = `"4F"`, 각 지도 폴더에 `COPY_OF_4F.md`) |
+| `real_enabled` | 실차 층간 이동 허용. 3F·5F는 엘리베이터 실차 시험 전까지 `false` |
+| `provisional_copy_of` | 다른 층 지도를 복사한 임시본이면 원본 층. 현재 없음 (3F·5F는 2026-10-23 실측 지도로 교체) |
 | `map`, `annotations`, `sim_map` | 실차 지도, 영역 주석 PNG, 시뮬레이션 지도 (`amr_stack` 패키지 기준 경로) |
 | `sim_layer`, `spawn` | 시뮬레이션 층 USD, 시작 자세 |
 | `elevators.<id>.door_center`, `car_inward_yaw`, `hall_wait_pose`, `hall_exit_pose` | 층별 엘리베이터 지점 (map 프레임) |
@@ -287,8 +288,8 @@ Isaac 내장 rclpy는 사용자 정의 메시지를 쓸 수 없어 Isaac은 JSON
 | `navigation.yaml`, `can_telemetry` | **변경 없음** | — |
 | `elevator_can_link` | 별도 소켓. 통합 시험 전까지 실행하지 않음 | `start_elevator_link:=false` |
 | `/localization/suspend`, 기동 임대 | 호출하지 않으면 기존과 동일 | 적용 |
-| `elevator_monitor`, `floor_mission_manager` | 실행하지 않으면 영향 없음 | `elevator:=false` (sim building은 true) |
-| 웹 UI 층 선택 | 실차 허용 층이 1개면 기존 화면과 같음 | 적용 |
+| `elevator_monitor`, `floor_mission_manager` | monitor는 센서를 읽고 `/floor/*`만 발행. mission은 접수된 층간 목표에서만 움직임 | 실차·sim building `true`, 그 외 sim `false` |
+| 웹 UI 층 선택 | 층 탭·호실 목록 표시. 실차 허용 층(현재 4F)만 선택 가능 | 적용 |
 
 ## 10. 시나리오
 
@@ -346,8 +347,8 @@ python3 scripts/run_floor_suite.py --output logs/elevator/<새 폴더> [--scenar
 | 범위 | 엘리베이터 1대, 카는 비어 있다고 가정. 다른 승객 호출에 의한 중간 정차는 처리 |
 | 문 | 카 문과 홀 문이 함께 열리고 닫힌다 — 가정 |
 | 기동 | 전진 진입 → 카 안 180° 회전 → 전진 하차 (회전 지름 약 0.84 m < 카 폭 1.87 m) |
-| 지도 | 3F·5F는 4F 복사본. 실측 지도로 바꾸면 층마다 평면 좌표 오프셋을 장면 생성기와 런타임에 넣어야 한다 |
-| 실차 | 3F·5F `real_enabled: false`. 실측 지도 교체, 엘리베이터 실측(문턱 높이·틈) 후 활성화 |
+| 지도 | 3F·5F 실차 지도는 실측(2026-10-06 SLAM)을 4F 좌표계로 정렬해 넣었다(`scripts/align_floor_map.py`, 엘리베이터 문 위치 차 3F 6.5 cm·5F 4.5 cm). 층 전환이 자세 값을 그대로 쓰므로 모든 층 지도는 같은 좌표계여야 한다. 시뮬레이션 3F·5F 장면·영역지정과 호실 좌표는 아직 4F 복사본 (`maps/G_3_floor/MAP_SOURCE.md`) |
+| 실차 | 3F·5F `real_enabled: false`. 호실 문 위치 현장 확인, 엘리베이터 실측(문턱 높이·틈)·실차 통합 시험 후 활성화 |
 | CAN·RF | 프로토콜 v1.1([RF](ELEVATOR_RF_PROTOCOL.md), [CAN](ELEVATOR_CAN_PROTOCOL.md)). 하위제어기 구현·단독 검증, 4F 홀 비콘 bench 왕복 확인, Jetson 반영. 실차 통합·현장 채널·RPD 보정 남음 |
 | 카 "열림" 버튼 | `repeat` 정의(1.1), 카 비콘 펌웨어 미구현. 없어도 후퇴·재호출 규칙으로 동작 |
 | 통과층 | 1·2·6·7F는 지도 없이 비콘만 쓴다. 시뮬레이션 장면에는 없다 |

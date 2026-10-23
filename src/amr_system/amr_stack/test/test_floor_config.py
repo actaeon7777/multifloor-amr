@@ -50,9 +50,21 @@ def test_floors_without_a_map_are_pass_floors(config):
         config.floor('6F')  # Never a mission goal or a map.
 
 
-def test_only_measured_floor_is_enabled_on_the_real_vehicle(config):
+def test_only_the_elevator_tested_floor_is_enabled_on_the_real_vehicle(config):
+    # 3F/5F have measured maps but the elevator ride is not yet tested on the real vehicle.
     assert {n for n, f in config.floors.items() if f.real_enabled} == {'4F'}
-    assert all(f.provisional_copy_of == '4F' for n, f in config.floors.items() if n != '4F')
+    assert all(f.provisional_copy_of is None for f in config.floors.values())
+
+
+def test_real_floor_maps_share_the_reference_lattice(config):
+    """Floor switches keep the pose numbers, so every real map uses 4F's frame and cell lattice."""
+    reference = yaml.safe_load(config.map_path('4F', False).read_text())
+    for name in config.floors:
+        meta = yaml.safe_load(config.map_path(name, False).read_text())
+        assert meta['resolution'] == reference['resolution'], name
+        for axis in (0, 1):
+            cells = (meta['origin'][axis]-reference['origin'][axis])/meta['resolution']
+            assert abs(cells-round(cells)) < 1e-6, (name, axis)
 
 
 def test_referenced_files_exist(config):

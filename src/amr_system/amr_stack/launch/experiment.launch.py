@@ -33,7 +33,10 @@ def launch_mode(context):
 
     world = LaunchConfiguration('world').perform(context)
     default_map = f'maps/sim_{world}/{world}.yaml' if sim else 'maps/G_4_floor/4_floor_0522.yaml'
-    elevator = LaunchConfiguration('elevator').perform(context) or ('true' if world == 'building' else 'false')
+    # Real: the floor monitor feeds the web floor tabs and room list; floors with
+    # real_enabled false are still refused and the CAN elevator link stays off.
+    elevator = LaunchConfiguration('elevator').perform(context) or (
+        'true' if world == 'building' or not sim else 'false')
     if elevator not in ('true', 'false'):
         raise ValueError('elevator must be true or false')
     start_floor = LaunchConfiguration('start_floor').perform(context)
@@ -113,7 +116,7 @@ def generate_launch_description():
         DeclareLaunchArgument('start_floor', default_value='',
                               description='world:=building only: floor the AMR starts on (default floors.yaml default_floor)'),
         DeclareLaunchArgument('elevator', default_value='',
-                              description='Multi-floor elevator nodes; empty = true only for world:=building'),
+                              description='Multi-floor elevator nodes; empty = true for mode:=real and world:=building'),
         DeclareLaunchArgument('control_config', default_value=str(share / 'config/control_mux.yaml')),
         DeclareLaunchArgument('navigation_config', default_value=str(share / 'config/navigation.yaml')),
         DeclareLaunchArgument('startup_config', default_value=str(share / 'config/localization_startup.yaml')),

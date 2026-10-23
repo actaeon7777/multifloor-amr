@@ -22,9 +22,9 @@ floors:
   "3F":
     level: 3
     beacon_floor_code: 3
-    provisional_copy_of: "4F"
-    real_enabled: false              # 실측 지도 전까지 실차 층간 이동 금지
-    map: maps/G_3_floor/3_floor_tmp_from_4F.yaml
+    real_enabled: false              # 엘리베이터 실차 시험 전까지 실차 층간 이동 금지
+    # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_3_floor/MAP_SOURCE.md)
+    map: maps/G_3_floor/3_floor_1006.yaml
     annotations: maps/G_3_floor/3_floor_tmp_from_4F(영역지정).png
     sim_map: maps/sim_floor3/floor3.yaml
     sim_layer: sim/layers/3_floor_tmp_from_4F_map.usda
@@ -89,13 +89,13 @@ floors:
   "5F":
     level: 5
     beacon_floor_code: 5
-    provisional_copy_of: "4F"
-    real_enabled: false
-    map: maps/G_5_floor/5_floor_tmp_from_4F.yaml
+    real_enabled: false              # 엘리베이터 실차 시험 전까지 실차 층간 이동 금지
+    # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_5_floor/MAP_SOURCE.md)
+    map: maps/G_5_floor/5_floor_1006.yaml
     annotations: maps/G_5_floor/5_floor_tmp_from_4F(영역지정).png
     sim_map: maps/sim_floor5/floor5.yaml
     sim_layer: sim/layers/5_floor_tmp_from_4F_map.usda
-    spawn: [11.5, 3.31, 0.0]
+    spawn: [12.05, 3.31, 0.0]          # 실측 지도의 홀 물체(11.6, 3.2)를 0.3 m 이상 피함
     elevators:
       E1:
         door_center: [9.975, 3.31]

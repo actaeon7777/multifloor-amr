@@ -33,7 +33,7 @@ def test_floor_list_rooms_and_maps(shared):
     assert [f['name'] for f in info['floors']] == ['3F', '4F', '5F']
     assert info['current_floor'] == '4F' and info['default_floor'] == '4F'
     third = info['floors'][0]
-    assert third['provisional'] and third['selectable'] and not third['real_enabled']
+    assert not third['provisional'] and third['selectable'] and not third['real_enabled']
     assert [r['id'] for r in third['rooms']][:2] == ['301', '302']
     assert third['map']['width'] == 1014 and third['map']['resolution'] == .05
     versions = {f['name']: f['map']['version'] for f in info['floors']}
@@ -62,10 +62,10 @@ def test_cross_floor_goal_validation(shared):
         goal(shared, '3F', request='floor_goal_04')
 
 
-def test_real_vehicle_blocks_provisional_floors_and_unready_missions(shared):
+def test_real_vehicle_blocks_disabled_floors_and_unready_missions(shared):
     shared.state['preview'] = False
     shared.simulation = False
-    with pytest.raises(ApiError, match='임시 지도'):
+    with pytest.raises(ApiError, match='실차 층간 이동이 꺼져'):
         goal(shared, '3F')
     shared.simulation = True
     now = time.time()

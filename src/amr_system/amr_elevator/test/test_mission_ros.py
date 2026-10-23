@@ -120,7 +120,7 @@ def test_goal_admission(ros):
     assert not send(ros, '4F').accepted          # current floor not confirmed
     ros.floor_state()
     ros.spin(.3)
-    assert not send(ros, '3F').accepted          # provisional map: real vehicle refuses
+    assert not send(ros, '3F').accepted          # real_enabled false: real vehicle refuses
     assert not send(ros, '9F').accepted          # unknown floor
 
 

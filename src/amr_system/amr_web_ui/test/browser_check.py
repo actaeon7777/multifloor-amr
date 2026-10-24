@@ -158,6 +158,13 @@ def main():
         wait(lambda: script("return !document.getElementById('vehicle-view').hidden && document.getElementById('main-view').hidden"))
         assert script("return !document.getElementById('main-menu').classList.contains('open') && document.getElementById('menu-backdrop').hidden")
         assert script("return document.getElementById('health-title').textContent.includes('미리보기') && document.getElementById('side-battery-percent').textContent==='—'")
+        # Third view: floor transit (steps, door, beacons) renders without a mission in preview.
+        script("document.querySelector('[data-view=floor-transit]').click()")
+        wait(lambda: script("return !document.getElementById('transit-view').hidden && document.getElementById('vehicle-view').hidden"))
+        wait(lambda: script("return document.querySelectorAll('#transit-steps .transit-step').length===11 && document.querySelectorAll('#transit-beacons .beacon-card').length>0"))
+        assert script("return document.getElementById('transit-route').textContent.includes('없습니다') && document.getElementById('transit-door-state').textContent==='미수신'")
+        script("document.querySelector('[data-view=vehicle-status]').click()")
+        wait(lambda: script("return !document.getElementById('vehicle-view').hidden && document.getElementById('transit-view').hidden"))
         for viewport in [(1440,1080),(1366,900),(900,900),(768,900),(390,844)]:
             api('POST',f'/session/{session}/goog/cdp/execute', dict(cmd='Emulation.setDeviceMetricsOverride',
                 params=dict(width=viewport[0],height=viewport[1],deviceScaleFactor=1,mobile=viewport[0]<641)))

@@ -79,13 +79,15 @@
     $('menu-backdrop').hidden = !open;
     if (!open && window.matchMedia('(max-width:900px)').matches && $('main-menu').contains(document.activeElement)) $('menu-toggle').focus();
   }
+  // location.hash -> [section, nav data-view, breadcrumb]; anything else shows the main view.
+  const views = {'#vehicle-status': ['vehicle-view', 'vehicle-status', '차량 상태'],
+    '#floor-transit': ['transit-view', 'floor-transit', '층간 이동']};
   function view() {
-    const vehicle = location.hash === '#vehicle-status';
-    $('main-view').hidden = vehicle;
-    $('vehicle-view').hidden = !vehicle;
-    text('current-view', vehicle ? '차량 상태' : '메인');
+    const [section, name, title] = views[location.hash] || ['main-view', 'main', '메인'];
+    for (const id of ['main-view', 'vehicle-view', 'transit-view']) $(id).hidden = id !== section;
+    text('current-view', title);
     document.querySelectorAll('[data-view]').forEach(e => {
-      const active = e.dataset.view === (vehicle ? 'vehicle-status' : 'main');
+      const active = e.dataset.view === name;
       e.classList.toggle('active', active);
       if (active) e.setAttribute('aria-current', 'page'); else e.removeAttribute('aria-current');
     });
@@ -247,6 +249,7 @@
       text('power-source', bms ? 'BMS' : Number.isFinite(voltage) ? 'CAN 전압' : '전압 연동 대기');
       badge('battery-charge-state', battery ? ({1:'방전 중',2:'충전 중',3:'충전 완료'}[battery.charge_state] || '미확인') : '미연동');
       badge('battery-temperature', Number.isFinite(battery?.temperature) ? `${number(battery.temperature)} ℃` : '미연동');
+      window.AMRTransit?.update(s, online && relayFresh);
     },
   };
 })();

@@ -39,11 +39,12 @@ from amr_vehicle_interfaces.msg import VehicleStatus
 
 try:  # Multi-floor support is optional: the web UI still runs without the elevator packages.
     from amr_elevator_interfaces.action import NavigateToFloorPose
-    from amr_elevator_interfaces.msg import ElevatorCommandStatus, FloorState
+    from amr_elevator_interfaces.msg import (
+        ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorEvent, FloorState)
     from amr_stack.floor_config import load_floor_config
 except ImportError:  # pragma: no cover - depends on the installed workspace
     NavigateToFloorPose = ElevatorCommandStatus = FloorState = load_floor_config = None
-import json
+    ElevatorBeacon = ElevatorCommand = ElevatorDoorState = FloorEvent = None
 
 from .geometry import Grid, transform_xy, yaw
 from .vehicle_status import display_snapshot, seconds
@@ -117,13 +118,28 @@ class WebBridge(Node):
         if self.floor_client is not None:
             self.subscriptions_list.append(self.create_subscription(
                 FloorState, '/floor/state', self.on_floor_state, latched))
+            # Depth 10: phases can change within one executor cycle (CALL_ELEVATOR -> WAIT_DOOR_OPEN).
             self.subscriptions_list.append(self.create_subscription(
-                String, '/floor_mission/status', self.on_floor_mission, latched))
+                String, '/floor_mission/status', lambda m: self.shared.update_floor_mission(m.data),
+                QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)))
             self.subscriptions_list.append(self.create_subscription(
                 String, '/elevator/rf_status', lambda m: self.shared.update_elevator_rf(m.data), latched))
             self.subscriptions_list.append(self.create_subscription(
                 ElevatorCommandStatus, '/elevator/command_status', lambda m: self.shared.update_elevator_command(
                     m.cmd_seq, m.status, m.device_result, m.target, m.attempts, m.source), 10))
+            # Floor transit view. Callbacks only store; the snapshot does the work (Jetson CPU).
+            self.subscriptions_list.append(self.create_subscription(
+                ElevatorCommand, '/elevator/command', lambda m: self.shared.update_sent_command(
+                    m.command, m.floor_code, m.direction, m.sequence, m.repeat), 10))
+            self.subscriptions_list.append(self.create_subscription(
+                ElevatorBeacon, '/elevator/beacon', lambda m: self.shared.update_beacon(
+                    m.event, m.location, m.floor_code, m.ack_sequence, m.rssi_dbm), 50))
+            self.subscriptions_list.append(self.create_subscription(
+                ElevatorDoorState, '/elevator/door', lambda m: self.shared.update_door(
+                    m.state, m.open_ratio, m.valid_beams), 1))
+            self.subscriptions_list.append(self.create_subscription(
+                FloorEvent, '/floor/events', lambda m: self.shared.update_floor_event(
+                    m.event, m.from_floor, m.to_floor, m.detail), 20))
         self.subscriptions_list.append(self.create_subscription(
             VehicleStatus, '/vehicle/status', self.on_vehicle_status, QoSProfile(depth=1)))
         self.create_timer(.05, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
@@ -192,15 +208,6 @@ class WebBridge(Node):
                                   duplicate_count=msg.duplicate_count,
                                   out_of_order_count=msg.out_of_order_count,
                                   stale_count=msg.stale_count))
-
-    def on_floor_mission(self, msg):
-        try:
-            value = json.loads(msg.data)
-            if isinstance(value, dict):
-                self.set_state(floor_mission={k: value.get(k) for k in (
-                    'phase', 'detail', 'goal_floor', 'goal_room', 'start_floor', 'current_floor')})
-        except ValueError:
-            pass
 
     def on_scan(self, msg):
         self.pending_scan = (msg, time.monotonic())

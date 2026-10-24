@@ -117,7 +117,8 @@ def generate_launch_description():
         DeclareLaunchArgument('start_elevator_link', default_value='false', choices=['true', 'false'],
                               description='Run elevator_can_link (real RF relay over can0).'),
         DeclareLaunchArgument('elevator_link_dry_run', default_value='true', choices=['true', 'false'],
-                              description='true: preview 0x210 only; false: transmit and press real buttons.'),
+                              description='true: no CAN socket (0x210 preview only, no beacon RX); '
+                                          'false: receive beacons and press real buttons.'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
         DeclareLaunchArgument('map', default_value=''),
         DeclareLaunchArgument('start_floor', default_value='',

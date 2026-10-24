@@ -52,7 +52,8 @@
 
 `experiment.sh sim world:=building`이면 monitor·mission·relay가 자동으로 실행된다. 실차(`experiment.sh real`)도 2026-10-23부터 monitor·mission을
 기본으로 실행해 웹에 층 탭·호실 목록이 나온다(`elevator:=false`로 끔). `real_enabled: false` 층은 계속 거절된다. `elevator_can_link`는 기본 꺼짐이고
-`start_elevator_link:=true`로 켠다. 이때도 `elevator_link_dry_run`이 기본 `true`라 0x210을 미리보기만 하며, `false`여야 실제 버튼을 누른다.
+`start_elevator_link:=true`로 켠다. 이때도 `elevator_link_dry_run`이 기본 `true`라 CAN을 열지 않는다(0x210 미리보기만, 0x310/0x311 비콘 수신도 없음).
+비콘을 받으려면 `false`로 둔다. 그러면 미션이 보내는 버튼 명령도 실제로 송신된다.
 
 ### 토픽·서비스·액션
 

@@ -157,3 +157,79 @@ def test_elevator_rf_panel_lists_every_installed_beacon(shared):
 def test_pass_floors_are_not_destinations(shared):
     names = [f['name'] for f in shared.floors_info()['floors']]
     assert names == ['3F', '4F', '5F']
+
+
+def mission_status(phase, **overrides):
+    status = dict(phase=phase, detail='', goal_floor='3F', goal_room='302', start_floor='4F',
+                  current_floor='4F', zone=1, confidence='BEACON', door=1,
+                  counters={'button_retries': 1, 'bad': 'x', 'flag': True}, timings={'NAV_TO_HALL': 12.5, 'x': 'y'},
+                  elapsed=3.)
+    status.update(overrides)
+    return json.dumps(status)
+
+
+def test_floor_transit_mission_steps_and_event_log(shared):
+    assert shared.snapshot()['transit']['mission'] is None
+    assert shared.update_floor_mission(mission_status('SUCCEEDED'))  # latched result of an older mission
+    assert not shared.update_floor_mission('garbage') and not shared.update_floor_mission('{"phase": 3}')
+    assert shared.update_floor_mission(mission_status('NAV_TO_HALL'))
+    mission = shared.state['floor_mission']
+    assert mission['counters'] == {'button_retries': 1}  # bool and str values dropped
+    assert mission['timings'] == {'NAV_TO_HALL': 12.5} and mission['door'] == 1
+    shared.update_floor_mission(mission_status('NAV_TO_HALL', door=3))  # same phase: no new event
+    shared.update_floor_mission(mission_status('CALL_ELEVATOR'))
+    shared.update_sent_command(1, 4, 1, 21, 0)
+    shared.update_sent_command(1, 4, 1, 22, 0)  # unacknowledged resend of the same press
+    shared.update_elevator_command(21, 4, 0xFF, 0x44, 3, 'can')
+    shared.update_elevator_command(22, 1, 0xFF, 0x44, 1, 'can')
+    shared.update_beacon(2, 0, 4, 21, -60)  # a late ACK of the first press still counts
+    transit = shared.snapshot()['transit']
+    command = transit['command']
+    assert (command['sequence'], command['attempt'], command['status']) == (22, 2, 'DELIVERED')
+    assert command['ack_age'] is not None and 'sequences' not in command
+    assert transit['mission']['phases'] == ['NAV_TO_HALL', 'CALL_ELEVATOR']
+    assert transit['mission']['phase_age'] >= 0 and transit['mission']['elapsed'] >= 3.
+    kinds = [e['kind'] for e in transit['events']]
+    assert kinds == ['phase', 'phase', 'command', 'command', 'status', 'status', 'ack']
+    json.dumps(transit, allow_nan=False)
+    shared.update_floor_mission(mission_status('FAILED_SAFE', detail='NO_HALL_ACK'))
+    shared.update_floor_mission(mission_status('NAV_TO_HALL'))  # a new mission starts a fresh log
+    transit = shared.snapshot()['transit']
+    assert [e['kind'] for e in transit['events']] == ['phase'] and transit['command'] is None
+    assert transit['mission']['phases'] == ['NAV_TO_HALL']
+
+
+def test_floor_transit_door_is_logged_once_it_settles(shared, monkeypatch):
+    now = [100.]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+    shared.update_door(3, .9, 40)
+    shared.update_door(3, .9, 40)  # idle: shown, not logged
+    assert shared.snapshot()['transit']['door']['state'] == 3 and not shared.transit_events
+    shared.update_floor_mission(mission_status('WAIT_DOOR_OPEN'))
+    for state, step in ((1, 0.), (1, .2), (3, .1), (3, .3), (3, .3), (3, .1)):
+        now[0] += step
+        shared.update_door(state, .5, 40)
+    assert [e['state'] for e in shared.transit_events if e['kind'] == 'door'] == [3]
+    now[0] += 5
+    assert shared.snapshot()['transit']['door']['age'] == 5
+
+
+def test_floor_transit_beacon_timeline(shared, monkeypatch):
+    now = [1000.]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+    shared.update_beacon(1, 0, 4, 0, -80)  # 4F hall, weak
+    now[0] += .5
+    shared.update_beacon(1, 0, 4, 0, -60)  # same second: the stronger grade wins
+    shared.update_beacon(1, 1, 0, 0, -60)  # car
+    shared.update_beacon(1, 0, 15, 0, -80)  # not in floors.yaml
+    now[0] += 2.2
+    shared.update_elevator_rf(rf_status())
+    rows = {b['label']: b for b in shared.snapshot()['transit']['beacons']}
+    hall = rows['4F']
+    assert hall['rssi'] == -60 and abs(hall['presence_age'] - 2.2) < 1e-9
+    assert len(hall['bins']) == 60 and hall['bins'][-3] == -60 and hall['bins'].count(None) == 59
+    assert rows['E1']['bins'][-3] == -60 and rows['1F']['battery_mv'] == 2100 and rows['1F']['bins'] == [None]*60
+    assert rows['15F']['mapped'] is False and rows['3F']['presence_age'] is None
+    now[0] += 61
+    rows = {b['label']: b for b in shared.snapshot()['transit']['beacons']}
+    assert rows['4F']['presence_age'] is None and rows['4F']['bins'] == [None]*60

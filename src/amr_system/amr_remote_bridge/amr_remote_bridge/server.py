@@ -553,7 +553,7 @@ def create_server(registry, assets, token, host='127.0.0.1', port=8081, default_
                     mime = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8',
                             'css': 'text/css; charset=utf-8'}[name.rsplit('.', 1)[1]]
                     self.respond(200, (fleet_assets / name).read_bytes(), mime)
-                elif path in ('/', '/index.html', '/app.js', '/geometry.js', '/dashboard.js',
+                elif path in ('/', '/index.html', '/app.js', '/geometry.js', '/dashboard.js', '/transit.js',
                               '/battery-profile.js', '/style.css', '/favicon.svg'):
                     name = 'index.html' if path == '/' else path[1:]
                     content = (assets / name).read_bytes()

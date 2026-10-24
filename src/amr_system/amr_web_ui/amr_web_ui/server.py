@@ -1,6 +1,6 @@
 """Offline-capable HTTP UI. ROS commands are executed only on the ROS executor."""
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -34,6 +34,13 @@ RF_LINK_KEYS = {'radio_ok': bool, 'rx_overflow': bool, 'tx_timeout': bool, 'rx_o
 RF_BEACON_KEYS = {'node_id': int, 'label': str, 'role': str, 'floor_code': int,
                   'presence_age': (int, float), 'rssi_dbm': int, 'battery_mv': int,
                   'fw_version': int, 'device_age': (int, float)}
+# Floor transit view: beacon reception timeline (1 s bins) and the mission event log.
+TRANSIT_WINDOW = 60
+TRANSIT_EVENTS = 60
+# /elevator/door follows the scan (~10 Hz); a door state must hold this long to be logged.
+DOOR_TIMEOUT = 1.
+DOOR_SETTLE = .5
+MISSION_TEXT_KEYS = ('phase', 'detail', 'goal_floor', 'goal_room', 'start_floor', 'current_floor', 'confidence')
 COMMAND_STATUS_NAMES = {1: 'DELIVERED', 2: 'COMPLETED', 3: 'DEVICE_REJECTED', 4: 'RF_TIMEOUT',
                         5: 'NO_RESULT', 6: 'NO_ROUTE', 7: 'BAD_FRAME', 8: 'REPLACED'}
 DEVICE_RESULT_NAMES = {0x00: 'PRESSED', 0x01: 'DUPLICATE', 0x81: 'WRONG_DEVICE', 0x82: 'UNSUPPORTED',
@@ -79,6 +86,15 @@ class SharedState:
         self.elevator_rf = None
         self.elevator_rf_received = -math.inf
         self.elevator_command = None
+        # Floor transit view (/elevator/command, /elevator/beacon, /elevator/door, /floor/events).
+        self.transit_events = deque(maxlen=TRANSIT_EVENTS)
+        self.beacon_history = {}  # ('car', 0) | ('hall', floor_code) -> deque[(monotonic, rssi)]
+        self.door = None
+        self.door_candidate = (None, -math.inf)
+        self.door_logged = None
+        self.sent_command = None
+        self.mission_phases = []
+        self.mission_received = (-math.inf, -math.inf)  # (phase change, last status) monotonic
         self.connection_epoch = 0
         self.telemetry = DisplayTelemetry()
         # Multi-floor (floors.yaml); None when the elevator packages are absent.
@@ -200,6 +216,148 @@ class SharedState:
                 cmd_seq=cmd_seq, status=COMMAND_STATUS_NAMES.get(status, str(status)),
                 device_result=DEVICE_RESULT_NAMES.get(device_result, f'0x{device_result:02X}'),
                 target=target, attempts=attempts, source=source[:8], received_at=time.monotonic())
+            name, result = self.elevator_command['status'], self.elevator_command['device_result']
+            sent = self.sent_command
+            if sent is not None and cmd_seq in sent['sequences']:
+                sent.update(status=name, device_result=result)
+            self.log_transit('status', cmd_seq=cmd_seq, status=name, device_result=result, target=target)
+
+    def log_transit(self, kind, **fields):
+        self.transit_events.append(dict(t=time.time(), kind=kind, **fields))
+
+    def mission_active(self):
+        return (self.state.get('floor_mission') or {}).get('phase') in FLOOR_MISSION_ACTIVE
+
+    def update_floor_mission(self, text):
+        """/floor_mission/status; only typed, whitelisted fields reach the browser."""
+        try:
+            value = json.loads(text, parse_constant=lambda _s: None)
+        except ValueError:
+            return False
+        if not isinstance(value, dict) or not isinstance(value.get('phase'), str):
+            return False
+        mission = {k: value[k][:300] if isinstance(value.get(k), str) else '' for k in MISSION_TEXT_KEYS}
+        for key in ('zone', 'door'):
+            mission[key] = value[key] if type(value.get(key)) is int else None
+        number = lambda v: type(v) in (int, float) and math.isfinite(v)
+        mission['counters'] = {str(k)[:40]: v for k, v in (value.get('counters') or {}).items()
+                               if type(v) is int} if isinstance(value.get('counters'), dict) else {}
+        mission['timings'] = {str(k)[:40]: float(v) for k, v in (value.get('timings') or {}).items()
+                              if number(v)} if isinstance(value.get('timings'), dict) else {}
+        mission['elapsed'] = float(value['elapsed']) if number(value.get('elapsed')) else None
+        now = time.monotonic()
+        with self.lock:
+            old = self.state.get('floor_mission') or {}
+            phase = mission['phase']
+            if phase != old.get('phase'):
+                if phase in FLOOR_MISSION_ACTIVE and old.get('phase') not in FLOOR_MISSION_ACTIVE:
+                    # A new mission: start a fresh log and button history.
+                    self.transit_events.clear()
+                    self.mission_phases = []
+                    self.sent_command = self.door_logged = None
+                self.mission_phases = (self.mission_phases + [phase])[-40:]
+                self.mission_received = (now, now)
+                self.log_transit('phase', phase=phase, detail=mission['detail'])
+            else:
+                self.mission_received = (self.mission_received[0], now)
+            self.state['floor_mission'] = mission
+        return True
+
+    def update_sent_command(self, command, floor_code, direction, sequence, repeat):
+        """An ElevatorCommand from the mission; a resend of the same press counts as a retry."""
+        now = time.monotonic()
+        key = (command, floor_code, direction, repeat)
+        with self.lock:
+            last = self.sent_command
+            retry = last is not None and last['key'] == key and last['acked_at'] is None
+            self.sent_command = dict(
+                key=key, command=command, floor_code=floor_code, direction=direction, repeat=repeat,
+                sequence=sequence, sequences=(last['sequences'] if retry else set()) | {sequence},
+                attempt=last['attempt'] + 1 if retry else 1, sent_at=now, acked_at=None,
+                status=None, device_result=None)
+            self.log_transit('command', command=command, floor_code=floor_code, direction=direction,
+                             repeat=repeat, sequence=sequence, attempt=self.sent_command['attempt'])
+
+    def update_beacon(self, event, location, floor_code, ack_sequence, rssi):
+        now = time.monotonic()
+        with self.lock:
+            if event == 1:  # PRESENCE
+                key = ('car', 0) if location == 1 else ('hall', floor_code)
+                samples = self.beacon_history.setdefault(key, deque())
+                samples.append((now, rssi))
+                while samples and now - samples[0][0] > TRANSIT_WINDOW:
+                    samples.popleft()
+            elif event == 2:  # BUTTON_ACK
+                sent = self.sent_command
+                if sent is not None and sent['acked_at'] is None and ack_sequence in sent['sequences']:
+                    sent['acked_at'] = now
+                self.log_transit('ack', location=location, floor_code=floor_code, ack_sequence=ack_sequence)
+
+    def update_door(self, state, open_ratio, valid_beams):
+        now = time.monotonic()
+        with self.lock:
+            self.door = dict(state=state, open_ratio=open_ratio if math.isfinite(open_ratio) else None,
+                             valid_beams=valid_beams, received_at=now)
+            if state != self.door_candidate[0]:
+                self.door_candidate = (state, now)
+            elif (state != self.door_logged and now - self.door_candidate[1] >= DOOR_SETTLE
+                  and self.mission_active()):
+                self.door_logged = state
+                self.log_transit('door', state=state)
+
+    def update_floor_event(self, event, from_floor, to_floor, detail):
+        with self.lock:
+            self.log_transit('floor', event=event[:40], from_floor=from_floor[:16], to_floor=to_floor[:16],
+                             detail=detail[:200])
+
+    def transit_snapshot(self, now):
+        """The floor transit view; None without floors.yaml."""
+        with self.lock:
+            if self.building is None:
+                return None
+            mission = self.state.get('floor_mission')
+            mission = dict(mission) if mission else None
+            phases, (phase_at, status_at) = list(self.mission_phases), self.mission_received
+            history = {key: list(samples) for key, samples in self.beacon_history.items()}
+            expected = self.expected_beacons()
+            devices = {('car', 0) if b.get('role') == 'car' else ('hall', b.get('floor_code')): b
+                       for b in (self.elevator_rf or {}).get('beacons', [])}
+            door = dict(self.door) if self.door else None
+            sent = dict(self.sent_command) if self.sent_command else None
+            events = list(self.transit_events)
+        if mission:
+            mission['phase_age'] = max(0., now - phase_at) if math.isfinite(phase_at) else None
+            if mission.get('elapsed') is not None and mission.get('phase') in FLOOR_MISSION_ACTIVE:
+                mission['elapsed'] += max(0., now - status_at)
+            mission['phases'] = phases
+        if door:
+            door['age'] = max(0., now - door.pop('received_at'))
+        if sent:
+            for name in ('key', 'sequences'):
+                sent.pop(name)
+            sent['age'] = max(0., now - sent.pop('sent_at'))
+            acked = sent.pop('acked_at')
+            sent['ack_age'] = None if acked is None else max(0., now - acked)
+        rows = [(('car', 0) if row['role'] == 'car' else ('hall', row['floor_code']), row) for row in expected]
+        known = {key for key, _row in rows}
+        rows += [(key, dict(label=f'{key[1]}F' if key[1] > 0 else f'B{-key[1]}', role='hall',
+                            floor_code=key[1], mapped=False))  # Heard but not in floors.yaml.
+                 for key in sorted(set(history) - known) if key[0] == 'hall']
+        beacons = []
+        for key, row in rows:
+            samples = [(t, r) for t, r in history.get(key, ()) if 0 <= now - t < TRANSIT_WINDOW]
+            bins = [None] * TRANSIT_WINDOW
+            for t, rssi in samples:
+                index = TRANSIT_WINDOW - 1 - int(now - t)
+                bins[index] = rssi if bins[index] is None else max(bins[index], rssi)
+            device = devices.get(key, {})
+            beacons.append(dict(
+                label=row['label'], role=row['role'], floor_code=row.get('floor_code', 0),
+                mapped=row['mapped'], presence_age=now - samples[-1][0] if samples else None,
+                rssi=samples[-1][1] if samples else None, bins=bins,
+                **{k: device[k] for k in ('battery_mv', 'flags', 'device_age') if device.get(k) is not None}))
+        return dict(mission=mission, door=door, command=sent, events=events, beacons=beacons,
+                    window=TRANSIT_WINDOW, door_timeout=DOOR_TIMEOUT)
 
     def expected_beacons(self):
         """Every installed beacon: floors with a map, pass floors (no map) and the car."""
@@ -280,6 +438,8 @@ class SharedState:
                     self.complete(request_id, 'FAILED', reason)
             self.state['pending_request'] = None
             self.localization_reset_baseline = None
+            # The log and beacon timeline stay; live door and button state must be re-heard.
+            self.door = self.sent_command = None
             while True:
                 try:
                     self.commands.get_nowait()
@@ -447,6 +607,7 @@ class SharedState:
             result['tf_error'] = '시간·센서 상태 확인 필요: ' + detail
         result['estop'] = self.estop_snapshot(now)
         result['elevator'] = self.elevator_snapshot(now)
+        result['transit'] = self.transit_snapshot(now)
         for name in ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization'):
             item = result.get(name)
             if item:
@@ -626,7 +787,7 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                     self.respond(404, dict(error='아직 레이어 데이터가 없습니다.'))
                 else:
                     self.respond(200, png, 'image/png', {'X-Map-Version': version})
-            elif path in ('/', '/index.html', '/app.js', '/geometry.js', '/dashboard.js',
+            elif path in ('/', '/index.html', '/app.js', '/geometry.js', '/dashboard.js', '/transit.js',
                           '/battery-profile.js', '/style.css', '/favicon.svg'):
                 name = 'index.html' if path == '/' else path[1:]
                 mime = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8',

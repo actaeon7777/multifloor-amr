@@ -1,8 +1,7 @@
 /* Use textContent for agent-provided values; never retry movement commands. */
 (() => {
   'use strict';
-  // Approval is given at the robot (web UI or joystick); the fleet view only reports it.
-  const estopLabels = {ESTOP:'E-stop 정지', DISARMED:'E-stop 해제 · 현장 승인 필요', ARMING:'주행 준비 중',
+  const estopLabels = {ESTOP:'E-stop 정지', ARMING:'주행 준비 중',
     UNKNOWN:'E-stop 상태 대기'};
   const rfLabels = {WARN:'엘리베이터 RF 주의', ERROR:'엘리베이터 RF 이상'};
   async function poll() {

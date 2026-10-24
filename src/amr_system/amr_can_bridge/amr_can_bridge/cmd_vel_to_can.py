@@ -1,7 +1,7 @@
 """Translate /cmd_vel to the proven Jetson -> STM32 CAN velocity protocol.
 
-Drive frames are gated by the STM32 E-stop status (0x202): nothing is sent after
-an E-stop until /estop/approve_resume, then (0, 0) until the STM32 drive gate opens.
+Drive frames are gated by the STM32 E-stop status (0x202): nothing is sent while
+stopped, then (0, 0) until the STM32 drive gate opens.
 """
 
 import json
@@ -21,12 +21,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
 
 from amr_can_bridge.can_sender import CanInterfaceError, CanSender
 from amr_can_bridge.drive_protocol import CommandWatchdog, make_payload
 from amr_can_bridge.estop_protocol import (
-    ARMING, DISARMED, ESTOP, ESTOP_STATUS_ID, READY, SEND_COMMAND, SEND_ZERO, UNKNOWN,
+    ARMING, ESTOP, ESTOP_STATUS_ID, READY, SEND_COMMAND, SEND_ZERO, UNKNOWN,
     EstopSupervisor, InvalidStatus, decode_estop_status,
 )
 
@@ -37,21 +36,12 @@ MIN_TX_RATE = 10.0
 STATE_DETAIL = {
     UNKNOWN: 'STM32 E-stop 상태 수신을 기다립니다.',
     ESTOP: 'E-stop 정지 중입니다. 버튼을 원위치로 돌리세요.',
-    DISARMED: 'E-stop 해제됨. 주변을 확인하고 재개를 승인하세요.',
-    ARMING: '재개 승인됨. STM32 주행 준비를 기다립니다.',
+    ARMING: 'E-stop 해제됨. STM32 주행 준비를 기다립니다.',
     READY: '주행 가능',
     BYPASS: 'E-stop 상태 확인 없이 동작 중입니다 (dry run 또는 구 펌웨어).',
 }
 ARMING_SLOW_DETAIL = ('STM32 주행 준비가 늦어지고 있습니다. '
                       'ODrive 연결·오류 상태를 확인하세요.')
-APPROVE_REJECTED = {
-    'state_unknown': 'STM32 E-stop 상태를 아직 받지 못했습니다.',
-    'state_estop': 'E-stop이 아직 눌려 있거나 해제가 확정되지 않았습니다.',
-    'state_arming': '이미 재개 승인되어 주행 준비 중입니다.',
-    'state_ready': '이미 주행 가능 상태입니다.',
-    'status_not_clear': 'STM32 E-stop 상태가 최신이 아니거나 정지 중입니다.',
-    'bypass': 'E-stop 확인이 꺼져 있어 승인이 필요 없습니다.',
-}
 
 
 class CmdVelToCan(Node):
@@ -101,7 +91,6 @@ class CmdVelToCan(Node):
                 String, '/estop/status', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
             self.diagnostics = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
             self.subscription = self.create_subscription(Twist, '/cmd_vel', self.on_command, 1)
-            self.create_service(Trigger, '/estop/approve_resume', self.approve_resume)
             self.transport_fault = False
             self.last_error_log = float('-inf')
             self.rx_error = ''
@@ -130,8 +119,8 @@ class CmdVelToCan(Node):
                 'restart after an E-stop is not interlocked by this bridge.')
         else:
             self.get_logger().info(
-                'E-stop interlock on: no drive frames until 0x202 is clear and '
-                '/estop/approve_resume is called.')
+                'E-stop interlock on: no drive frames until 0x202 is clear; '
+                're-arms automatically after release.')
         self.publish_status()
 
     @staticmethod
@@ -150,23 +139,6 @@ class CmdVelToCan(Node):
             message.linear.x, message.linear.y, message.linear.z,
             message.angular.x, message.angular.y, message.angular.z,
         ), monotonic())
-
-    def approve_resume(self, _request, response):
-        if self.estop is None:
-            accepted, reason = False, 'bypass'
-        else:
-            self.receive_status(monotonic())
-            accepted, reason = self.estop.approve(monotonic())
-        if accepted:
-            # Only commands issued after approval may move the robot.
-            self.watchdog.stop('awaiting_zero')
-            self.get_logger().warning('E-stop restart approved by operator; arming STM32 drive gate')
-            response.message = '재개 승인됨. STM32 주행 준비 후 새 명령으로만 움직입니다.'
-        else:
-            response.message = APPROVE_REJECTED.get(reason, reason)
-        response.success = accepted
-        self.after_estop_update()
-        return response
 
     def receive_status(self, now):
         if self.estop is None:
@@ -198,15 +170,16 @@ class CmdVelToCan(Node):
             return
         if self.estop.epoch != self.estop_epoch:
             self.estop_epoch = self.estop.epoch
-            # Discard any cached motion; resuming requires approval and new commands.
+            # Discard any cached motion; only commands issued after re-arming move the robot.
             self.watchdog.stop('estop')
             self.get_logger().error(f'E-stop event ({self.estop.reason}); drive frames blocked')
         state = self.estop.state
         if state != self.estop_state:
-            if state == ARMING and self.estop_state == READY:
-                self.watchdog.stop('drive_gate_closed')
+            if state == ARMING:
+                # Released or gate closed: zeros sent before re-arming do not count.
+                self.watchdog.stop(self.estop.reason)
             text = f'E-stop interlock {self.estop_state} -> {state} ({self.estop.reason})'
-            if state in (ESTOP, DISARMED):
+            if state == ESTOP:
                 self.get_logger().warning(text)
             else:
                 self.get_logger().info(text)
@@ -230,8 +203,8 @@ class CmdVelToCan(Node):
         self.status_publisher.publish(String(data=json.dumps(dict(
             report, session=self.session, sequence=self.sequence, stamp=time(),
             epoch=report.get('epoch', 0), state=state,
-            healthy=state in (READY, BYPASS), latched=state in (UNKNOWN, ESTOP, DISARMED),
-            approval_required=state == DISARMED, detail=self.detail(),
+            healthy=state in (READY, BYPASS), latched=state in (UNKNOWN, ESTOP),
+            detail=self.detail(),
             rx_error=self.rx_error))))
 
     def detail(self):
@@ -246,7 +219,7 @@ class CmdVelToCan(Node):
         allowed = SEND_COMMAND if self.estop is None else self.estop.output(now)
         self.publish_status()
         if allowed not in (SEND_COMMAND, SEND_ZERO):
-            return  # ESTOP/DISARMED/UNKNOWN: send no 0x201 at all, not even zeros.
+            return  # ESTOP/UNKNOWN: send no 0x201 at all, not even zeros.
         v, w = self.watchdog.sample(now)
         reason = self.watchdog.reason
         if allowed == SEND_ZERO:
@@ -276,7 +249,7 @@ class CmdVelToCan(Node):
         status.hardware_id = self.sender.channel
         if self.rx_error or state in (UNKNOWN, ESTOP):
             status.level = DiagnosticStatus.ERROR
-        elif state in (DISARMED, ARMING, BYPASS):
+        elif state in (ARMING, BYPASS):
             status.level = DiagnosticStatus.WARN
         else:
             status.level = DiagnosticStatus.OK

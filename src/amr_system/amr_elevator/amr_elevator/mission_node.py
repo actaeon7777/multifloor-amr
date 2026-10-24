@@ -33,6 +33,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.task import Future
+from rclpy.time import Time
 
 
 def spin_executor():
@@ -50,6 +51,7 @@ def spin_executor():
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from amr_control.time_guard import HealthLease
 from amr_elevator.geometry import depth_beyond, wrap
@@ -129,7 +131,7 @@ class FloorMissionManager(Node):
             'boarding_timeout': 30., 'max_boarding_attempts': 3, 'lease_renew_period': 10.,
             'initial_pose_xy_variance': .0225, 'initial_pose_yaw_variance': .0076,
             'maneuver_speed': .35, 'tick_period': .05, 'floor_state_timeout': 3.,
-            'localization_recovery_timeout': 45., 'require_estop': False,
+            'localization_recovery_timeout': 45., 'require_estop': False, 'base_frame': 'base_footprint',
             # Door-open presses about 1 s apart, repeated by the car beacon itself.
             'door_open_repeat_board': 6, 'door_open_repeat_exit': 10, 'door_open_repeat_hold': 15,
             'door_open_rearm_s': 8., 'door_open_rearm_max': 2,
@@ -147,6 +149,9 @@ class FloorMissionManager(Node):
         self.door = ElevatorDoorState()
         self.pose = None
         self.scan = None
+        self.laser_pose = None     # laser (x, y, yaw) in base_frame, from TF once
+        self.tf = Buffer()
+        self.tf_listener = TransformListener(self.tf, self, spin_thread=False)
         self.mode = 'MANUAL'
         self.estop = HealthLease()
         self.estop_event = False
@@ -325,8 +330,12 @@ class FloorMissionManager(Node):
     def clearance(self, reverse):
         if self.scan is None:
             return math.inf
+        if self.laser_pose is None:
+            # Without the laser frame the scan direction is unknown: hold rather than drive blind.
+            self.get_logger().warning('laser transform unknown; maneuver held', throttle_duration_sec=5.)
+            return 0.
         return travel_clearance(self.scan.ranges, self.scan.angle_min, self.scan.angle_increment,
-                                reverse, HALF_LENGTH)
+                                reverse, HALF_LENGTH, laser_pose=self.laser_pose)
 
     def drive(self):
         """Advance the current maneuver; True once done."""
@@ -442,6 +451,12 @@ class FloorMissionManager(Node):
 
     def on_scan(self, message):
         self.scan = message
+        if self.laser_pose is None:
+            try:
+                t = self.tf.lookup_transform(self.p['base_frame'], message.header.frame_id, Time()).transform
+            except TransformException:
+                return
+            self.laser_pose = (t.translation.x, t.translation.y, yaw_of(t.rotation))
 
     def on_mode(self, message):
         self.mode = 'AUTO' if message.data == 'AUTO' else 'MANUAL'
@@ -456,7 +471,7 @@ class FloorMissionManager(Node):
         return not self.p['require_estop'] or self.estop.healthy()
 
     def estop_stopped(self):
-        """An E-stop, or no fresh status. ARMING after a closed drive gate only holds."""
+        """An E-stop, or no fresh status. ARMING only holds; every E-stop changes the epoch."""
         if not self.p['require_estop']:
             return False
         fresh = self.estop.status and 0 <= monotonic()-self.estop.received < self.estop.timeout
@@ -654,7 +669,7 @@ class FloorMissionManager(Node):
         if self.estop_stopped():
             self.estop_event = False
             self.get_logger().warning('E-stop: aborting floor mission')
-            self.abandon('FAILED', 'ESTOP', 'E-stop; approve restart and send a new mission')
+            self.abandon('FAILED', 'ESTOP', 'E-stop; send a new mission after release')
             return
         if self.now() - self.floor_state_time > self.p['floor_state_timeout']:
             # elevator_monitor publishes at least every second; without it nothing is safe.

@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from .common import (AGED_FIELDS, COMMANDS, FLOOR_LAYER, LAYERS, LEASED_FIELDS, MAX_COMMAND, MAX_FLOORS,
                      MAX_MESSAGE, PROTOCOL_VERSION, REQUEST_ID, dumps, floor_layer, floor_map_version,
-                     identifier, layer_floor, loads, positive, read_token)
+                     identifier, layer_floor, loads, positive, read_token, CAMERA_MAX_AGE, JPEG_MAGIC, MAX_CAMERA)
 
 DISPLAY_FIELDS = ('scan', 'wheel', 'imu', 'ekf', 'joints', 'command', 'diagnostics', 'power',
                   'vehicle', 'pose', 'localization', 'time', 'battery')
@@ -61,9 +61,8 @@ def age_lease(item, extra_age):
     timeout = item.get('timeout')
     if timeout is not None and item['age'] >= timeout:
         item['fresh'] = False
-        for key in ('approval_required', 'healthy'):
-            if key in item:
-                item[key] = False
+        if 'healthy' in item:
+            item['healthy'] = False
 
 
 class ApiError(Exception):
@@ -99,6 +98,7 @@ class Robot:
     layers: dict = field(default_factory=dict)
     revisions: dict = field(default_factory=dict)
     commands: OrderedDict = field(default_factory=OrderedDict)
+    camera: dict | None = None   # jpeg, received (monotonic), age at capture
 
 
 class Registry:
@@ -205,6 +205,7 @@ class Registry:
         if not isinstance(updates, dict) or not isinstance(results, list) or len(results) > 256:
             raise ApiError(400, 'Invalid exchange contents')
         floors = self._validate_floors(message.get('floors')) if state is not None else None
+        camera = self._validate_camera(message.get('camera'), state)
         decoded = {}
         for name, image in updates.items():
             try:
@@ -245,6 +246,7 @@ class Registry:
                         self._finish(command, 504, dict(error='AMR 클라이언트가 변경되었습니다. 현재 상태를 확인해 주세요.'))
                 robot.session_id, robot.sequence = session_id, 0
                 robot.layers.clear()
+                robot.camera = None
             if sequence <= robot.sequence:
                 raise ApiError(409, 'Exchange sequence has already been used')
             robot.sequence, robot.last_exchange = sequence, now
@@ -252,6 +254,8 @@ class Registry:
             robot.floors = floors
             robot.captured = now - age if state is not None else None
             robot.local_error = 'Local web API unavailable' if state is None else None
+            if camera is not None:
+                robot.camera = dict(jpeg=camera, received=now, age=age + state['camera']['age'])
             for name, image in decoded.items():
                 old = robot.layers.get(name)
                 if (old is None or old['source_version'] != image['source_version'] or
@@ -318,6 +322,33 @@ class Registry:
                                 if name in robot.layers and robot.layers[name]['source_version'] == info['version']}
             result['remote'] = dict(robot_id=robot_id, age=extra_age, timeout=self.stale_after)
             return result
+
+    @staticmethod
+    def _validate_camera(camera, state):
+        """The decoded JPEG of a camera envelope entry, or None when absent."""
+        if camera is None:
+            return None
+        if (state is None or not isinstance(camera, dict) or not isinstance(camera.get('jpeg'), str)
+                or not isinstance(state.get('camera'), dict)):
+            raise ApiError(400, 'Invalid camera update')
+        if len(camera['jpeg']) > MAX_CAMERA * 4 // 3 + 4:
+            raise ApiError(400, 'Oversized camera snapshot')
+        try:
+            jpeg = base64.b64decode(camera['jpeg'], validate=True)
+        except (ValueError, TypeError):
+            raise ApiError(400, 'Invalid camera encoding') from None
+        if len(jpeg) > MAX_CAMERA or not jpeg.startswith(JPEG_MAGIC):
+            raise ApiError(400, 'Invalid or oversized camera snapshot')
+        return jpeg
+
+    def camera(self, robot_id):
+        """The latest relayed JPEG while it is fresh end to end."""
+        with self.lock:
+            self.snapshot(robot_id)  # Freshness check only.
+            frame = self.robots[robot_id].camera
+            if frame is None or time.monotonic() - frame['received'] + frame['age'] > CAMERA_MAX_AGE:
+                raise ApiError(404, '카메라 영상이 없습니다.')
+            return frame['jpeg']
 
     def _current_layer(self, robot, name):
         """The cached image for a layer whose version the AMR still reports, else None."""
@@ -548,6 +579,8 @@ def create_server(registry, assets, token, host='127.0.0.1', port=8081, default_
                         raise ApiError(404, 'Unknown layer')
                     png, version = registry.layer(robot_id, name)
                     self.respond(200, png, 'image/png', {'X-Map-Version': version})
+                elif path == '/api/camera.jpg':
+                    self.respond(200, registry.camera(robot_id), 'image/jpeg')
                 elif path in ('/fleet', '/fleet.js', '/fleet.css'):
                     name = 'fleet.html' if path == '/fleet' else path[1:]
                     mime = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8',
@@ -563,7 +596,7 @@ def create_server(registry, assets, token, host='127.0.0.1', port=8081, default_
                             '<a class="brand" href="/fleet">').replace('href="/" aria-label="AMR 홈"',
                             'href="/fleet" aria-label="AMR 홈"').replace('목적지 주행 <span>',
                             f'{robot_id} · 목적지 주행 <span>').encode('utf-8')
-                    elif name == 'app.js':
+                    elif name in ('app.js', 'transit.js'):
                         content = content.replace(b'/api/', f'/robots/{robot_id}/api/'.encode('ascii'))
                     mime = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8',
                             'css': 'text/css; charset=utf-8', 'svg': 'image/svg+xml'}[name.rsplit('.', 1)[1]]

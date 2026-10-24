@@ -11,7 +11,7 @@ cmd_vel_to_can:
     max_linear_speed: 1.00  # m/s
     max_angular_speed: 0.80 # rad/s
     shutdown_stop_count: 5
-    # STM32 E-stop status 0x202 (docs/ESTOP_CAN_PROTOCOL.md). After any E-stop no
-    # 0x201 is sent until /estop/approve_resume. false only for firmware without 0x202.
+    # STM32 E-stop status 0x202 (docs/ESTOP_CAN_PROTOCOL.md). No 0x201 is sent while
+    # stopped; after release the bridge re-arms by itself. false only for firmware without 0x202.
     require_estop_status: true
     status_timeout: 0.50    # seconds without a valid 0x202 -> treated as an E-stop

@@ -92,14 +92,20 @@ class LineManeuver:
         return math.copysign(rate, error)
 
 
-def travel_clearance(ranges, angle_min, angle_increment, reverse, half_length=.32, half_width=.3):
-    """Free distance ahead of the bumper along the travel direction from a scan in the base frame."""
+def travel_clearance(ranges, angle_min, angle_increment, reverse, half_length=.32, half_width=.3,
+                     laser_pose=(0., 0., 0.)):
+    """Free distance ahead of the bumper along the travel direction.
+
+    The scan is in the laser frame; ``laser_pose`` is the laser's (x, y, yaw) in
+    the base frame (the real S2 is mounted turned 180 deg, yaw = pi).
+    """
+    lx, ly, lyaw = laser_pose
     best = math.inf
     for index, value in enumerate(ranges):
         if not math.isfinite(value) or value <= 0.:
             continue
-        angle = angle_min + index * angle_increment
-        x, y = value * math.cos(angle), value * math.sin(angle)
+        angle = lyaw + angle_min + index * angle_increment
+        x, y = lx + value * math.cos(angle), ly + value * math.sin(angle)
         if reverse:
             x = -x
         if x > 0 and abs(y) <= half_width:

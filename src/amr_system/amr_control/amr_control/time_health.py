@@ -1,6 +1,7 @@
 """Robot-side time validity gate. No motor IO; consumers inhibit AUTO on loss."""
 import json
 import math
+import struct
 import time
 import uuid
 
@@ -23,7 +24,7 @@ def spin_executor():
         from rclpy.executors import SingleThreadedExecutor
         return SingleThreadedExecutor()
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
-from sensor_msgs.msg import Imu, LaserScan
+from sensor_msgs.msg import Imu, LaserScan, PointCloud2
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
@@ -38,8 +39,16 @@ class TimeHealth(Node):
         self.future = self.declare_parameter('future_tolerance', .1).value
         self.recovery = self.declare_parameter('recovery_duration', 1.).value
         self.clock_monitor = ClockMonitor(self.declare_parameter('clock_jump_limit', .5).value)
-        if any(not math.isfinite(v) or v <= 0 for v in (self.max_age, self.future, self.recovery)):
+        # Optional depth camera watch (bringup start_camera): a 10 Hz cloud plus driver
+        # latency needs a longer allowance than the 0.75 s LiDAR/odometry default.
+        self.watch_depth = bool(self.declare_parameter('watch_depth', False).value)
+        self.depth_topic = self.declare_parameter('depth_topic', '/camera/depth/points').value
+        self.depth_max_age = self.declare_parameter('depth_max_age', 1.).value
+        if any(not math.isfinite(v) or v <= 0 for v in (self.max_age, self.future, self.recovery,
+                                                         self.depth_max_age)):
             raise ValueError('Time health thresholds must be positive and finite')
+        self.max_ages = {'depth': self.depth_max_age}
+        self.watched = ('scan', 'wheel', 'imu', 'odom', 'odom_tf') + (('depth',) if self.watch_depth else ())
         self.session, self.sequence, self.epoch = str(uuid.uuid4()), 0, 0
         self.samples = {}
         self.speed = None
@@ -51,6 +60,11 @@ class TimeHealth(Node):
         for kind, typ, topic in [('scan', LaserScan, '/scan'), ('wheel', Odometry, '/wheel/odometry'),
                                  ('imu', Imu, '/imu/data_raw')]:
             self.create_subscription(typ, topic, lambda m, k=kind: self.observe(k, m), qos_profile_sensor_data)
+        if self.watch_depth:
+            # Raw bytes: deserializing a ~1 MB PointCloud2 in Python at 10 Hz would
+            # cost the CPU this node exists to protect. Only the header stamp is read.
+            self.create_subscription(PointCloud2, self.depth_topic, self.on_depth_raw,
+                                     qos_profile_sensor_data, raw=True)
         self.create_subscription(Odometry, '/odometry/filtered', self.on_odom, qos_profile_sensor_data)
         self.create_subscription(TFMessage, '/tf', self.on_tf, 100)
         self.create_service(Trigger, '/system/reset_time_fault', self.reset_fault)
@@ -60,14 +74,32 @@ class TimeHealth(Node):
         return self.get_clock().now().nanoseconds/1e9
 
     def observe(self, kind, message):
-        stamp = message.header.stamp.sec + message.header.stamp.nanosec/1e9
-        if stamp <= 0 or not -self.future <= self.now()-stamp <= self.max_age:
+        return self.observe_stamp(kind, message.header.stamp.sec + message.header.stamp.nanosec/1e9)
+
+    def observe_stamp(self, kind, stamp):
+        if stamp <= 0 or not -self.future <= self.now()-stamp <= self.max_ages.get(kind, self.max_age):
             return
         old = self.samples.get(kind)
         if old and stamp <= old[0]:
             return  # Delayed packets cannot refresh freshness or reset the clock.
         self.samples[kind] = (stamp, time.monotonic())
         return True
+
+    @staticmethod
+    def header_stamp(data):
+        """(sec, nanosec) of a serialized message whose first field is a std_msgs/Header."""
+        if len(data) < 12:
+            raise ValueError('serialized message too short for a header')
+        little = data[1] & 1  # CDR encapsulation: 4-byte header, bit 0 = little endian
+        sec, nanosec = struct.unpack_from('<iI' if little else '>iI', data, 4)
+        return sec, nanosec
+
+    def on_depth_raw(self, data):
+        try:
+            sec, nanosec = self.header_stamp(bytes(data))
+        except (ValueError, struct.error):
+            return
+        self.observe_stamp('depth', sec + nanosec/1e9)
 
     def on_odom(self, message):
         if self.observe('odom', message):
@@ -79,11 +111,12 @@ class TimeHealth(Node):
                 self.observe('odom_tf', transform)
 
     def data_error(self, ros, steady):
-        for name in ('scan', 'wheel', 'imu', 'odom', 'odom_tf'):
+        for name in self.watched:
+            max_age = self.max_ages.get(name, self.max_age)
             stamp, received = self.samples.get(name, (0., -math.inf))
-            if stamp <= 0 or steady-received > self.max_age:
+            if stamp <= 0 or steady-received > max_age:
                 return f'{name}: missing or stale'
-            if not -self.future <= ros-stamp <= self.max_age:
+            if not -self.future <= ros-stamp <= max_age:
                 return f'{name}: timestamp outside allowed range'
         return ''
 

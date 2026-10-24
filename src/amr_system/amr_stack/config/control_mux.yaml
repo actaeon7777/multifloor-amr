@@ -11,11 +11,6 @@ control_mux:
     joy_timeout: 0.50       # seconds; Joy loss still requires releasing LB again
     command_timeout: 0.50   # seconds; fresh commands resume while Joy/LB remain valid
     release_debounce: 0.10  # seconds to confirm LB release; 0.0 disables debounce
-    # E-stop restart approval at the robot: with LB up and sticks centred, hold
-    # this button approve_hold seconds while the bridge is DISARMED. 11 = Menu (≡)
-    # in the original /joy indices; check with `ros2 topic echo /joy`. -1 disables.
-    approve_button: 11
-    approve_hold: 2.0       # seconds
     publish_rate: 20.0      # periodic refresh Hz; new commands also publish immediately
     max_linear_speed: 1.00  # m/s
     max_angular_speed: 0.80 # rad/s

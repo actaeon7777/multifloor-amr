@@ -23,7 +23,7 @@ FLOOR_MISSION_ACTIVE = {'NAV_TO_HALL', 'CALL_ELEVATOR', 'WAIT_DOOR_OPEN', 'BOARD
                         'IN_CAR_ALIGN', 'SELECT_FLOOR', 'RIDING', 'SWITCH_MAP', 'ALIGHTING',
                         'RETURN_TO_CAR', 'RELOCALIZE', 'NAV_TO_GOAL'}
 ACTIVE_GOALS = {'SENDING', 'ACCEPTED', 'CANCELING'}
-ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'DISARMED', 'ARMING', 'READY', 'BYPASS'}
+ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'ARMING', 'READY', 'BYPASS'}
 ESTOP_STM32_KEYS = ('raw', 'debounced', 'latched', 'inhibit', 'odrv_idle', 'bus_off', 'odrv_hb_ok',
                     'drive_enabled', 'stopped', 'trip_count', 'release_count', 'reset_rejected', 'sequence')
 # /elevator/rf_status is published at 1 Hz (elevator_can_link); allow two misses.
@@ -57,6 +57,41 @@ def _typed(source, keys):
         if isinstance(value, kind) and (not isinstance(value, float) or math.isfinite(value)):
             result[key] = value[:40] if isinstance(value, str) else value
     return result
+
+
+CAMERA_MAX_AGE = 3.  # seconds; older frames are not served or relayed
+
+
+def jpeg_size(data):
+    """(width, height) from the JPEG SOF marker; raises ValueError for anything else.
+
+    A marker walk over a few header segments: microseconds, no decoding.
+    """
+    data = bytes(data)
+    if len(data) < 4 or data[:3] != b'\xff\xd8\xff':
+        raise ValueError('not a JPEG')
+    index = 2
+    while index + 9 <= len(data):
+        if data[index] != 0xFF:
+            raise ValueError('corrupt JPEG header')
+        marker = data[index + 1]
+        if marker == 0xFF:  # fill byte
+            index += 1
+            continue
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        length = int.from_bytes(data[index + 2:index + 4], 'big')
+        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            height = int.from_bytes(data[index + 5:index + 7], 'big')
+            width = int.from_bytes(data[index + 7:index + 9], 'big')
+            if width <= 0 or height <= 0:
+                raise ValueError('corrupt JPEG size')
+            return width, height
+        if marker == 0xDA or length < 2:
+            break
+        index += 2 + length
+    raise ValueError('JPEG size not found')
 
 
 class ApiError(Exception):
@@ -101,11 +136,40 @@ class SharedState:
         self.building = None
         self.simulation = False
         self.floor_grids = {}
+        # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
+        # Encoded by the camera driver; this process never decodes or re-encodes images.
+        self.camera = None
         self.state = dict(preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
                           action_ready=False, robot=None, amcl=None, scan=None,
                           global_path=None, local_path=None, footprint=None,
                           goal=None, notice=None, velocity=None, tf_error=None, pending_request=None,
                           localization=None, localization_reset_pending=False)
+
+    def update_camera(self, data, fmt=''):
+        """Store one camera JPEG; other encodings and truncated frames are dropped."""
+        try:
+            size = jpeg_size(data)
+        except ValueError:
+            return False
+        with self.lock:
+            self.camera = (bytes(data), time.monotonic(), size[0], size[1])
+        return True
+
+    def camera_frame(self, max_age=CAMERA_MAX_AGE):
+        """(jpeg, age) of a frame newer than max_age, else None."""
+        with self.lock:
+            frame = self.camera
+        if frame is None:
+            return None
+        age = time.monotonic() - frame[1]
+        return None if age > max_age else (frame[0], age)
+
+    def camera_snapshot(self, now):
+        with self.lock:
+            frame = self.camera
+        if frame is None:
+            return None
+        return dict(age=max(0., now - frame[1]), width=frame[2], height=frame[3], bytes=len(frame[0]))
 
     def update_localization(self, text):
         """Only the supervisor can grant readiness; malformed input fails closed."""
@@ -414,11 +478,9 @@ class SharedState:
         if state == 'ESTOP':
             if status.get('reason') in ('status_timeout', 'invalid_status'):
                 return 'STM32 E-stop 상태 수신이 끊겨 정지했습니다. CAN 연결을 확인하세요.'
-            return 'E-stop이 눌려 있습니다. 버튼을 원위치로 돌린 뒤 재개를 승인하세요.'
-        if state == 'DISARMED':
-            return 'E-stop이 해제되었습니다. 주변을 확인하고 재개를 승인한 뒤 목적지를 지정하세요.'
+            return 'E-stop이 눌려 있습니다. 버튼을 원위치로 돌리세요.'
         if state == 'ARMING':
-            return '재개 승인 후 주행 준비 중입니다. 잠시 후 다시 시도하세요.'
+            return 'E-stop 해제 후 주행 준비 중입니다. 잠시 후 다시 시도하세요.'
         if state == 'UNKNOWN':
             return 'STM32 E-stop 상태를 기다리고 있습니다.'
         return 'E-stop 상태를 받지 못했습니다. CAN 브릿지 연결을 확인하세요.'
@@ -568,16 +630,6 @@ class SharedState:
                 goal = self.state.get('goal')
                 if not goal or goal['status'] != 'ACCEPTED':
                     return '이 웹에서 실행한 취소 가능한 목표가 없습니다.'
-            elif kind == 'estop_approve':
-                status = self.estop_live()
-                if not status:
-                    return 'E-stop 상태를 받지 못해 재개를 승인할 수 없습니다.'
-                if status.get('approval_required') is not True:
-                    return {'ESTOP': 'E-stop이 아직 눌려 있거나 해제가 확정되지 않았습니다.',
-                            'ARMING': '이미 재개 승인되어 주행 준비 중입니다.',
-                            'READY': '이미 주행 가능 상태입니다.',
-                            'BYPASS': 'E-stop 확인이 꺼져 있어 승인이 필요 없습니다.'}.get(
-                        status.get('state'), '지금은 재개를 승인할 수 없습니다.')
             return None
 
     def snapshot(self):
@@ -608,6 +660,7 @@ class SharedState:
         result['estop'] = self.estop_snapshot(now)
         result['elevator'] = self.elevator_snapshot(now)
         result['transit'] = self.transit_snapshot(now)
+        result['camera'] = self.camera_snapshot(now)
         for name in ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization'):
             item = result.get(name)
             if item:
@@ -630,7 +683,7 @@ class SharedState:
             required=self.require_estop, received=bool(status), fresh=live,
             age=max(0., now-received) if math.isfinite(received) else None, timeout=self.estop.timeout,
             state=status.get('state') if live else None,
-            healthy=self.estop.healthy(now), approval_required=live and status.get('approval_required') is True,
+            healthy=self.estop.healthy(now),
             detail=str(status.get('detail', ''))[:300], reason=str(status.get('reason', ''))[:80],
             rx_error=str(status.get('rx_error', ''))[:300], reboot_suspected=status.get('reboot_suspected') is True,
             status_age=status.get('status_age'),
@@ -642,7 +695,7 @@ class SharedState:
         request_id = payload.get('request_id', '')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ApiError(400, '요청 ID가 필요합니다.')
-        if kind not in ('goal', 'initialpose', 'cancel', 'relocalize', 'estop_approve'):
+        if kind not in ('goal', 'initialpose', 'cancel', 'relocalize'):
             raise ApiError(400, '지원하지 않는 명령입니다.')
         pose = validate_pose(payload) if kind in ('goal', 'initialpose') else None
         floor_name, room = payload.get('floor'), payload.get('room', '')
@@ -787,6 +840,12 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                     self.respond(404, dict(error='아직 레이어 데이터가 없습니다.'))
                 else:
                     self.respond(200, png, 'image/png', {'X-Map-Version': version})
+            elif path == '/api/camera.jpg':
+                frame = shared.camera_frame()
+                if frame is None:
+                    self.respond(404, dict(error='카메라 영상이 없습니다.'))
+                else:
+                    self.respond(200, frame[0], 'image/jpeg', {'X-Camera-Age': f'{frame[1]:.2f}'})
             elif path in ('/', '/index.html', '/app.js', '/geometry.js', '/dashboard.js', '/transit.js',
                           '/battery-profile.js', '/style.css', '/favicon.svg'):
                 name = 'index.html' if path == '/' else path[1:]
@@ -812,8 +871,7 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 if not isinstance(payload, dict):
                     raise ValueError('JSON object required')
                 kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
-                         '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
-                         '/api/estop_approve': 'estop_approve'}
+                         '/api/cancel': 'cancel', '/api/relocalize': 'relocalize'}
                 if self.path not in kinds:
                     raise ApiError(404, 'Not found')
                 result = shared.request(kinds[self.path], payload)

@@ -52,6 +52,14 @@
   <xacro:property name="camera_y" value="0.025"/>
   <xacro:property name="camera_z" value="0.061017"/>
   <xacro:property name="camera_pitch" value="${-12.0 * pi / 180.0}"/>
+  <!--
+    Depth optical axis as the ROS point cloud sees it: floor-plane fits on the
+    real vehicle (2026-10-25, three corridor spots, 0.34-1.82 m ahead) give
+    11.2-11.4 deg up, not the CAD 12 deg. With 12 deg the floor rose ~1.3 cm/m
+    and 2-3 m floor returns crossed the 5 cm marking height. The housing mesh
+    keeps the CAD pitch; only camera_joint uses the measured value.
+  -->
+  <xacro:property name="camera_optical_pitch" value="${-11.25 * pi / 180.0}"/>
 
   <!--
     18.0 kg total mass (set 2026-10-20 for v119; v28 measured 15.0 kg):
@@ -373,7 +381,7 @@
 
   <!--
     Orbbec Gemini 2 mount frame (+X along the optical axis, +Z up, pitched
-    12 deg up). OrbbecSDK_ROS2 publishes camera_link -> depth/color/IR and
+    11.25 deg up as measured; CAD 12 deg). OrbbecSDK_ROS2 publishes camera_link -> depth/color/IR and
     optical frames itself from the factory calibration, so none of those
     frames are defined here. Depth FOV 91 x 66 deg, 50 mm baseline.
   -->
@@ -381,7 +389,7 @@
   <joint name="camera_joint" type="fixed">
     <parent link="base_link"/>
     <child link="camera_link"/>
-    <origin xyz="${camera_x} ${camera_y} ${camera_z}" rpy="0 ${camera_pitch} 0"/>
+    <origin xyz="${camera_x} ${camera_y} ${camera_z}" rpy="0 ${camera_optical_pitch} 0"/>
   </joint>
 
 </robot>

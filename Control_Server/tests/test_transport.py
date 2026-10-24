@@ -103,7 +103,7 @@ def test_invalid_robot_coordinates_and_methods(harness):
 def test_unknown_state_fields_ages_and_missing_images(harness):
     harness.shared.state['extension'] = {'valid': [3, 'keep me']}
     agent = harness.agent
-    state, _layers, _captured = agent.collect()
+    state, _layers, _captured, _camera = agent.collect()
     message = envelope(harness)
     message.update(state=state, state_age=.1, local_error=None)
     response = raw_post(harness, json.dumps(message).encode())
@@ -119,7 +119,7 @@ def test_unknown_state_fields_ages_and_missing_images(harness):
 
 
 def test_invalid_layer_version_encoding_and_size(harness):
-    state, layers, _ = harness.agent.collect()
+    state, layers, _, _ = harness.agent.collect()
     for change in ('version', 'encoding', 'size'):
         message = envelope(harness)
         message.update(state=state, layers=deepcopy(layers))
@@ -159,7 +159,7 @@ def test_expiry_and_lost_exchange_response_are_not_replayed(harness):
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(harness.request, '/api/goal', payload('lost_reply_goal_001'))
         wait_for(lambda: 'lost_reply_goal_001' in harness.registry.robots['amr-01'].commands)
-        state, layers, _ = harness.agent.collect()
+        state, layers, _, _ = harness.agent.collect()
         message = envelope(harness)
         message.update(state=state, layers=layers)
         response = raw_post(harness, json.dumps(message).encode())

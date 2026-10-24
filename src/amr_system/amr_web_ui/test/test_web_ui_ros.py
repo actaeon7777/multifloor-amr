@@ -343,36 +343,26 @@ def test_vehicle_display_rejects_expired_reordered_and_retired_messages():
 
 
 class FakeEstopBridge(Node):
-    """Stands in for cmd_vel_to_can: /estop/status plus /estop/approve_resume."""
+    """Stands in for cmd_vel_to_can's /estop/status."""
     def __init__(self):
         super().__init__('web_ui_estop_scene')
-        self.state = 'DISARMED'
+        self.state = 'ESTOP'
         self.sequence = 0
-        self.approvals = 0
         self.publisher = self.create_publisher(
             String, '/estop/status', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_service(Trigger, '/estop/approve_resume', self.approve)
         self.timer = self.create_timer(.05, self.publish)
-
-    def approve(self, _request, response):
-        self.approvals += 1
-        response.success = self.state == 'DISARMED'
-        response.message = '재개 승인됨. 시험 응답' if response.success else '승인 거절 시험 응답'
-        if response.success:
-            self.state = 'ARMING'
-        return response
 
     def publish(self):
         self.sequence += 1
         self.publisher.publish(String(data=json.dumps(dict(
             session='fake_estop', sequence=self.sequence, stamp=time.time(), epoch=1, state=self.state,
-            healthy=self.state == 'READY', latched=self.state in ('UNKNOWN', 'ESTOP', 'DISARMED'),
-            approval_required=self.state == 'DISARMED', detail='시험 E-stop', reason='awaiting_approval',
-            rx_error='', stm32=dict(raw=False, stopped=False, drive_enabled=self.state == 'READY',
-                                    trip_count=1, release_count=1)))))
+            healthy=self.state == 'READY', latched=self.state in ('UNKNOWN', 'ESTOP'),
+            detail='시험 E-stop', reason='stm32_stopped', rx_error='',
+            stm32=dict(raw=self.state == 'ESTOP', stopped=self.state == 'ESTOP',
+                       drive_enabled=self.state == 'READY', trip_count=1, release_count=1)))))
 
 
-def test_http_estop_approval_calls_bridge_service_once():
+def test_estop_status_follows_the_bridge_without_approval():
     assert os.environ.get('ROS_DOMAIN_ID') == '193'
     rclpy.init()
     from rclpy.parameter import Parameter
@@ -393,25 +383,14 @@ def test_http_estop_approval_calls_bridge_service_once():
             assert time.monotonic() < end, shared.snapshot()['estop']
             executor.spin_once(timeout_sec=.01)
 
-    def post(request_id):
-        req = Request(root+'/api/estop_approve', data=json.dumps(dict(request_id=request_id)).encode(),
-                      headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
-        return json.load(urlopen(req, timeout=2))
-
     try:
         assert shared.require_estop
-        until(lambda: shared.snapshot()['estop']['approval_required'] and bridge.estop_client.service_is_ready())
+        until(lambda: shared.snapshot()['estop']['state'] == 'ESTOP')
         state = json.load(urlopen(root+'/api/state', timeout=2))['estop']
-        assert state['state'] == 'DISARMED' and '재개를 승인' in state['error']
-        assert post('ros_estop_approve_1')['status'] == 'QUEUED'
-        until(lambda: (shared.state['notice'] or {}).get('request_id') == 'ros_estop_approve_1')
-        assert shared.state['notice']['status'] == 'APPROVED'
-        assert '재개 승인됨' in shared.state['notice']['detail']
+        assert 'E-stop이 눌려' in state['error'] and 'approval_required' not in state
+        fake.state = 'ARMING'  # Released: the bridge re-arms by itself.
         until(lambda: shared.snapshot()['estop']['state'] == 'ARMING')
-        with pytest.raises(HTTPError) as refused:
-            post('ros_estop_approve_2')
-        assert refused.value.code == 409
-        assert fake.approvals == 1
+        assert '주행 준비' in shared.estop_error()
         fake.state = 'READY'
         until(lambda: shared.snapshot()['estop']['healthy'])
         assert shared.estop_error() is None

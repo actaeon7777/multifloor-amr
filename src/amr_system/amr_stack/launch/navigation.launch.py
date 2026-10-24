@@ -90,6 +90,9 @@ def launch_nodes(context):
         Node(package='amr_tim_localization', executable='tim_global_localizer',
              name='tim_global_localizer',
              parameters=[LaunchConfiguration('tim_config'), {'use_sim_time': use_sim_time}],
+             # Batch matching saturates its threads for ~20 s; yield to AMCL, the EKF
+             # and the controller so their heartbeats and 20 Hz loops keep running.
+             prefix='nice -n 10',
              output='screen'),
         Node(package='amr_stack', executable='navigation_startup', name='navigation_startup',
              parameters=[LaunchConfiguration('startup_config'), {'use_sim_time': use_sim_time}],
@@ -100,6 +103,7 @@ def launch_nodes(context):
                  # initial pose exists. The supervisor requests STARTUP later.
                  'use_sim_time': use_sim_time, 'autostart': False,
                  'attempt_respawn_reconnection': False,
+                 'bond_timeout': 12.0,  # same reason as lifecycle_manager_localization
                  'node_names': ['planner_server', 'controller_server', 'behavior_server', 'bt_navigator'],
              }], output='screen'),
     ]

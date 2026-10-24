@@ -92,10 +92,10 @@ async function run() {
   assert(requests.every(url => url === '/api/state' || url === '/api/floors' || url.startsWith('/api/layers/')),
     'Status rendering must never send or resume a goal');
 
-  // E-stop: a released STM32 still needs approval; the banner never approves by itself.
+  // E-stop: the banner reports the bridge state; there is no approval step.
   state.localization = {...state.localization, age:0};
   const estop = (values) => ({required:true, received:true, fresh:true, age:0, timeout:.6, healthy:false,
-    approval_required:false, reason:'', detail:'', error:'E-stop 차단', stm32:{}, ...values});
+    reason:'', detail:'', error:'E-stop 차단', stm32:{}, ...values});
   state = {...state, estop:estop({state:'READY', healthy:true})};
   await nextPoll();
   assert(element('estop-banner').hidden, 'READY must hide the E-stop banner');
@@ -104,49 +104,23 @@ async function run() {
   await nextPoll();
   assert(!element('estop-banner').hidden && element('estop-title').textContent === 'E-stop 눌림', 'ESTOP banner');
   assert(element('estop-banner').className.includes('danger'), 'ESTOP must be shown as danger');
-  assert(element('estop-approve').disabled, 'A pressed E-stop cannot be approved');
+  assert(!element('estop-detail').textContent.includes('승인'), 'ESTOP must not ask for approval');
   assert(element('send').disabled, 'ESTOP must close the goal gate');
-  state = {...state, estop:estop({state:'DISARMED', approval_required:true})};
-  await nextPoll();
-  assert(element('estop-title').textContent.includes('재개 승인 필요'), 'DISARMED must ask for approval');
-  assert(!element('estop-approve').disabled && !element('estop-approve').hidden, 'DISARMED enables approval');
-  assert(element('send').disabled, 'DISARMED must keep goals blocked until approval');
-  state = {...state, estop:estop({state:'DISARMED', approval_required:true, age:1})};
+  state = {...state, estop:estop({state:'ESTOP', age:1})};
   await nextPoll();
   assert(element('estop-title').textContent === 'E-stop 상태 수신 없음', 'A stale lease is shown as missing');
-  assert(element('estop-approve').disabled, 'A stale DISARMED view must not allow approval');
   state = {...state, estop:estop({state:'ARMING'})};
   await nextPoll();
   assert(element('estop-title').textContent === '주행 준비 중', 'ARMING banner');
-  assert(element('estop-approve').hidden, 'ARMING hides the approve button');
+  assert(element('send').disabled, 'ARMING must keep goals blocked until READY');
   state = {...state, estop:estop({state:'BYPASS', healthy:true, required:false})};
   await nextPoll();
   assert(element('estop-banner').hidden, 'Not required must hide the banner');
   assert(requests.every(url => url === '/api/state' || url === '/api/floors' || url.startsWith('/api/layers/')),
-    'E-stop rendering must never approve or send commands');
-
-  // A remote (relay) view shows the state but never offers approval.
-  state = {...state, estop:estop({state:'DISARMED', approval_required:true}), remote:{robot_id:'amr', age:0, timeout:2}};
-  await nextPoll();
-  assert(element('estop-approve').hidden, 'Remote views must hide the approve button');
-  assert(element('estop-detail').textContent.includes('현장'), 'Remote views must point to the robot');
-  element('estop-approve').handlers.click();
-  assert(!requests.includes('/api/estop_approve'), 'A remote view must never request approval');
-
-  // Locally, approval needs a second press within the confirmation window.
-  delete state.remote;
-  state = {...state};
-  await nextPoll();
-  assert(!element('estop-approve').hidden && element('estop-approve').textContent === '재개 승인', 'Local approve button');
-  element('estop-approve').handlers.click();
-  assert(!requests.includes('/api/estop_approve'), 'The first press only arms the approval');
-  assert(element('estop-approve').textContent === '다시 눌러 승인', 'The armed button asks for confirmation');
-  element('estop-approve').handlers.click();
-  await Promise.resolve();
-  assert(requests.includes('/api/estop_approve'), 'The confirming press requests approval');
+    'E-stop rendering must never send commands');
 }
 
 run().then(
-  () => print('READY warning, recovery, LB takeover, VERIFYING, stale-status, E-stop rendering/gates and approval: OK'),
+  () => print('READY warning, recovery, LB takeover, VERIFYING, stale-status, E-stop rendering/gates: OK'),
   error => { printerr(error.stack || error); System.exit(1); },
 );

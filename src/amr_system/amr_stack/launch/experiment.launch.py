@@ -74,6 +74,8 @@ def launch_mode(context):
             # Real elevator RF relay (CAN 0x210/0x310/0x311); off unless asked.
             'start_elevator_link': LaunchConfiguration('start_elevator_link'),
             'elevator_link_dry_run': LaunchConfiguration('elevator_link_dry_run'),
+            # Gemini 2 depth camera; the simulation has no camera model.
+            'start_camera': 'false' if sim else LaunchConfiguration('start_camera'),
         }),
         include('localization', {'map': map_path}),
         include('navigation', {
@@ -119,6 +121,9 @@ def generate_launch_description():
         DeclareLaunchArgument('elevator_link_dry_run', default_value='true', choices=['true', 'false'],
                               description='true: no CAN socket (0x210 preview only, no beacon RX); '
                                           'false: receive beacons and press real buttons.'),
+        DeclareLaunchArgument('start_camera', default_value='false', choices=['true', 'false'],
+                              description='mode:=real only: Gemini 2 depth -> global/local costmap VoxelLayers, '
+                                          'JPEG color -> web snapshot, depth watch in time_health.'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
         DeclareLaunchArgument('map', default_value=''),
         DeclareLaunchArgument('start_floor', default_value='',

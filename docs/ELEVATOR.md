@@ -116,6 +116,8 @@
 
 - `ALIGN`(목표 방향 회전) → `DRIVE`(직진 + 방향 보정 + 감속) → `TURN`(최종 방향) → `DONE`.
 - 최고 0.35 m/s, 회전 0.5 rad/s, 위치 허용 오차 0.05 m, 전방 여유 0.15 m 미만이면 정지. `reverse`는 방향을 유지한 채 후진(문이 닫힐 때 후퇴).
+- 진행 방향 여유는 `/scan`을 TF의 `base_footprint → laser`(실차 S2는 yaw π, 180° 돌려 장착)로 로봇 좌표계에 옮긴 뒤 계산한다.
+  이 변환을 받기 전에는 여유를 0으로 보고 기동을 보류한다(5초마다 경고). 2026-10-24까지는 변환 없이 계산해 앞·뒤 여유가 뒤바뀌어 있었다(실차 미검증 수정, `test_maneuver.py`).
 - AUTO일 때만 명령을 낸다. MANUAL로 바뀌면 즉시 0을 내고 단계는 유지한다.
 
 ### 4.4 층간 미션 (`mission_node.py`)
@@ -158,7 +160,7 @@ IDLE ─(같은 층)────────────────────
 - LB를 누르면(MANUAL) 기동 즉시 정지하고 미션을 `MANUAL_OVERRIDE`로 중단한다(재개 없음, MANUAL 중 새 층간 목표 거절).
   조이스틱 연결·끊김만으로는 미션이 중단되지 않는다.
   취소·중단 시 카 밖이면 위치 추정을 재개하고 카 안이면 정지 상태로 둔다.
-- 실차(`require_estop`)에서 E-stop이 나거나 `/estop/status`가 끊기면 미션을 `ESTOP`으로 중단한다. 재개 승인 뒤에도 이어 가지 않으며
+- 실차(`require_estop`)에서 E-stop이 나거나 `/estop/status`가 끊기면 미션을 `ESTOP`으로 중단한다. 해제 뒤에도 이어 가지 않으며
   새 미션은 E-stop 인터록이 READY일 때만 받는다. RF 중계는 E-stop과 독립이라 래치 중에도 버튼 명령이 전달된다.
 - BOARDING·BACKING_OUT·ALIGHTING·RETURN_TO_CAR에서 미션이 끝나면(E-stop·LB·취소·실패) 차체가 문턱에 걸려 있으면
   "열림" repeat 15(약 15초)를 한 번 보낸다. 그 뒤의 탈출은 운영자가 수동으로 한다.
@@ -287,7 +289,7 @@ Isaac 내장 rclpy는 사용자 정의 메시지를 쓸 수 없어 Isaac은 JSON
 
 | 변경 | 실차 영향 | 기본값 |
 |---|---|---|
-| `navigation.yaml`, `can_telemetry` | **변경 없음** | — |
+| `navigation.yaml`, `can_telemetry` | `can_telemetry` 변경 없음. `navigation.yaml`은 2026-10-25 깊이 카메라 `depth_layer`를 전역·지역 costmap에 반영. inflation·robot_radius·footprint는 유지, 카메라가 없으면 깊이 레이어는 비어 있음 | — |
 | `elevator_can_link` | 별도 소켓. 통합 시험 전까지 실행하지 않음 | `start_elevator_link:=false` |
 | `/localization/suspend`, 기동 임대 | 호출하지 않으면 기존과 동일 | 적용 |
 | `elevator_monitor`, `floor_mission_manager` | monitor는 센서를 읽고 `/floor/*`만 발행. mission은 접수된 층간 목표에서만 움직임 | 실차·sim building `true`, 그 외 sim `false` |

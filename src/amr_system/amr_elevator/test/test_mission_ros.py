@@ -9,19 +9,24 @@ import pytest
 if os.environ.get('AMR_RUN_ELEVATOR_MISSION_TESTS') != '1':
     pytest.skip('Set AMR_RUN_ELEVATOR_MISSION_TESTS=1 in domain 193', allow_module_level=True)
 
+import math
+
 from action_msgs.msg import GoalStatus
 from amr_elevator_interfaces.action import NavigateToFloorPose
 from amr_elevator_interfaces.msg import (
     ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorState,
 )
+from geometry_msgs.msg import TransformStamped
 from nav2_msgs.action import NavigateToPose
 import rclpy
 from rclpy.action import ActionClient, ActionServer
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.parameter import Parameter
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
+from tf2_ros import StaticTransformBroadcaster
 
 from amr_elevator.mission_node import FloorMissionManager
 from amr_stack.floor_config import load_floor_config
@@ -46,7 +51,8 @@ def ros():
         beacon=peer.create_publisher(ElevatorBeacon, 'elevator/beacon', 10),
         command_status=peer.create_publisher(ElevatorCommandStatus, 'elevator/command_status', 10),
         localization=peer.create_publisher(String, 'localization/status', LATCHED),
-        mode=peer.create_publisher(String, 'control_mux/mode', LATCHED))
+        mode=peer.create_publisher(String, 'control_mux/mode', LATCHED),
+        scan=peer.create_publisher(LaserScan, 'scan', qos_profile_sensor_data))
     navigation_goals, nav_outcomes = [], []
 
     def navigate(handle):
@@ -78,7 +84,13 @@ def ros():
 
     pubs.localization.publish(String(data=json.dumps({'state': 'READY', 'ready': True})))
     pubs.mode.publish(String(data='AUTO'))
-    yield SimpleNamespace(executor=executor, peer=peer, pubs=pubs, spin=spin, commands=commands,
+    def laser_tf(yaw):
+        t = TransformStamped()
+        t.header.frame_id, t.child_frame_id = 'base_footprint', 'laser'
+        t.transform.rotation.z, t.transform.rotation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+        StaticTransformBroadcaster(peer).sendTransform(t)
+
+    yield SimpleNamespace(executor=executor, peer=peer, pubs=pubs, laser_tf=laser_tf, spin=spin, commands=commands,
                           statuses=statuses, navigation_goals=navigation_goals, calls=calls,
                           nav_outcomes=nav_outcomes,
                           floor_state=floor_state)
@@ -202,7 +214,7 @@ def test_manual_takeover_aborts_boarding_and_blocks_new_missions(ros):
 def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
     node = manager(ros, require_estop=True)
     publisher = ros.peer.create_publisher(String, 'estop/status', LATCHED)
-    estop = {'state': 'DISARMED', 'epoch': 0, 'sequence': 0}
+    estop = {'state': 'ARMING', 'epoch': 0, 'sequence': 0}
 
     def publish():
         estop['sequence'] += 1
@@ -210,11 +222,11 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
         publisher.publish(String(data=json.dumps(dict(
             session='mission_estop_test', sequence=estop['sequence'], epoch=estop['epoch'],
             stamp=time.time(), state=state, healthy=state == 'READY',
-            latched=state in ('UNKNOWN', 'ESTOP', 'DISARMED')))))
+            latched=state in ('UNKNOWN', 'ESTOP')))))
     ros.peer.create_timer(.05, publish)
     ros.floor_state()
-    assert ros.spin(1., lambda: node.estop.status.get('state') == 'DISARMED')
-    assert not send(ros, '5F', '502').accepted  # Restart not approved yet.
+    assert ros.spin(1., lambda: node.estop.status.get('state') == 'ARMING')
+    assert not send(ros, '5F', '502').accepted  # Missions wait for READY.
     estop['state'] = 'READY'
     assert ros.spin(1., node.estop_ready)
     handle = send(ros, '5F', '502')
@@ -244,7 +256,7 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
                                     for c in ros.commands[sent:]))
     assert ros.calls['navigation/maneuver_lease'][-1] is False
     assert ros.statuses[-1]['phase'] == 'FAILED_SAFE'
-    estop['state'] = 'DISARMED'
+    estop['state'] = 'ARMING'  # Released: the bridge re-arms by itself.
     ros.spin(.3)
     assert not send(ros, '4F', '402').accepted
 
@@ -351,3 +363,22 @@ def test_slow_exit_rearms_the_door_open_repeats(ros):
     ros.spin(.3)
     assert len(ros.commands) == 1
     node.mission = None
+
+
+def test_clearance_uses_the_laser_frame_from_tf(ros):
+    node = manager(ros)
+    n = 360
+    scan = LaserScan(angle_min=-math.pi, angle_increment=2 * math.pi / n, range_min=.05, range_max=30.)
+    scan.header.frame_id = 'laser'
+    scan.ranges = [math.inf] * n
+    scan.ranges[0] = 1.0                 # laser bearing -pi: behind the laser, in front of the turned S2's robot
+    ros.pubs.scan.publish(scan)
+    ros.spin(.3)
+    assert node.scan is not None and node.laser_pose is None
+    assert node.clearance(False) == 0.   # frame unknown: hold rather than drive blind
+    ros.laser_tf(math.pi)
+    ros.pubs.scan.publish(scan)
+    assert ros.spin(2., lambda: node.laser_pose is not None)
+    assert abs(abs(node.laser_pose[2]) - math.pi) < 1e-6
+    assert abs(node.clearance(False) - .68) < 1e-6
+    assert node.clearance(True) == math.inf

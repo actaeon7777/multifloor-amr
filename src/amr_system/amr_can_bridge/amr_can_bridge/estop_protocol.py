@@ -1,9 +1,8 @@
 """STM32 E-stop status (0x202, version 1) and the Jetson restart interlock.
 
-The STM32 releases its own stop when the button returns. That release is not a
-permission to move: once an E-stop is seen, drive frames stay blocked until an
-operator approves, and only (0, 0) is sent until the STM32 reports its gate open.
-See docs/ESTOP_CAN_PROTOCOL.md.
+The STM32 releases its own stop when the button returns. The bridge then re-arms
+by itself: only (0, 0) is sent until the STM32 reports its gate open, and motion
+resumes only from commands issued after that. See docs/ESTOP_CAN_PROTOCOL.md.
 """
 
 import struct
@@ -14,7 +13,7 @@ ESTOP_STATUS_VERSION = 1
 FLAG_RAW, FLAG_DEBOUNCED, FLAG_LATCHED, FLAG_INHIBIT = 0x01, 0x02, 0x04, 0x08
 FLAG_ODRV_IDLE, FLAG_BUS_OFF, FLAG_ODRV_HB_OK, FLAG_DRIVE_ENABLED = 0x10, 0x20, 0x40, 0x80
 
-UNKNOWN, ESTOP, DISARMED, ARMING, READY = 'UNKNOWN', 'ESTOP', 'DISARMED', 'ARMING', 'READY'
+UNKNOWN, ESTOP, ARMING, READY = 'UNKNOWN', 'ESTOP', 'ARMING', 'READY'
 # What the bridge may write to 0x201 in each state.
 SEND_NOTHING, SEND_ZERO, SEND_COMMAND = 'nothing', 'zero', 'command'
 
@@ -65,7 +64,7 @@ def sequence_discontinuous(old, new):
 
 
 class EstopSupervisor:
-    """UNKNOWN -> DISARMED -approve-> ARMING -gate open-> READY; any E-stop -> ESTOP."""
+    """UNKNOWN/ESTOP -clear-> ARMING -gate open-> READY; any E-stop -> ESTOP."""
 
     def __init__(self, status_timeout=0.50, arming_warn=5.0):
         if not 0 < status_timeout < float('inf'):
@@ -115,7 +114,7 @@ class EstopSupervisor:
                 self.trip('trip_count_changed')
             elif sequence_discontinuous(previous['sequence'], status['sequence']):
                 # An IWDG reset can finish inside the status timeout with trip_count
-                # still 0; a rebooted STM32 must not resume without approval.
+                # still 0; a rebooted STM32 must re-arm before new commands.
                 self.trip('status_discontinuity')
         self.status = status
         self.received_at = now
@@ -123,9 +122,10 @@ class EstopSupervisor:
             if self.state != ESTOP or self.reason != 'stm32_stopped':
                 self.trip('stm32_stopped')
         elif self.state in (UNKNOWN, ESTOP):
-            self.state = DISARMED
-            self.reason = 'awaiting_approval'
-        elif self.state == ARMING:
+            self.state, self.reason = ARMING, 'released'
+            self.zero_sent_at = None
+            self.arming_since = now
+        if self.state == ARMING:
             if (status['drive_enabled'] and self.zero_sent_at is not None
                     and now > self.zero_sent_at):
                 self.state, self.reason = READY, 'drive_enabled'
@@ -134,18 +134,6 @@ class EstopSupervisor:
             self.state, self.reason = ARMING, 'drive_gate_closed'
             self.zero_sent_at = None
             self.arming_since = now
-
-    def approve(self, now):
-        """Return (accepted, reason). Approval only arms; motion needs new commands."""
-        self.check(now)
-        if self.state != DISARMED:
-            return False, f'state_{self.state.lower()}'
-        if not self.fresh(now) or self.status['stopped']:
-            return False, 'status_not_clear'
-        self.state, self.reason = ARMING, 'approved'
-        self.zero_sent_at = None
-        self.arming_since = now
-        return True, 'approved'
 
     def arming_slow(self, now):
         """ARMING for longer than arming_warn: the ODrives are probably not ready."""

@@ -259,27 +259,24 @@ def test_localization_age_includes_relay_delay(system):
     assert state['localization']['ready'] is False
 
 
-def test_estop_lease_ages_with_the_relay_and_approval_stays_at_the_robot(system):
+def test_estop_lease_ages_with_the_relay(system):
     shared = system['shared']
     shared.require_estop = True
     shared.update_estop(json.dumps(dict(
-        session='bridge', sequence=1, stamp=time.time(), epoch=0, state='DISARMED', healthy=False,
-        latched=True, approval_required=True, detail='', reason='', rx_error='', stm32={})))
+        session='bridge', sequence=1, stamp=time.time(), epoch=0, state='READY', healthy=True,
+        latched=False, detail='', reason='', rx_error='', stm32={})))
     system['agent'].exchange()
     registry = system['registry']
     estop = registry.snapshot('amr-01')['estop']
-    assert estop['fresh'] and estop['approval_required'] and estop['state'] == 'DISARMED'
+    assert estop['fresh'] and estop['healthy'] and estop['state'] == 'READY'
     (robot,) = registry.roster()
-    assert (robot['estop'], robot['estop_required'], robot['elevator_rf']) == ('DISARMED', True, None)
+    assert (robot['estop'], robot['estop_required'], robot['elevator_rf']) == ('READY', True, None)
     with registry.lock:
         # Transport still fresh, but the relayed E-stop lease has run out.
         registry.robots['amr-01'].state['estop']['age'] = .5
         registry.robots['amr-01'].captured -= .15
     estop = registry.snapshot('amr-01')['estop']
-    assert estop['age'] >= estop['timeout'] and not estop['fresh'] and not estop['approval_required']
-    status, _, _ = system['request']('/api/estop_approve', dict(request_id='remote_approve_01'))
-    assert status in (400, 404)
-    assert not [kind for kind, _ in system['calls'] if kind == 'estop_approve']
+    assert estop['age'] >= estop['timeout'] and not estop['fresh'] and not estop['healthy']
 
 
 def test_vehicle_source_lease_is_separate_from_relay_age(system):
@@ -580,3 +577,57 @@ def test_single_floor_robot_has_an_empty_floor_list(system):
     assert status == 200 and loads(body)['floors'] == [] and loads(body)['current_floor'] is None
     assert system['request']('/api/goal', dict(payload('no_floor_goal_01'), floor='3F'))[0] == 409
     assert not system['calls']
+
+
+def small_jpeg(color=(40, 50, 60)):
+    buffer = io.BytesIO()
+    Image.new('RGB', (16, 9), color).save(buffer, 'JPEG')
+    return buffer.getvalue()
+
+
+def test_camera_snapshot_is_relayed_validated_and_expires(system):
+    shared, registry, agent = system['shared'], system['registry'], system['agent']
+    jpeg = small_jpeg()
+    # No frame yet: the host answers 404 after the usual freshness check.
+    agent.exchange()
+    assert system['request']('/robots/amr-01/api/camera.jpg')[0] == 404
+    assert shared.update_camera(jpeg)
+    # Layers take the single image slot first; the camera follows once they are cached.
+    for _ in range(6):
+        agent.exchange()
+        if registry.robots['amr-01'].camera is not None:
+            break
+    status, headers, body = system['request']('/robots/amr-01/api/camera.jpg')
+    assert status == 200 and body == jpeg
+    assert any(k.lower() == 'content-type' and v == 'image/jpeg' for k, v in headers.items())
+    assert registry.snapshot('amr-01')['camera']['width'] == 16
+    # Unchanged frame is not re-sent; a changed one is.
+    before = registry.robots['amr-01'].camera['received']
+    agent.camera_sent = -1e9
+    agent.exchange()
+    assert registry.robots['amr-01'].camera['received'] == before
+    assert shared.update_camera(small_jpeg((200, 10, 10)))
+    agent.camera_sent = -1e9
+    agent.exchange()
+    assert registry.robots['amr-01'].camera['received'] > before
+    # transit.js is rewritten so the central page requests this robot's camera.
+    status, _, js = system['request']('/robots/amr-01/transit.js')
+    assert status == 200 and b'/robots/amr-01/api/camera.jpg' in js
+    assert HttpClient().request(system['url'] + '/robots/amr-01/api/camera.jpg')[0] == 401
+    # Malformed or oversized camera entries are rejected as a whole exchange.
+    state = shared.snapshot()
+    base = dict(protocol=PROTOCOL_VERSION, robot_id='amr-01', session_id=agent.session_id,
+                state=state, state_age=0, layers={}, results=[])
+    for bad in (dict(jpeg='***'), dict(jpeg=base64.b64encode(b'\x89PNG' + b'\0'*8).decode()),
+                dict(jpeg=base64.b64encode(b'\xff\xd8\xff' + b'\0'*(300*1024)).decode()), 'jpeg', 5):
+        with pytest.raises(ApiError) as error:
+            registry.exchange(dict(base, sequence=agent.sequence + 1, camera=bad))
+        assert error.value.status == 400
+    # A frame that is old at the AMR is not served by the host either.
+    with shared.lock:
+        data, received, w, h = shared.camera
+        shared.camera = (data, received - 4, w, h)
+    agent.camera_sent = -1e9
+    agent.exchange()
+    registry.robots['amr-01'].camera['received'] -= 4
+    assert system['request']('/robots/amr-01/api/camera.jpg')[0] == 404

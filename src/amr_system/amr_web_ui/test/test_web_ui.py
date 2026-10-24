@@ -146,6 +146,48 @@ def test_http_assets_commands_and_origin(tmp_path):
         server.shutdown(); server.server_close(); thread.join()
 
 
+def test_camera_snapshot_is_served_only_while_fresh():
+    from amr_web_ui.server import jpeg_size
+    shared = SharedState(preview=True)
+    buffer = io.BytesIO()
+    Image.new('RGB', (16, 9), (10, 20, 30)).save(buffer, 'JPEG')
+    jpeg = buffer.getvalue()
+    assert jpeg_size(jpeg) == (16, 9)
+    with pytest.raises(ValueError):
+        jpeg_size(b'\x89PNG\r\n\x1a\n' + b'\0'*16)
+    assert shared.snapshot()['camera'] is None
+    assert not shared.update_camera(b'not a jpeg', 'jpeg')
+    assert shared.camera is None
+    assets = Path(__file__).resolve().parents[1]/'web'
+    server = create_http_server(shared, assets, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f'http://127.0.0.1:{server.server_port}'
+    try:
+        with pytest.raises(HTTPError) as exc:
+            urlopen(url+'/api/camera.jpg')
+        assert exc.value.code == 404
+        assert shared.update_camera(jpeg, 'rgb8; jpeg compressed bgr8')
+        response = urlopen(url+'/api/camera.jpg?t=1')
+        assert response.headers['Content-Type'] == 'image/jpeg'
+        assert response.headers['Cache-Control'] == 'no-store'
+        assert float(response.headers['X-Camera-Age']) < 1
+        assert response.read() == jpeg
+        camera = shared.snapshot()['camera']
+        assert (camera['width'], camera['height'], camera['bytes']) == (16, 9, len(jpeg)) and camera['age'] < 1
+        # An old frame is reported with its age but no longer served.
+        with shared.lock:
+            data, received, w, h = shared.camera
+            shared.camera = (data, received - 4, w, h)
+        assert shared.snapshot()['camera']['age'] > 3
+        with pytest.raises(HTTPError) as exc:
+            urlopen(url+'/api/camera.jpg')
+        assert exc.value.code == 404
+        assert b'transit-camera' in urlopen(url).read()
+    finally:
+        server.shutdown(); server.server_close(); thread.join()
+
+
 def test_saved_map_preview_uses_real_map():
     filename = Path(__file__).resolve().parents[2]/'amr_stack/maps/G_4_floor/4_floor_0522.yaml'
     shared = SharedState(preview=True)
@@ -395,14 +437,14 @@ def test_relocalize_map_version_is_checked_without_pose_payload():
 def estop_status(state='READY', sequence=1, session='bridge', **values):
     return json.dumps(dict(
         session=session, sequence=sequence, stamp=time.time(), epoch=0, state=state,
-        healthy=state in ('READY', 'BYPASS'), latched=state in ('UNKNOWN', 'ESTOP', 'DISARMED'),
-        approval_required=state == 'DISARMED', detail='상태 안내', reason='', rx_error='',
+        healthy=state in ('READY', 'BYPASS'), latched=state in ('UNKNOWN', 'ESTOP'),
+        detail='상태 안내', reason='', rx_error='',
         stm32=dict(raw=False, stopped=state == 'ESTOP', drive_enabled=state == 'READY',
                    trip_count=1, release_count=1), **values))
 
 
 @pytest.mark.parametrize('state,message', [
-    ('ESTOP', 'E-stop이 눌려'), ('DISARMED', '재개를 승인'), ('ARMING', '주행 준비'),
+    ('ESTOP', 'E-stop이 눌려'), ('ARMING', '주행 준비'),
     ('UNKNOWN', 'STM32 E-stop 상태'),
 ])
 def test_required_estop_blocks_goals_until_ready(state, message):
@@ -441,47 +483,26 @@ def test_missing_stale_or_malformed_estop_status_fails_closed():
     assert shared.estop.status['sequence'] == 4
 
 
-def test_estop_approve_only_when_bridge_reports_disarmed():
+def test_there_is_no_estop_approval_command():
     shared = live_state()
     shared.require_estop = True
-    payload = dict(request_id='estop_approve_1')
-    with pytest.raises(ApiError, match='E-stop 상태를 받지 못해'):
-        shared.request('estop_approve', payload)
-    for sequence, state in enumerate(('ESTOP', 'ARMING', 'READY', 'BYPASS'), start=1):
-        shared.update_estop(estop_status(state, sequence=sequence))
-        with pytest.raises(ApiError) as exc:
-            shared.request('estop_approve', payload)
-        assert exc.value.status == 409
-    shared.update_estop(estop_status('DISARMED', sequence=10))
+    shared.update_estop(estop_status('ARMING'))
     snapshot = shared.snapshot()['estop']
-    assert snapshot['approval_required'] and snapshot['state'] == 'DISARMED'
+    assert snapshot['state'] == 'ARMING' and 'approval_required' not in snapshot
     assert snapshot['stm32']['trip_count'] == 1
-    first = shared.request('estop_approve', payload)
-    assert first['status'] == 'QUEUED'
-    assert shared.request('estop_approve', payload) == first
-    assert shared.commands.get_nowait() == dict(kind='estop_approve', request_id='estop_approve_1', pose=None,
-                                                map_version=None, floor=None, room='')
-    # The ROS executor re-checks before calling the service.
-    shared.update_estop(estop_status('ESTOP', sequence=11))
-    assert shared.readiness_error('estop_approve', 'estop_approve_1')
-
-
-def test_http_estop_approve_endpoint_uses_command_checks():
-    shared = live_state()
-    shared.require_estop = True
-    shared.update_estop(estop_status('DISARMED'))
+    with pytest.raises(ApiError) as exc:
+        shared.request('estop_approve', dict(request_id='estop_approve_1'))
+    assert exc.value.status == 400
     server = create_http_server(shared, Path(__file__).resolve().parents[1]/'web', port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f'http://127.0.0.1:{server.server_port}/api/estop_approve'
     payload = json.dumps(dict(request_id='http_estop_1')).encode()
     try:
-        with pytest.raises(HTTPError) as exc:
-            urlopen(Request(url, data=payload, headers={'Content-Type': 'application/json'}))
-        assert exc.value.code == 403
         headers = {'Content-Type': 'application/json', 'X-AMR-Request': '1'}
-        result = json.load(urlopen(Request(url, data=payload, headers=headers)))
-        assert result['status'] == 'QUEUED'
-        assert shared.commands.get_nowait()['kind'] == 'estop_approve'
+        with pytest.raises(HTTPError) as exc:
+            urlopen(Request(url, data=payload, headers=headers))
+        assert exc.value.code == 404
+        assert shared.commands.empty()
     finally:
         server.shutdown(); server.server_close(); thread.join()

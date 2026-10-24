@@ -181,11 +181,11 @@
       const estopLive = Boolean(e?.fresh && Number.isFinite(e.age) && e.age < (e.timeout ?? .6));
       const st = estopLive ? e.stm32 || {} : {};
       const estopOk = !e?.required || (estopLive && e.healthy);
-      const estopLabels = {UNKNOWN:'STM32 대기', ESTOP:'E-stop 정지', DISARMED:'재개 승인 필요',
+      const estopLabels = {UNKNOWN:'STM32 대기', ESTOP:'E-stop 정지',
         ARMING:'주행 준비 중', READY:'주행 가능', BYPASS:'확인 꺼짐'};
       badge('health-estop-state', !estopLive ? (e?.received ? '수신 지연' : '미수신') : estopLabels[e.state] || e.state,
         !estopLive ? (e?.required ? 'bad' : '') : e.state === 'READY' ? 'good' :
-          ['ESTOP','DISARMED','UNKNOWN'].includes(e.state) ? 'bad' : 'warn');
+          ['ESTOP','UNKNOWN'].includes(e.state) ? 'bad' : 'warn');
       const yesNo = (value, yes, no) => typeof value === 'boolean' ? (value ? yes : no) : '—';
       text('estop-raw', yesNo(st.raw, '눌림 또는 단선', '정상'));
       text('estop-stopped', yesNo(st.stopped, '정지 중', '해제'));

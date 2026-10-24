@@ -7,6 +7,36 @@
 > `diagnostics/`는 Jetson 작업공간, 나머지는 시뮬레이션 PC 작업공간에 있다. 아래 경로는 그 기준이다.
 > 시뮬레이션 수치는 실물 보정 전 모델(`calibration_status: uncalibrated`)의 결과이며 실차 성능으로 확정하지 않는다.
 
+## 2026-10-25 · 깊이 장애물의 전역 우회 경로 연결
+
+- 후속 관찰: 같은 10 cm 박스의 양옆에 우회 공간이 충분했지만 차체 약 20 cm 앞에서 정지. 당시 스택은 `mark_threshold=0` 적용 후 실행됐다.
+  01:16:43 목표 시작, 01:16:54·01:17:04·01:17:15 경로 교체, 01:16:55부터 `No valid trajectories` 반복,
+  01:17:19 추종 중단·지역 costmap 전체 지움, 01:17:24 SIGINT 종료. 경로 교체 로그만으로 박스를 우회했는지는 알 수 없고,
+  bag이 없어 최초 깊이 관측 거리·지도 반영 지연은 소급 측정할 수 없다.
+- 전역 costmap에 depth 입력이 없음을 설정과 planner 기동 로그에서 확인했다. 양쪽 costmap에 같은 깊이 높이·거리·mark 기준을 적용해
+  깊이에서만 보이는 장애물도 기존 전역 경로 무효화와 Smac 재계획에 반영되도록 했다. 주행 속도·inflation·footprint 값은 변경하지 않았다.
+- Jetson / Nav2 Jazzy, localhost 도메인 197에서 실제 VoxelLayer·Smac planner와 합성 센서만 실행. 2.8 m 복도의 빈 지도와 LiDAR는 유지하고
+  깊이 점군에만 높이 10 cm 박스를 추가했다. 수정 전 전역 지도에서 박스 누락 assertion 실패, 수정 후 기존 직선 경로 무효화와 유효한 우회 경로 생성 확인.
+  앞선 8·10 cm 인식 시험을 포함해 5개 통과. 실제 주행·제동·카메라 지연·추가 CPU 비용은 이 시험의 검증 범위가 아니다.
+- 명령: 앞 절의 도메인 197 `test_depth_costmap_ros.py` 전체 실행. 원자료는 `diagnostics/depth_costmap_probe/detour_before.xml`,
+  `detour_after.xml`, `detour_path_trace.json`, `detour_validation.json`. 검증 당시 소스 해시와 패키지 버전은 JSON에 기록했다.
+- 다음 현장 시험은 `AMR_EXPERIMENT_MODE=real ./scripts/record_trial.sh depth_box`를 먼저 실행한다.
+  기록 대상에 `/camera/depth/points`를 추가했다. 점군·전역/지역 costmap·경로·TF·속도를 함께 보아 최초 관측, 경로 변경, 실제 정지 간격을 구분한다.
+
+## 2026-10-25 · 깊이 카메라의 낮은 박스 누락 재현
+
+- 계기: 높이 10 cm 박스에 접근했을 때 차체 바로 앞에서야 정지한다는 실차 관찰. 조사 당시 차량 스택은 종료되어 실제 점군·제동거리는 측정하지 않았다.
+- 원인 하나를 확인: VoxelLayer `z_resolution=0.10`, `mark_threshold=1`은 같은 XY 칸에 서로 다른 높이 복셀 두 개가 있어야 2D 장애물로 표시한다.
+  평평한 박스 윗면처럼 한 높이 칸에만 있는 점군은 반복 수신해도 누락된다. `mark_threshold=0`으로 수정하고 5 cm 바닥 제외 기준은 유지했다.
+- Jetson / ROS Jazzy, localhost 도메인 197에서 실제 Nav2 costmap과 합성 점군만 실행했다. CAN·카메라·실차 제어 노드는 실행하지 않았다.
+  수정 전 10 cm 시험은 예상대로 장애물 표시 assertion 실패(1 실패·1 비교군 통과), 수정 후 8·10 cm × 이전/현재 설정 4개 통과.
+  바닥 제외, 빈 점군에서 표시 유지, 실제 ray에 의한 제거를 함께 확인했다. 실차 감지거리·회피·정지거리 통과를 의미하지 않는다.
+- 재현: `source scripts/env.sh` 후
+  `ROS_DOMAIN_ID=197 ROS_LOCALHOST_ONLY=1 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST AMR_RUN_DEPTH_COSTMAP_TESTS=1 python3 -m pytest -q src/amr_system/amr_stack/test/test_depth_costmap_ros.py`.
+  원자료: `diagnostics/depth_costmap_probe/low_box_before.xml`, `low_box_after.xml`, `low_box_validation.json`(형상·버전·결과).
+- 남은 현장 확인: 정지한 차체 앞 0.5·1·2 m에 실제 10 cm 박스를 놓아 점군과 지역 costmap의 최초 표시·지연·바닥 오검출을 확인한 뒤,
+  저속 주행에서 실제 속도·최초 감지 거리·감속 시작 거리·차체 앞 최종 간격을 함께 기록한다. 깊이는 지역 costmap 전용이므로 전역 우회 경로도 별도 확인한다.
+
 ## 2026-10-24 · 실차 엘리베이터 통합 시험 (4F 홀 호출 ~ 카 안 정렬)
 
 - 조건: `experiment.sh real`에 `start_elevator_link:=true elevator_link_dry_run:=false`, 3F `real_enabled: true`. 설치 비콘은 4F 홀 비콘뿐(카 E1 없음).

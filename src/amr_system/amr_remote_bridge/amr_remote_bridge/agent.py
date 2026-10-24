@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from .common import (COMMANDS, LAYERS, MAX_COMMAND, MAX_FLOORS, MAX_MESSAGE, PROTOCOL_VERSION,
                      REQUEST_ID, HttpClient, base_url, dumps, floor_layer, floor_map_version,
-                     identifier, layer_floor, loads, positive, read_token, valid_layer)
+                     identifier, layer_floor, loads, positive, read_token, valid_layer, CAMERA_MAX_AGE, JPEG_MAGIC, MAX_CAMERA)
 
 
 LOG = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 
 class Agent:
     def __init__(self, server_url, token, robot_id='amr-01', local_url='http://127.0.0.1:8080',
-                 rate=5, timeout=1.5, layer_refresh=5, reconnect_max=10, stop=None):
+                 rate=5, timeout=1.5, layer_refresh=5, reconnect_max=10, stop=None, camera_refresh=1.):
         self.server_url = base_url(server_url)
         self.local_url = base_url(local_url, local=True)
         self.robot_id = identifier(robot_id)
@@ -31,6 +31,9 @@ class Agent:
         self.interval = 1 / positive(rate)
         self.timeout = positive(timeout)
         self.layer_refresh = positive(layer_refresh)
+        self.camera_refresh = positive(camera_refresh)
+        self.camera_sent = -math.inf
+        self.camera_digest = None
         self.reconnect_max = positive(reconnect_max)
         self.stop = stop or threading.Event()
         self.http = HttpClient()
@@ -113,6 +116,9 @@ class Agent:
         # image requests. Serve one pending layer per cycle, least recently tried
         # first, then capture the current state. Images whose version changed are discarded.
         image_started = time.monotonic()
+        camera = None
+        if not pending and self.camera_due(state):
+            camera = self.read_camera()
         if pending:
             # The map is needed to validate coordinate commands after restart.
             name, info = next((item for item in pending if item[0] == 'map'),
@@ -126,12 +132,37 @@ class Agent:
                     updates[name] = dict(version=info['version'], png=base64.b64encode(png).decode('ascii'))
             except Exception as exc:
                 LOG.warning('Local map layer %s unavailable (%s); state exchange continues', name, type(exc).__name__)
+        if pending or camera is not None:
             state, captured = read_state()
             updates = {name: image for name, image in updates.items()
                        if self.layer_version(name, state) == image['version']}
         self.exchange_metrics = dict(phase='host_exchange', collect_ms=1000*(time.monotonic()-started),
                                      image_ms=1000*(time.monotonic()-image_started),host_http_status=None)
-        return state, updates, captured
+        return state, updates, captured, camera
+
+    def camera_due(self, state):
+        """A fresh camera frame exists locally and the relay interval has passed."""
+        camera = state.get('camera')
+        return (isinstance(camera, dict) and isinstance(camera.get('age'), (int, float))
+                and camera['age'] < CAMERA_MAX_AGE
+                and time.monotonic() - self.camera_sent >= self.camera_refresh)
+
+    def read_camera(self):
+        """The local JPEG snapshot as an envelope entry, or None when unchanged or unavailable."""
+        self.camera_sent = time.monotonic()
+        try:
+            status, _, jpeg = self.http.request(self.local_url + '/api/camera.jpg', timeout=self.timeout,
+                                                limit=MAX_CAMERA)
+        except Exception as exc:
+            LOG.warning('Local camera snapshot unavailable (%s); state exchange continues', type(exc).__name__)
+            return None
+        if status != 200 or not jpeg.startswith(JPEG_MAGIC):
+            return None
+        digest = hashlib.sha256(jpeg).hexdigest()
+        if digest == self.camera_digest:
+            return None
+        self.camera_digest = digest
+        return dict(jpeg=base64.b64encode(jpeg).decode('ascii'))
 
     def execute(self, command, round_trip):
         command_id = command.get('command_id')
@@ -191,10 +222,11 @@ class Agent:
     def exchange(self):
         error = None
         try:
-            state, updates, captured = self.collect()
+            state, updates, captured, camera = self.collect()
         except Exception as exc:
-            state, updates, captured = None, {}, time.monotonic()
+            state, updates, captured, camera = None, {}, time.monotonic(), None
             self.layer_cache.clear()
+            self.camera_digest = None
             self.floors, self.floors_checked = None, None
             # The central UI must become unavailable, rather than keep old data looking live.
             error = type(exc).__name__ + ': local web API unavailable'
@@ -203,7 +235,7 @@ class Agent:
                         session_id=self.session_id, sequence=self.sequence, state=state,
                         state_age=time.monotonic() - captured + self.round_trip,
                         layers=updates, results=list(self.results.values()), local_error=error,
-                        floors=self.floors if state is not None else None)
+                        floors=self.floors if state is not None else None, camera=camera)
         self.exchange_metrics.update(payload_bytes=len(dumps(envelope)), state_age=envelope['state_age'])
         if self.exchange_metrics['payload_bytes'] > MAX_MESSAGE:
             raise ValueError('Telemetry exceeds 8 MiB; reduce local map/scan data size')
@@ -214,6 +246,7 @@ class Agent:
         self.exchange_metrics.update(host_http_status=status, round_trip_ms=round_trip*1000)
         if status != 200:
             self.layer_cache.clear()
+            self.camera_digest = None
             # Deliberately omit the URL, credential and returned body from logs.
             raise ConnectionError(f'Host rejected exchange: HTTP {status}')
         reply = loads(body)
@@ -277,6 +310,8 @@ def main(args=None):
     parser.add_argument('--rate', type=float, default=5)
     parser.add_argument('--timeout', type=float, default=1.5)
     parser.add_argument('--layer-refresh', type=float, default=5)
+    parser.add_argument('--camera-refresh', type=float, default=1,
+                        help='Seconds between relayed camera snapshots (JPEG, <= 300 KiB)')
     parser.add_argument('--log-file', type=Path, help='Diagnostic file; defaults to diagnostics/remote_client under the working directory')
     options = parser.parse_args(args)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -290,7 +325,8 @@ def main(args=None):
     LOG.info('Remote client diagnostic log: %s', log_file)
     try:
         agent = Agent(options.server_url, read_token(options.token_file), options.robot_id,
-                      options.local_url, options.rate, options.timeout, options.layer_refresh)
+                      options.local_url, options.rate, options.timeout, options.layer_refresh,
+                      camera_refresh=options.camera_refresh)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     for signum in (signal.SIGINT, signal.SIGTERM):

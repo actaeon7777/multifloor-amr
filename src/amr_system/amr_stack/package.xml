@@ -13,6 +13,7 @@
   <exec_depend>joy_teleop</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>amr_control</exec_depend>
+  <exec_depend>amr_depth_filter</exec_depend>
   <exec_depend>amr_vehicle_status</exec_depend>
   <exec_depend>amr_can_bridge</exec_depend>
   <exec_depend>sllidar_ros2</exec_depend>
@@ -54,6 +55,10 @@
   <exec_depend>nav2_costmap_2d</exec_depend>
   <exec_depend>nav2_rviz_plugins</exec_depend>
   <exec_depend>amr_nav2_plugins</exec_depend>
+  <!-- camera.launch.py (start_camera:=true) also needs ros-jazzy-orbbec-camera, which is not in
+       rosdistro and would break rosdep as a dependency; see docs/REAL_VEHICLE.md section 2. -->
+  <exec_depend>image_transport</exec_depend>
+  <exec_depend>compressed_image_transport</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <export>
     <build_type>ament_python</build_type>

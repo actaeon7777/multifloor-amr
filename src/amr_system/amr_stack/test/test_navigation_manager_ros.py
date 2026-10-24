@@ -576,7 +576,7 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
     h.manager.require_estop = True
     qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     publisher = h.probe.create_publisher(String, '/estop/status', qos)
-    estop = {'state': 'DISARMED', 'epoch': 0, 'sequence': 0}
+    estop = {'state': 'ARMING', 'epoch': 0, 'sequence': 0}
 
     def publish():
         estop['sequence'] += 1
@@ -584,7 +584,7 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
         publisher.publish(String(data=json.dumps(dict(
             session='estop_test', sequence=estop['sequence'], epoch=estop['epoch'],
             stamp=time.time(), state=state, healthy=state in ('READY', 'BYPASS'),
-            latched=state in ('UNKNOWN', 'ESTOP', 'DISARMED')))))
+            latched=state in ('UNKNOWN', 'ESTOP')))))
     timer = h.probe.create_timer(.05, publish)
 
     def set_state(state, epoch=None):
@@ -593,9 +593,9 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
         estop['state'] = state
         h.until(lambda: h.manager.estop.status.get('state') == state)
 
-    set_state('DISARMED')
+    set_state('ARMING')
     rejected, _ = h.goal()
-    assert not rejected.accepted  # A clear STM32 alone is not a restart.
+    assert not rejected.accepted  # Goals wait for READY.
     set_state('READY')
     _, result = h.goal()
     h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
@@ -617,14 +617,14 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
     h.until(lambda: h.manager.run is None)
     h.spin(.1)
     assert h.manager.last_status == 'ESTOP'
-    set_state('DISARMED')
+    set_state('ARMING')  # Released: the bridge re-arms by itself.
     rejected, _ = h.goal()
     assert not rejected.accepted
     lease = h.probe.create_client(SetBool, '/navigation/maneuver_lease')
     assert not h.wait(lease.call_async(SetBool.Request(data=True))).success
     set_state('READY')
     h.spin()
-    assert len(h.backend.runs) == 1  # Never resumed after approval.
+    assert len(h.backend.runs) == 1  # Never resumed after re-arming.
     h.assert_zero()
 
     # A lost status stream is treated as an E-stop.

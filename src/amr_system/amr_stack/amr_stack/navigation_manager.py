@@ -3,7 +3,7 @@
 MANUAL (an LB takeover) rejects new goals and aborts the active goal as
 OVERRIDDEN. A goal is never resumed after AUTO returns; a new goal is required.
 An E-stop (/estop/status from the CAN bridge) aborts the active goal as ESTOP;
-after the operator approves a restart a new goal is required as well.
+after the bridge re-arms a new goal is required as well.
 
 All state is owned by one single-threaded executor. Action execution awaits an rclpy
 Future rather than blocking the executor. An old internal goal must reach a
@@ -48,7 +48,7 @@ from amr_control.time_guard import HealthLease, SessionOrder
 OVERRIDE_DETAIL = ('수동 조작(LB)으로 자율주행을 중단했습니다. '
                    'LB를 놓은 뒤 목적지를 다시 지정하세요.')
 ESTOP_DETAIL = ('E-stop으로 자율주행을 중단했습니다. '
-                '버튼을 원위치로 돌리고 재개를 승인한 뒤 목적지를 다시 지정하세요.')
+                '버튼을 원위치로 돌린 뒤 목적지를 다시 지정하세요.')
 
 
 def valid_goal(goal):
@@ -197,7 +197,7 @@ class NavigationManager(Node):
         return not self.require_estop or self.estop.healthy()
 
     def estop_stopped(self):
-        """An E-stop, or no fresh status. ARMING after a closed drive gate only holds."""
+        """An E-stop, or no fresh status. ARMING only holds; every E-stop changes the epoch."""
         if not self.require_estop:
             return False
         fresh = self.estop.status and 0 <= monotonic()-self.estop.received < self.estop.timeout
@@ -363,7 +363,7 @@ class NavigationManager(Node):
             self.get_logger().warning('Rejecting goal: an elevator maneuver holds the command lease')
             return GoalResponse.REJECT
         if not self.estop_ready():
-            self.get_logger().warning('Rejecting goal: E-stop interlock is not READY (approve restart)')
+            self.get_logger().warning('Rejecting goal: E-stop interlock is not READY')
             return GoalResponse.REJECT
         if not self.enforce_localization_readiness():
             self.get_logger().warning('Rejecting goal: localization is not ready or status is stale')

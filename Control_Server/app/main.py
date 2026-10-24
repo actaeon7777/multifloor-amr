@@ -13,7 +13,7 @@ from .http import authenticate, read_message, respond
 
 MIMES = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8',
          'css': 'text/css; charset=utf-8', 'svg': 'image/svg+xml'}
-UI_FILES = ('index.html', 'app.js', 'geometry.js', 'dashboard.js',
+UI_FILES = ('index.html', 'app.js', 'geometry.js', 'dashboard.js', 'transit.js',
             'battery-profile.js', 'style.css', 'favicon.svg')
 
 
@@ -102,6 +102,8 @@ def create_app(settings=None, registry=None):
                 raise ApiError(404, 'Unknown layer')
             png, version = await run(registry.layer, robot_id, name)
             return respond(200, png, 'image/png', {'X-Map-Version': str(version)})
+        if route == '/api/camera.jpg':
+            return respond(200, await run(registry.camera, robot_id), 'image/jpeg')
         if route in ('/fleet', '/fleet.js', '/fleet.css'):
             name = 'fleet.html' if route == '/fleet' else route[1:]
             content = await run((settings.fleet_dir / name).read_bytes)
@@ -114,7 +116,7 @@ def create_app(settings=None, registry=None):
                     '<a class="brand" href="/fleet">').replace('href="/" aria-label="AMR 홈"',
                     'href="/fleet" aria-label="AMR 홈"').replace('목적지 주행 <span>',
                     f'{robot_id} · 목적지 주행 <span>').encode('utf-8')
-            elif name == 'app.js':
+            elif name in ('app.js', 'transit.js'):
                 content = content.replace(b'/api/', f'/robots/{robot_id}/api/'.encode('ascii'))
         else:
             raise ApiError(404, 'Not found')

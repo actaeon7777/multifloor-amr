@@ -32,5 +32,9 @@ def generate_launch_description():
              name='lifecycle_manager_localization', parameters=[{
                  'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool), 'autostart': True,
                  'node_names': ['map_server', 'amcl'],
+                 # Default 4 s: during TIM global localization (two ICP threads, ~20 s) plus
+                 # the depth camera, AMCL's heartbeat starved and the manager shut
+                 # localization down with "SERVER amcl IS DOWN" (2026-10-25).
+                 'bond_timeout': 12.0,
              }], output='screen'),
     ])

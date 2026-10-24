@@ -16,7 +16,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import CompressedImage, LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -75,8 +75,6 @@ class WebBridge(Node):
                 self.get_logger().warning(f'Multi-floor goals disabled: {error}')
         self.relocalize_client = self.create_client(Trigger, '/localization/relocalize')
         self.pending_relocalize = None
-        self.estop_client = self.create_client(Trigger, '/estop/approve_resume')
-        self.pending_estop = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
         self.goal_handle = None
         self.goal_id = None
@@ -142,6 +140,11 @@ class WebBridge(Node):
                     m.event, m.from_floor, m.to_floor, m.detail), 20))
         self.subscriptions_list.append(self.create_subscription(
             VehicleStatus, '/vehicle/status', self.on_vehicle_status, QoSProfile(depth=1)))
+        # Depth camera color stream, JPEG-encoded by the driver (bringup start_camera).
+        # Bytes are stored as-is for /api/camera.jpg; nothing is decoded here (Jetson CPU).
+        self.subscriptions_list.append(self.create_subscription(
+            CompressedImage, '/camera/color/image_raw/compressed',
+            lambda m: self.shared.update_camera(bytes(m.data), m.format), QoSProfile(depth=1)))
         self.create_timer(.05, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
 
     def set_state(self, **values):
@@ -162,11 +165,9 @@ class WebBridge(Node):
         self.pending_scan = None
         self.pending_vectors.clear()
         self.robot_stamp = self.goal_id = self.goal_handle = None
-        for name in ('pending_relocalize', 'pending_estop'):
-            pending = getattr(self, name)
-            if pending:
-                setattr(self, name, None)
-                pending[0].cancel()
+        if self.pending_relocalize:
+            self.pending_relocalize[0].cancel()
+            self.pending_relocalize = None
         self.seen_epoch = self.shared.connection_epoch
         self.reset_requested = False
 
@@ -411,13 +412,6 @@ class WebBridge(Node):
             future = self.relocalize_client.call_async(Trigger.Request())
             self.pending_relocalize = (future, request_id, time.monotonic())
             future.add_done_callback(lambda f: self.on_relocalize_response(request_id, f))
-        elif kind == 'estop_approve':
-            if not self.estop_client.service_is_ready():
-                self.shared.complete(request_id, 'FAILED', 'E-stop 재개 승인 서비스에 연결되지 않았습니다.')
-                return
-            future = self.estop_client.call_async(Trigger.Request())
-            self.pending_estop = (future, request_id, time.monotonic())
-            future.add_done_callback(lambda f: self.on_estop_response(request_id, f))
         elif kind == 'cancel':
             if not self.goal_handle or not self.goal_handle.accepted:
                 self.shared.complete(request_id, 'FAILED', '취소할 목표가 없습니다.')
@@ -485,18 +479,6 @@ class WebBridge(Node):
                                                     if result.success else '자동 위치 찾기가 거절되었습니다.'))
         except Exception as error:
             self.shared.complete(request_id, 'FAILED', f'자동 위치 찾기 응답을 확인하지 못했습니다: {error}')
-
-    def on_estop_response(self, request_id, future):
-        if self.pending_estop is None or self.pending_estop[0] is not future:
-            return
-        self.pending_estop = None
-        try:
-            result = future.result()
-            self.shared.complete(request_id, 'APPROVED' if result.success else 'FAILED',
-                                 result.message or ('재개를 승인했습니다.' if result.success
-                                                    else '재개 승인이 거절되었습니다.'))
-        except Exception as error:
-            self.shared.complete(request_id, 'FAILED', f'재개 승인 응답을 확인하지 못했습니다: {error}')
 
     def on_goal_response(self, request_id, future, floor=False):
         if self.goal_id != request_id:
@@ -571,11 +553,6 @@ class WebBridge(Node):
             self.pending_relocalize = None
             future.cancel()
             self.shared.complete(request_id, 'FAILED', '자동 위치 찾기 응답이 지연됩니다. 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
-        if self.pending_estop and time.monotonic()-self.pending_estop[2] > 5:
-            future, request_id, _received = self.pending_estop
-            self.pending_estop = None
-            future.cancel()
-            self.shared.complete(request_id, 'FAILED', '재개 승인 응답이 지연됩니다. E-stop 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
         try:
             self.process_command(self.shared.commands.get_nowait())
         except queue.Empty:

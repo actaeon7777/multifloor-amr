@@ -16,7 +16,7 @@ planner_server:
       max_iterations: 1000000
       max_on_approach_iterations: 1000
       max_planning_time: 2.0
-      # Broad inflation + higher traversal cost favor clearance in ~2.8 m corridors.
+      # Higher traversal cost keeps clearance inside the global inflation band.
       cost_travel_multiplier: 4.0
       use_final_approach_orientation: false
       # Strong smoothing removes 8-connected stair steps and medial-axis wiggles
@@ -179,6 +179,7 @@ global_costmap:
       plugins:
       - static_layer
       - obstacle_layer
+      - depth_layer
       - inflation_layer
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -197,9 +198,60 @@ global_costmap:
           raytrace_min_range: 0.1
           raytrace_max_range: 6.0
           max_obstacle_height: 2.0
+      # Depth-only low obstacles must invalidate the global path as well as
+      # constrain local motion. Keep height/clearing rules aligned with local.
+      depth_layer:
+        plugin: nav2_costmap_2d::VoxelLayer
+        enabled: true
+        publish_voxel_map: false
+        footprint_clearing_enabled: true
+        origin_z: 0.0
+        z_resolution: 0.10
+        z_voxels: 10
+        unknown_threshold: 10
+        # Nav2 marks a column only when occupied voxel count > mark_threshold.
+        # With 10 cm bins, 1 misses low boxes / flat tops confined to one bin.
+        # The 6 cm height filter below rejects floor returns before marking.
+        mark_threshold: 0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
+          topic: /camera/depth/points_filtered
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # 0.06 with the persistence filter (2026-10-25 bags 012806/020944):
+          # single-frame glossy-floor returns at 5-11 cm, 1.5-2.8 m, blocked the
+          # corridor; 3-frame persistence removes them and keeps an 11 cm box
+          # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
+          min_obstacle_height: 0.06
+          max_obstacle_height: 1.0
+          obstacle_min_range: 0.0
+          obstacle_max_range: 3.0
+        depth_clear:
+          topic: /camera/depth/points
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # Floor returns (z ~ 0) stay in the clearing cloud so their rays free cells.
+          min_obstacle_height: -0.10
+          max_obstacle_height: 1.0
+          raytrace_min_range: 0.0
+          raytrace_max_range: 3.5
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        inflation_radius: 1.6
+        # 1.0 (was 1.6, 2026-10-25 bag 023737): with 1.6 every cell of the 2.7 m
+        # corridor carried wall cost, so Smac followed the free-space medial axis,
+        # bulging into lobbies and swinging back to centre after each obstacle.
+        # Below half the corridor width the centre is cost-free and plans run
+        # straight. Real map + observed obstacles (benchmark_global_planner.py):
+        # turning -20..-36 %, heading reversals 3-6 -> 0-4, min clearance 0.45 m
+        # unchanged on the box routes. Local costmap keeps 1.6.
+        inflation_radius: 1.0
         cost_scaling_factor: 2.0
       always_send_full_costmap: false
       track_unknown_space: true
@@ -224,6 +276,7 @@ local_costmap:
       rolling_window: true
       plugins:
       - obstacle_layer
+      - depth_layer
       - inflation_layer
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -242,6 +295,55 @@ local_costmap:
           raytrace_min_range: 0.1
           raytrace_max_range: 6.0
           max_obstacle_height: 2.0
+      # Gemini 2 depth cloud (bringup start_camera:=true). The S2 scan plane is
+      # 0.195 m above the floor; this layer adds what it misses: low boxes, table
+      # tops, chair seats, up to the robot top (0.84 m). The lower FOV edge first
+      # meets the floor 0.70 m ahead of base_link (raised surfaces can remain
+      # visible closer); marks persist until this layer's own rays clear them.
+      # expected_update_rate 0 keeps the costmap current without the camera
+      # (simulation, start_camera:=false); time_health gates AUTO on a dead camera.
+      depth_layer:
+        plugin: nav2_costmap_2d::VoxelLayer
+        enabled: true
+        publish_voxel_map: false
+        footprint_clearing_enabled: true
+        origin_z: 0.0
+        z_resolution: 0.10
+        z_voxels: 10
+        unknown_threshold: 10
+        # Nav2 marks a column only when occupied voxel count > mark_threshold.
+        # With 10 cm bins, 1 misses low boxes / flat tops confined to one bin.
+        # The 6 cm height filter below rejects floor returns before marking.
+        mark_threshold: 0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
+          topic: /camera/depth/points_filtered
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # 0.06 with the persistence filter (2026-10-25 bags 012806/020944):
+          # single-frame glossy-floor returns at 5-11 cm, 1.5-2.8 m, blocked the
+          # corridor; 3-frame persistence removes them and keeps an 11 cm box
+          # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
+          min_obstacle_height: 0.06
+          max_obstacle_height: 1.0
+          obstacle_min_range: 0.0
+          obstacle_max_range: 3.0
+        depth_clear:
+          topic: /camera/depth/points
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # Floor returns (z ~ 0) stay in the clearing cloud so their rays free cells.
+          min_obstacle_height: -0.10
+          max_obstacle_height: 1.0
+          raytrace_min_range: 0.0
+          raytrace_max_range: 3.5
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         inflation_radius: 1.6

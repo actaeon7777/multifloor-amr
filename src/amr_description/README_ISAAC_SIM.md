@@ -13,6 +13,8 @@ src/amr_description/urdf/capstone_amr.urdf
 ## v119 형상 업데이트 (2026-10-20)
 
 `AMR_MASTER_Linear v119.step`을 반영했다. 상세는 [`reports/UPDATE_V119.md`](reports/UPDATE_V119.md).
+v130(2026-10-24)에서 카메라·IMU 배치만 다시 확인했고 변경은 없다. 실차 바닥 실측 포함:
+[`reports/CHECK_V130_CAMERA.md`](reports/CHECK_V130_CAMERA.md).
 
 - 하우징 4조각(`housing.stl`): 외곽 X ±328, Y ±278, Z −55~80 mm, 구동휠 위 펜더는 Z 100 mm까지.
   차체 길이가 0.640 → **0.656 m**가 됐다. 폭은 구동휠 바깥면 기준 0.574 m로 같다.

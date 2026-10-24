@@ -19,11 +19,7 @@
   // Multi-floor: floorsInfo from /api/floors; viewFloor is the floor whose map is shown.
   let floorsInfo = null, viewFloor = null, shownCurrentFloor = null, floorPolls = 0;
   const floorImages = {}, floorLoading = {};
-  const missionLabels = {NAV_TO_HALL:'엘리베이터 홀로 이동', CALL_ELEVATOR:'엘리베이터 호출', WAIT_DOOR_OPEN:'문 열림 대기',
-    BOARDING:'탑승 중', BACKING_OUT:'탑승 중단 · 홀로 복귀', IN_CAR_ALIGN:'엘리베이터 안 정렬', SELECT_FLOOR:'층 버튼 선택',
-    RIDING:'층 이동 중', SWITCH_MAP:'지도 전환', ALIGHTING:'하차 중', RETURN_TO_CAR:'하차 중단 · 카 안 복귀',
-    RELOCALIZE:'위치 재확인', NAV_TO_GOAL:'목적지로 이동', SUCCEEDED:'층간 이동 완료', FAILED_SAFE:'안전 정지',
-    CANCELED:'층간 이동 취소'};
+  const missionLabels = window.AMRMissionLabels || {};  // transit.js
   const terminal = new Set(['SUCCEEDED', 'CANCELED', 'FAILED', 'REJECTED']);
   const navigationLabels = {IDLE:'목적지 선택', WAITING_NAV2:'주행 준비 중',
     RUNNING:'이동 중', STOPPING:'주행 종료 처리 중', MANUAL:'수동 조작 중', OVERRIDDEN:'수동 조작으로 중단됨', ESTOP:'E-stop으로 중단됨',
@@ -263,7 +259,7 @@
     }
     const mission = state?.floor_mission, line = $('floor-mission');
     const visible = mission && mission.phase && mission.phase !== 'IDLE';
-    line.hidden = !visible;
+    line.hidden = $('floor-mission-link').hidden = !visible;
     if (visible) {
       const route = mission.start_floor && mission.goal_floor ? `${mission.start_floor} → ${mission.goal_floor}${mission.goal_room ? ' ' + roomLabel(mission.goal_room) : ''} · ` : '';
       const press = state.elevator?.last_command;

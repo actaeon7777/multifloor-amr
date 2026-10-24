@@ -13,6 +13,8 @@ src/amr_description/urdf/capstone_amr.urdf
 ## v119 형상 업데이트 (2026-10-20)
 
 `AMR_MASTER_Linear v119.step`을 반영했다. 상세는 [`reports/UPDATE_V119.md`](reports/UPDATE_V119.md).
+v130(2026-10-24)에서 카메라·IMU 배치만 다시 확인했고 변경은 없다. 실차 바닥 실측 포함:
+[`reports/CHECK_V130_CAMERA.md`](reports/CHECK_V130_CAMERA.md).
 
 - 하우징 4조각(`housing.stl`): 외곽 X ±328, Y ±278, Z −55~80 mm, 구동휠 위 펜더는 Z 100 mm까지.
   차체 길이가 0.640 → **0.656 m**가 됐다. 폭은 구동휠 바깥면 기준 0.574 m로 같다.
@@ -36,7 +38,8 @@ src/amr_description/urdf/capstone_amr.urdf
 - LiDAR 마운트·본체, 캐스터 4개, 구동휠 메시의 위치·체적은 v28과 같다.
 - 질량 15.0 kg와 `base_link` 관성 근사는 v28 값을 유지했다. v80 실물을 다시 잰 값이 아니다.
 - 2020 기둥 4개가 LiDAR 스캔 평면(Z 108.605 mm)을 지난다. 실물 스캔에는 약 ±22~30°, ±149~157° 방향
-  0.27~0.28 m 거리에 차체가 보인다. 실차는 `amr_stack`의 `scan_body_filter`가 이 점을 지운다.
+  0.27~0.28 m 거리에 차체가 보인다. 실차는 `amr_stack`의 `scan_body_filter`가 이 점과, 기둥 모서리를 스친 빔이 0.7 m 이내에
+  내는 중간 거리 점(기둥 방향 ±3°)을 지운다.
   시뮬레이션 LiDAR는 자기 충돌체를 무시하므로 기둥 너머가 가려지는 것은 재현하지 않는다.
 
 ## v28 형상 업데이트 (2026-09-28)

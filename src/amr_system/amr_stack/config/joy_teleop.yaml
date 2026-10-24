@@ -4,9 +4,9 @@ joy:
     device_id: 0
     device_name: Xbox Series X Controller  # Exact SDL name; do not open another device.
     deadzone: 0.05
-    autorepeat_rate: 20.0
+    autorepeat_rate: 20.0  # Must stay > 0: a held LB without stick motion must keep publishing /joy.
     coalesce_interval: 0.01
-    sticky_buttons: false  # Keep LB held-to-drive; control_mux toggles only RB (7).
+    sticky_buttons: false  # Keep LB held-to-drive.
 
 joy_teleop:
   ros__parameters:

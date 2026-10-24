@@ -25,7 +25,8 @@ class ReceiveOnlyBus:
         assert {f['can_id'] for f in kwargs['can_filters']} == {0x009,0x029,0x301,0x302,0x017,0x037,0x001,0x021}
 
     def recv(self, timeout):
-        assert timeout == 0.
+        assert 0. <= timeout <= .1
+        time.sleep(timeout)  # the receive thread blocks here like SocketCAN
         return None
 
     def send(self, *args, **kwargs):

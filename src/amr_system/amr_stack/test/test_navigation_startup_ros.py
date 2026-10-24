@@ -354,6 +354,7 @@ class Harness:
         self.backend = SyntheticLocalization(**backend_options)
         overrides = dict(automatic_localization=automatic, verification_duration=.1,
                          manual_verification_duration=.1, manual_verification_samples=2,
+                         manual_refinement=False,
                          global_localization_backend='amcl',
                          verification_samples=2, stationary_duration=.15,
                          search_timeout=10., data_timeout=.7, pose_timeout=1.,
@@ -1091,6 +1092,152 @@ def test_real_amcl_manual_initialization_and_nomotion_updates(harnesses, tmp_pat
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
+            # AMCL's latched /amcl_pose and map->odom TF must be gone before the
+            # next test's synthetic backend starts, or they seed its supervisor.
+            h.until(lambda: h.probe.count_publishers('/amcl_pose') == 0, timeout=15.)
+
+
+def offset_pose(message, dx, dy, dyaw):
+    pose = copy.deepcopy(message)
+    x, y, theta = navigation_startup.planar(pose.pose.pose)
+    pose.pose.pose.position.x, pose.pose.pose.position.y = x + dx, y + dy
+    pose.pose.pose.orientation.z = math.sin((theta + dyaw) / 2)
+    pose.pose.pose.orientation.w = math.cos((theta + dyaw) / 2)
+    pose.pose.covariance[0] = pose.pose.covariance[7] = .25
+    pose.pose.covariance[35] = .0685
+    return pose
+
+
+def pose_error(message, expected):
+    x, y, theta = navigation_startup.planar(message.pose.pose)
+    return (math.hypot(x - expected[0], y - expected[1]),
+            abs(math.atan2(math.sin(theta - expected[2]), math.cos(theta - expected[2]))))
+
+
+def test_manual_click_is_scan_matched_before_verification(harnesses):
+    h = harnesses(unique_map=True, scan_count=360, laser_extrinsic=(.1, 0., math.pi),
+                  startup_parameters={'manual_refinement': True})
+    seeds = []
+    h.probe.create_subscription(PoseWithCovarianceStamped, '/initialpose', seeds.append, 10)
+    h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
+    h.initial_pub.publish(offset_pose(h.backend.estimated_pose(), .4, -.3, .25))
+    h.until(lambda: h.supervisor.source == 'manual')
+    h.backend.emit_pose = True
+    h.until(lambda: h.supervisor.state == 'READY')
+    assert len(seeds) == 2
+    distance, heading = pose_error(seeds[1], h.backend.pose)
+    assert distance < .06 and heading < .03
+    assert seeds[1].pose.covariance[0] == .01
+    metrics = h.statuses[-1]
+    assert metrics['refinement_accepted'] is True
+    assert metrics['refinement_match_ratio'] > .9 > metrics['refinement_hint_match_ratio']
+
+
+def test_manual_refinement_below_threshold_keeps_the_operator_pose(harnesses):
+    h = harnesses(unique_map=True, startup_parameters={'manual_refinement': True})
+    seeds = []
+    h.probe.create_subscription(PoseWithCovarianceStamped, '/initialpose', seeds.append, 10)
+    h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
+    # Returns that fit no wall anywhere in the window.
+    h.backend.ranges = [.2] * len(h.backend.ranges)
+    h.initial_pub.publish(offset_pose(h.backend.estimated_pose(), .4, -.3, .25))
+    h.until(lambda: h.supervisor.refinement_metrics)
+    h.spin(.3)
+    assert len(seeds) == 1
+    assert h.supervisor.refinement_metrics['refinement_accepted'] is False
+    assert h.supervisor.source == 'manual' and h.supervisor.refinement is None
+
+
+def test_manual_refinement_is_discarded_when_the_robot_moves(harnesses, monkeypatch):
+    h = harnesses(unique_map=True, startup_parameters={'manual_refinement': True})
+    seeds = []
+    h.probe.create_subscription(PoseWithCovarianceStamped, '/initialpose', seeds.append, 10)
+    h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
+    original = h.supervisor.map_quality.refine_pose
+
+    def slow(*args, **kwargs):
+        time.sleep(.5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(h.supervisor.map_quality, 'refine_pose', slow)
+    h.initial_pub.publish(offset_pose(h.backend.estimated_pose(), .4, -.3, .25))
+    h.until(lambda: h.supervisor.refinement is not None and h.supervisor.refinement['future'] is not None)
+    h.supervisor.record_motion()
+    h.until(lambda: h.supervisor.refinement is None)
+    h.spin(.2)
+    assert len(seeds) == 1
+
+
+def test_ready_stopped_pose_is_saved_per_map_and_offered_in_status(harnesses, tmp_path):
+    path = tmp_path / 'nested' / 'last_pose.json'
+    h = harnesses(startup_parameters={'last_pose_file': str(path)})
+    h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
+    h.spin(.3)
+    assert not path.exists() and h.statuses[-1]['last_pose'] is None
+    h.ready()
+    h.until(path.exists)
+    saved = json.loads(path.read_text())
+    assert list(saved) == [h.supervisor.map_id]
+    entry = saved[h.supervisor.map_id]
+    assert math.hypot(entry['x'] - h.backend.pose[0], entry['y'] - h.backend.pose[1]) < 1e-6
+    assert abs(entry['yaw'] - h.backend.pose[2]) < 1e-6
+    h.until(lambda: h.statuses[-1]['last_pose'] == entry)
+    assert h.supervisor.load_saved_poses() == saved
+    path.write_text('{"bad": {"x": "nan"}, "other": [1]}')
+    assert h.supervisor.load_saved_poses() == {}
+
+
+def test_last_pose_is_not_saved_while_moving(harnesses, tmp_path):
+    path = tmp_path / 'last_pose.json'
+    h = harnesses(startup_parameters={'last_pose_file': str(path)})
+    h.ready()
+    h.backend.speed = .2
+    h.supervisor.saved_poses = {}
+    if path.exists():
+        path.unlink()
+    h.spin(2.5)
+    assert not path.exists()
+
+
+def test_real_amcl_converges_from_a_rough_click_with_refinement(harnesses, tmp_path):
+    h = harnesses(real_amcl=True, map_tf=False, unique_map=True, scan_count=3240, startup_parameters={
+        'search_timeout': 15., 'pose_timeout': 2., 'data_timeout': 1.5,
+        'initialization_max_beams': 1080, 'manual_verification_duration': 1.,
+        'manual_refinement': True,
+    })
+    config = Path(__file__).resolve().parents[1] / 'config' / 'localization.yaml'
+    log_path = tmp_path / 'amcl.log'
+    with log_path.open('w') as log:
+        process = subprocess.Popen([
+            '/opt/ros/jazzy/lib/nav2_amcl/amcl', '--ros-args', '--params-file', str(config),
+        ], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            state_client = h.probe.create_client(ChangeState, '/amcl/change_state')
+            h.until(state_client.service_is_ready)
+            for transition in (Transition.TRANSITION_CONFIGURE, Transition.TRANSITION_ACTIVATE):
+                request = ChangeState.Request()
+                request.transition.id = transition
+                future = state_client.call_async(request)
+                h.until(future.done)
+                assert future.result().success, log_path.read_text()
+            h.until(lambda: h.supervisor.lifecycle_active('amcl'))
+            h.until(lambda: h.initial_pub.get_subscription_count() >= 2)
+            h.initial_pub.publish(offset_pose(h.backend.estimated_pose(), .4, -.3, .25))
+            h.until(lambda: h.supervisor.source == 'manual')
+            h.until(lambda: h.supervisor.state == 'READY', timeout=18.)
+            assert h.supervisor.refinement_metrics['refinement_accepted'] is True
+            distance, heading = pose_error(h.supervisor.pose, h.backend.pose)
+            assert distance < .1 and heading < .05, log_path.read_text()
+        finally:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.wait(timeout=5)
+            # AMCL's latched /amcl_pose and map->odom TF must be gone before the
+            # next test's synthetic backend starts, or they seed its supervisor.
+            h.until(lambda: h.probe.count_publishers('/amcl_pose') == 0, timeout=15.)
 
 
 def test_manual_fresh_scans_cannot_reuse_one_amcl_pose_stamp(harnesses, monkeypatch):
@@ -1201,9 +1348,14 @@ def test_manual_verification_bounds_gradual_drift_from_a_fixed_anchor(harnesses)
     # scans with each changed map pose so rejection is about unstable pose,
     # not a deliberately inconsistent scan or stale transform.
     for index in range(1, 9):
+        before = h.supervisor.get_clock().now().nanoseconds
         h.backend.pose = (initial_pose[0] + .1*index, initial_pose[1], initial_pose[2])
         h.backend.ranges = h.backend.raycast()
-        h.spin(.16)
+        # Wait until the supervisor has judged a scan taken after this step. A
+        # fixed spin lets a loaded Jetson skip steps and judge only stale,
+        # mutually consistent observations (full-suite flake, 2026-10-24).
+        h.until(lambda: h.supervisor.last_checked_scan > before)
+        h.spin(.05)
         assert h.supervisor.pose_evidence()[1] is None
         assert h.supervisor.beam_phase == 'initialization'
         assert not h.backend.start_commands
@@ -1296,6 +1448,56 @@ def test_tracking_transient_soft_mismatch_preserves_ready_and_verified_prior(
     _assert_tracking_prior_retained(h, faults, saved)
 
 
+@pytest.mark.parametrize('offset,expect_ready', [(.7, True), (1.5, False)])
+def test_tracking_bounded_amcl_tf_jump_is_a_warning_and_a_large_one_closes_the_gate(
+        harnesses, monkeypatch, offset, expect_ready):
+    h, faults, saved = _ready_tracking_fixture(harnesses, monkeypatch)
+    original = h.backend.estimated_pose
+
+    def shifted(stamp=None):
+        # The published pose steps ahead of the TF the backend keeps broadcasting.
+        message = original(stamp)
+        message.pose.pose.position.x += offset
+        return message
+
+    monkeypatch.setattr(h.backend, 'estimated_pose', shifted)
+    h.spin(.6)
+    assert (h.supervisor.state == 'READY') is expect_ready
+    if expect_ready:
+        assert h.supervisor.tracking_warning and '지도 좌표 변환' in h.supervisor.tracking_warning
+        assert h.statuses[-1]['ready']
+    else:
+        assert '일치하지 않습니다' in h.supervisor.detail
+    monkeypatch.setattr(h.backend, 'estimated_pose', original)
+    h.until(lambda: h.supervisor.state == 'READY' and not h.supervisor.tracking_warning, timeout=6.)
+    _assert_tracking_prior_retained(h, faults, saved)
+
+
+def test_tracking_corridor_covariance_below_the_tracking_limit_raises_no_warning(harnesses, monkeypatch):
+    h, faults, saved = _ready_tracking_fixture(harnesses, monkeypatch)
+    original_pose = h.backend.estimated_pose
+
+    def corridor_pose(stamp=None):
+        pose = original_pose(stamp)
+        pose.pose.covariance[0] = pose.pose.covariance[7] = .39 ** 2  # above the 0.35 m admission limit
+        return pose
+
+    monkeypatch.setattr(h.backend, 'estimated_pose', corridor_pose)
+    h.spin(.8)
+    assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
+    assert h.supervisor.metrics['xy_std'] == pytest.approx(.39, abs=.01)
+    _assert_tracking_prior_retained(h, faults, saved)
+
+
+def test_tracking_match_ratio_between_tracking_and_admission_limits_raises_no_warning(harnesses, monkeypatch):
+    h, faults, saved = _ready_tracking_fixture(harnesses, monkeypatch)
+    faults.quality['match_ratio'] = .65  # below the 0.70 admission limit, above tracking's 0.60
+    h.spin(.8)
+    assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
+    assert h.supervisor.metrics['match_ratio'] == pytest.approx(.65)
+    _assert_tracking_prior_retained(h, faults, saved)
+
+
 @pytest.mark.parametrize('warning', ['match_ratio', 'known_ratio', 'xy_covariance', 'yaw_covariance'])
 def test_tracking_initial_confidence_limits_are_diagnostics_after_ready(
         harnesses, monkeypatch, warning):
@@ -1307,8 +1509,9 @@ def test_tracking_initial_confidence_limits_are_diagnostics_after_ready(
     def estimated_pose(stamp=None):
         pose = original_pose(stamp)
         if warning == 'xy_covariance':
-            # Exact threshold crossing that aborted the closed-loop Isaac run.
-            pose.pose.covariance[0] = pose.pose.covariance[7] = .352 ** 2
+            # Just past the tracking limit (0.6 m); the former 0.352 m crossing
+            # that aborted the closed-loop Isaac run is now inside it.
+            pose.pose.covariance[0] = pose.pose.covariance[7] = .61 ** 2
         elif warning == 'yaw_covariance':
             pose.pose.covariance[35] = .8
         return pose
@@ -1412,6 +1615,13 @@ def test_tracking_soft_warning_never_delays_a_hard_fault(harnesses, monkeypatch,
         faults.quality['origin_free'] = False
     else:
         faults.quality['valid_beams'] = 0
+    if fault in ('origin', 'valid_beams'):
+        # Scan-derived evidence is cached per scan/pose pair while READY; these
+        # faults can only arrive with a new scan, so release the frozen one.
+        frozen_stamp = navigation_startup.stamp_ns(h.backend.frozen_scan.header.stamp)
+        h.backend.frozen_scan = None
+        h.until(lambda: navigation_startup.stamp_ns(h.supervisor.scan_samples[-1][0].header.stamp) > frozen_stamp)
+        h.until(lambda: h.supervisor.state != 'READY')
     h.supervisor.tick()
     assert h.supervisor.state != 'READY'
     h.until(lambda: h.statuses and not h.statuses[-1]['ready'])

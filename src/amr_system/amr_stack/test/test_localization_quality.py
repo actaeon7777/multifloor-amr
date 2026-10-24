@@ -169,6 +169,35 @@ def test_rival_budget_exhaustion_never_means_unique():
     assert result.candidates_evaluated <= 10
 
 
+@pytest.mark.parametrize('hint_offset', [(.6, -.4, .35), (-.8, .3, -.4), (0., 0., 0.)])
+def test_refinement_recovers_a_rough_operator_click(hint_offset):
+    grid = room_grid()
+    pose = (2.05, 2.55, .1)
+    scan = synthetic_scan(grid, pose, count=180)
+    hint = tuple(p + o for p, o in zip(pose, hint_offset))
+    result = map_quality(grid).refine_pose(**scan, laser_pose=hint)
+    assert math.hypot(result.pose[0] - pose[0], result.pose[1] - pose[1]) < .06
+    assert abs((result.pose[2] - pose[2] + math.pi) % (2 * math.pi) - math.pi) < .03
+    assert result.quality.match_ratio > .95
+    assert result.quality.match_ratio >= result.hint_quality.match_ratio
+
+
+def test_refinement_stays_within_its_window_and_rotated_map_origin():
+    grid = room_grid()
+    origin = (1., -2., .3)
+    quality = map_quality(grid, origin=origin)
+    local = (2.05, 2.55, .1)
+    c, s = math.cos(origin[2]), math.sin(origin[2])
+    pose = (origin[0] + c*local[0] - s*local[1], origin[1] + s*local[0] + c*local[1], local[2] + origin[2])
+    scan = synthetic_scan(grid, local, count=180)
+    near = quality.refine_pose(**scan, laser_pose=(pose[0] + .3, pose[1], pose[2] - .2))
+    assert math.hypot(near.pose[0] - pose[0], near.pose[1] - pose[1]) < .06
+    # Too far for the window: the result never leaves it to reach the true pose.
+    far = (pose[0] + 2., pose[1], pose[2])
+    result = quality.refine_pose(**scan, laser_pose=far, position_window=.5)
+    assert math.hypot(result.pose[0] - pose[0], result.pose[1] - pose[1]) > 1.
+
+
 def test_invalid_map_geometry_and_scan_metadata_fail_explicitly():
     with pytest.raises(ValueError):
         MapQuality(2, 2, .1, 0., 0., 0., [0])

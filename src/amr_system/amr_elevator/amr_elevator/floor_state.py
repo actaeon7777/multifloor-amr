@@ -10,6 +10,9 @@ enclosure).  Rules (docs/ELEVATOR.md 4.2):
   different floor's beacon is RF leakage: flagged, never applied.
 * Beacons are filtered per device for staleness, duplicates and old sequence
   numbers.  Floor beacons heard while the car travels are ignored.
+* A stop at a pass floor (beacon installed, no map) is another passenger's stop:
+  the ride continues and the floor stays in transit.  Car beacon PRESENCE is only
+  device liveness and never moves the floor.
 * Crossing the door line needs the door to have been seen open; otherwise the
   zone becomes UNKNOWN (stop) until the operator sets the floor.
 * Leaving the car before the floor is confirmed by a beacon is a violation.
@@ -78,6 +81,8 @@ class _Timers:
     conflict_seen: float = None
     exit_time: float = None
     ready: bool = False
+    pass_stop: str = ''
+    unknown_codes: set = field(default_factory=set)
 
 
 class FloorStateMachine:
@@ -135,8 +140,7 @@ class FloorStateMachine:
             return 'ok'
         heard = self.building.floor_by_beacon_code(floor_code)
         if heard is None:
-            self._emit('UNKNOWN_BEACON', detail=f'floor code {floor_code}')
-            return 'unknown'
+            return self._unmapped_beacon(floor_code, rssi, now)
         if rssi != 0 and rssi < self.presence_min_rssi:
             return 'weak'
         s = self.state
@@ -160,6 +164,34 @@ class FloorStateMachine:
             self.t.conflict_seen = now
         return 'conflict'
 
+    def _unmapped_beacon(self, floor_code, rssi, now):
+        passing = self.building.pass_floor_by_beacon_code(floor_code)
+        if passing is None:
+            if floor_code not in self.t.unknown_codes:  # Once per code, not every second.
+                self.t.unknown_codes.add(floor_code)
+                self._emit('UNKNOWN_BEACON', detail=f'floor code {floor_code}')
+            return 'unknown'
+        if rssi != 0 and rssi < self.presence_min_rssi:
+            return 'weak'
+        s = self.state
+        if s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT':
+            if self.t.arrival_wait_since is None:
+                return 'ignored_in_transit'
+            # Someone else's stop at a floor without a map: keep riding, never assume
+            # the target from this door opening.
+            self.t.arrival_wait_since = None
+            if self.t.pass_stop != passing.name:
+                self.t.pass_stop = passing.name
+                self._emit('PASS_FLOOR_STOP', s.transit_from, passing.name,
+                           f'target {s.transit_to}; staying in the car')
+            return 'pass_floor'
+        if s.zone != ZONE_UNKNOWN:
+            if not s.floor_conflict:
+                self._emit('FLOOR_CONFLICT', s.floor, passing.name, 'pass floor beacon heard; not applied')
+            self.state = replace(self.state, floor_conflict=True)
+            self.t.conflict_seen = now
+        return 'conflict'
+
     def on_door(self, door_state, now):
         previous = self.t.door_state
         self.t.door_state = door_state
@@ -170,6 +202,7 @@ class FloorStateMachine:
             self.t.door_closed_since = None
         elif door_state == CLOSED and self.t.door_closed_since is None:
             self.t.door_closed_since = now
+            self.t.pass_stop = ''
         s = self.state
         if (s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT' and door_state == OPEN
                 and previous != OPEN and self.t.arrival_wait_since is None):

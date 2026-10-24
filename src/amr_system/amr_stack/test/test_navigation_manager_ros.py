@@ -20,6 +20,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.task import Future
 from std_msgs.msg import String
+from std_srvs.srv import SetBool
 
 from amr_stack.navigation_manager import NavigationManager
 
@@ -81,6 +82,7 @@ class Harness:
         self.status_enabled = ready
         self.status_ready = ready
         self.tracking_warning = ''
+        self.unready_state, self.prior_verified = 'VERIFYING', False
         self.generation = time.time_ns()
         self.status_timer = self.probe.create_timer(.1, self.publish_localization)
         self.topic_goal = self.probe.create_publisher(PoseStamped, '/goal_pose', 1)
@@ -89,14 +91,16 @@ class Harness:
                                       lambda m: self.outputs.append((time.monotonic(), m.linear.x)), 100)
         self.client = ActionClient(self.probe, NavigateToPose, '/navigate_to_pose')
         self.until(lambda: self.client.server_is_ready() and self.mode.get_subscription_count() > 0)
+        self.set_mode('AUTO')  # No LB takeover.
         if ready:
             self.until(self.manager.localization_ready)
 
     def publish_localization(self):
         if self.status_enabled:
             self.localization.publish(String(data=json.dumps({
-                'state': 'READY' if self.status_ready else 'VERIFYING',
+                'state': 'READY' if self.status_ready else self.unready_state,
                 'ready': self.status_ready, 'generation': self.generation,
+                'prior_verified': self.prior_verified,
                 'session': 'navigation_manager_test',
                 'detail': 'Synthetic test heartbeat', 'source': 'test',
                 'tracking_warning': self.tracking_warning,
@@ -165,16 +169,21 @@ def h():
         harness.close()
 
 
-def test_pause_resume_replacement_cancel_and_terminal_results(h):
-    handle, result = h.goal()
-    h.spin()
-    assert not h.backend.runs
-    assert h.manager.last_status == 'WAITING_AUTO'
-    h.assert_zero()
+def hold_dispatch(h):
+    """Keep an accepted goal from reaching Nav2 until the next explicit tick."""
+    h.manager.backend.server_is_ready = lambda: False
+    _, result = h.goal()
+    del h.manager.backend.server_is_ready
+    h.manager.tick()
+    assert h.manager.run is not None and h.manager.run.handle is None
+    return result
 
-    h.set_mode('AUTO')
+
+def test_manual_takeover_aborts_goal_and_auto_never_resumes_it(h):
+    handle, result = h.goal()
     h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
     assert len(h.backend.runs) == 1
+    assert h.manager.last_status == 'RUNNING'
     # Controller silence and invalid commands may never replay the last speed.
     h.backend.emit = False
     h.spin(.25)
@@ -186,93 +195,92 @@ def test_pause_resume_replacement_cancel_and_terminal_results(h):
     h.until(lambda: h.outputs[-1][1] == .3)
 
     h.set_mode('MANUAL')
+    response = h.wait(result)
+    assert response.status == GoalStatus.STATUS_ABORTED
+    assert '수동 조작' in response.result.error_msg
     h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
-    assert not result.done()
     h.assert_zero()  # Backend deliberately keeps producing old commands.
-    h.set_mode('AUTO')
-    h.spin(.2)
-    assert len(h.backend.runs) == 1  # Wait for terminal result, not just cancel ACK.
-    h.assert_zero()
     h.backend.finish(0)
-    h.until(lambda: len(h.backend.runs) == 2)
-    assert h.backend.runs[1]['handle'].request.pose.pose.position.x == 2.
-    h.until(lambda: h.outputs[-1][1] == .3)
-
-    replacement, replacement_result = h.goal(3.)
-    assert h.wait(result).status == GoalStatus.STATUS_ABORTED
-    h.until(lambda: h.backend.runs[1]['handle'].is_cancel_requested)
+    h.until(lambda: h.manager.run is None)
+    h.spin(.1)
+    assert h.manager.last_status == 'MANUAL'
+    rejected, _ = h.goal()
+    assert not rejected.accepted
+    h.set_mode('AUTO')
+    h.spin()
+    assert len(h.backend.runs) == 1
+    assert h.manager.last_status == 'OVERRIDDEN'
     h.assert_zero()
-    assert len(h.backend.runs) == 2
-    h.backend.finish(1)
-    h.until(lambda: len(h.backend.runs) == 3)
-    assert h.backend.runs[2]['handle'].request.pose.pose.position.x == 3.
-    h.wait(replacement.cancel_goal_async())
-    h.until(lambda: h.backend.runs[2]['handle'].is_cancel_requested)
-    h.assert_zero()
-    h.backend.finish(2)
-    assert h.wait(replacement_result).status == GoalStatus.STATUS_CANCELED
-    h.set_mode('MANUAL'); h.set_mode('AUTO'); h.spin()
-    assert len(h.backend.runs) == 3
 
     _, success = h.goal(1.)
-    h.until(lambda: len(h.backend.runs) == 4)
-    h.backend.finish(3)
+    h.until(lambda: len(h.backend.runs) == 2)
+    assert h.backend.runs[1]['handle'].request.pose.pose.position.x == 1.
+    h.backend.finish(1)
     assert h.wait(success).status == GoalStatus.STATUS_SUCCEEDED
     h.assert_zero()
     h.set_mode('MANUAL'); h.set_mode('AUTO'); h.spin()
-    assert len(h.backend.runs) == 4
-    _, failure = h.goal(4.)
-    h.until(lambda: len(h.backend.runs) == 5)
-    h.backend.finish(4, success=False)
-    assert h.wait(failure).status == GoalStatus.STATUS_ABORTED
-    h.set_mode('MANUAL'); h.set_mode('AUTO'); h.spin()
-    assert len(h.backend.runs) == 5
-    h.assert_zero()
+    assert len(h.backend.runs) == 2
 
 
-def test_paused_goal_replacement_cancel_topic_input_and_invalid_goal(h):
+def test_replacement_cancel_topic_input_and_invalid_goal(h):
     old, old_result = h.goal(1.)
+    h.until(lambda: len(h.backend.runs) == 1)
     new, new_result = h.goal(2.)
     assert h.wait(old_result).status == GoalStatus.STATUS_ABORTED
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.assert_zero()
+    assert len(h.backend.runs) == 1  # Wait for terminal result, not just cancel ACK.
+    h.backend.finish(0)
+    h.until(lambda: len(h.backend.runs) == 2)
+    assert h.backend.runs[1]['handle'].request.pose.pose.position.x == 2.
     h.wait(new.cancel_goal_async())
+    h.until(lambda: h.backend.runs[1]['handle'].is_cancel_requested)
+    h.assert_zero()
+    h.backend.finish(1)
     assert h.wait(new_result).status == GoalStatus.STATUS_CANCELED
-    h.set_mode('AUTO'); h.spin()
-    assert not h.backend.runs
     bad, _ = h.goal(frame='odom')
     assert not bad.accepted
     bad, _ = h.goal(x=float('nan'))
     assert not bad.accepted
-    h.set_mode('MANUAL')
     pose = PoseStamped()
     pose.header.frame_id = 'map'
     pose.pose.position.x = 5.
     pose.pose.orientation.w = 1.
     h.until(lambda: h.topic_goal.get_subscription_count() > 0)
+    h.set_mode('MANUAL')
     h.topic_goal.publish(pose)
-    h.until(lambda: h.manager.desired is not None)
-    h.spin(); assert not h.backend.runs
+    h.spin()
+    assert h.manager.desired is None and len(h.backend.runs) == 2
     h.set_mode('AUTO')
-    h.until(lambda: len(h.backend.runs) == 1)
-    assert h.backend.runs[0]['handle'].request.pose.pose.position.x == 5.
-    h.backend.finish(0)
+    h.topic_goal.publish(pose)
+    h.until(lambda: len(h.backend.runs) == 3)
+    assert h.backend.runs[2]['handle'].request.pose.pose.position.x == 5.
+    h.backend.finish(2)
     h.until(lambda: h.manager.desired is None)
 
 
-def test_pause_before_backend_goal_acknowledgement(h):
-    _, result = h.goal()
+def test_manual_takeover_before_backend_goal_acknowledgement(h):
+    result = hold_dispatch(h)
     # Exercise the actual mode callback before the internal action response arrives.
-    h.manager.on_mode(String(data='AUTO'))
-    h.manager.tick()
-    assert h.manager.run is not None and h.manager.run.handle is None
     h.manager.on_mode(String(data='MANUAL'))
+    assert h.wait(result).status == GoalStatus.STATUS_ABORTED
     h.manager.on_mode(String(data='AUTO'))
     h.until(lambda: h.backend.runs and h.backend.runs[0]['handle'].is_cancel_requested)
     h.assert_zero()
-    assert len(h.backend.runs) == 1 and not result.done()
     h.backend.finish(0)
-    h.until(lambda: len(h.backend.runs) == 2)
-    h.backend.finish(1)
-    assert h.wait(result).status == GoalStatus.STATUS_SUCCEEDED
+    h.spin()
+    assert len(h.backend.runs) == 1 and h.manager.desired is None
+
+
+def test_manual_rejects_maneuver_lease(h):
+    h.set_mode('MANUAL')
+    response = h.manager.on_maneuver_lease(SetBool.Request(data=True), SetBool.Response())
+    assert not response.success and not h.manager.lease_active()
+    h.set_mode('AUTO')
+    response = h.manager.on_maneuver_lease(SetBool.Request(data=True), SetBool.Response())
+    assert response.success and h.manager.lease_active()
+    h.set_mode('MANUAL')
+    assert not h.manager.lease_active()
 
 
 def test_cancel_topic_goal_without_nav2_rviz_panel(h):
@@ -282,21 +290,17 @@ def test_cancel_topic_goal_without_nav2_rviz_panel(h):
     pose = PoseStamped()
     pose.header.frame_id = 'map'
     pose.pose.orientation.w = 1.0
-    for mode in ('MANUAL', 'AUTO'):
-        h.set_mode(mode)
-        h.until(lambda: h.topic_goal.get_subscription_count() > 0)
-        h.topic_goal.publish(pose)
-        h.until(lambda: h.manager.desired is not None)
-        if mode == 'AUTO':
-            h.until(lambda: len(h.backend.runs) == 1)
-        response = h.wait(cancel.call_async(CancelGoal.Request()))
-        assert response.return_code == CancelGoal.Response.ERROR_NONE
-        assert len(response.goals_canceling) == 1
-        if mode == 'AUTO':
-            h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
-            h.backend.finish(0)
-        h.until(lambda: h.manager.desired is None and h.manager.run is None)
-        h.assert_zero()
+    h.until(lambda: h.topic_goal.get_subscription_count() > 0)
+    h.topic_goal.publish(pose)
+    h.until(lambda: h.manager.desired is not None)
+    h.until(lambda: len(h.backend.runs) == 1)
+    response = h.wait(cancel.call_async(CancelGoal.Request()))
+    assert response.return_code == CancelGoal.Response.ERROR_NONE
+    assert len(response.goals_canceling) == 1
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.backend.finish(0)
+    h.until(lambda: h.manager.desired is None and h.manager.run is None)
+    h.assert_zero()
     h.set_mode('MANUAL')
     h.set_mode('AUTO')
     h.spin()
@@ -328,10 +332,7 @@ def test_missing_status_rejects_public_action_and_topic_goals():
 
 
 def test_readiness_loss_before_backend_ack_cancels_without_resuming(h):
-    _, result = h.goal()
-    h.manager.on_mode(String(data='AUTO'))
-    h.manager.tick()
-    assert h.manager.run is not None and h.manager.run.handle is None
+    result = hold_dispatch(h)
     h.set_ready(False, new_generation=True)
     assert h.wait(result).status == GoalStatus.STATUS_ABORTED
     h.until(lambda: h.backend.runs and h.backend.runs[0]['handle'].is_cancel_requested)
@@ -345,12 +346,9 @@ def test_readiness_loss_before_backend_ack_cancels_without_resuming(h):
     h.assert_zero()
 
 
-@pytest.mark.parametrize('mode', ['MANUAL', 'AUTO'])
-def test_stale_heartbeat_aborts_goal_and_recovery_never_resumes_it(h, mode):
-    h.set_mode(mode)
+def test_stale_heartbeat_aborts_goal_and_recovery_never_resumes_it(h):
     _, result = h.goal()
-    if mode == 'AUTO':
-        h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
+    h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
     h.status_enabled = False
     h.spin(h.manager.settings['localization_status_timeout'] + .15)
     assert h.wait(result).status == GoalStatus.STATUS_ABORTED
@@ -358,16 +356,13 @@ def test_stale_heartbeat_aborts_goal_and_recovery_never_resumes_it(h, mode):
     h.assert_zero()
     rejected, _ = h.goal()
     assert not rejected.accepted
-    if mode == 'AUTO':
-        h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
     # A live heartbeat in the same generation may recover the gate, but cannot
     # recover an old user goal. Backend cancellation must still reach terminal.
     h.set_ready(True)
-    if mode == 'AUTO':
-        h.backend.finish(0)
-    h.set_mode('AUTO')
+    h.backend.finish(0)
     h.spin()
-    assert len(h.backend.runs) == (1 if mode == 'AUTO' else 0)
+    assert len(h.backend.runs) == 1
     h.assert_zero()
 
 
@@ -513,6 +508,57 @@ def test_backend_failure_details_reach_public_result(h):
     assert response.result.error_msg == 'Synthetic planner failure'
 
 
+@pytest.mark.parametrize('state', ['WAITING_DATA', 'VERIFYING'])
+def test_verified_tracker_recheck_holds_the_goal_and_resumes_it(h, state):
+    h.set_mode('AUTO')
+    h.prior_verified = True
+    _, future = h.goal()
+    h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
+    h.unready_state = state
+    h.set_ready(False)
+    h.spin(.5)
+    assert h.manager.desired is not None and not h.backend.runs[0]['handle'].is_cancel_requested
+    assert h.manager.last_status == 'WAITING_NAV2'
+    h.assert_zero()
+    h.set_ready(True)
+    h.until(lambda: h.outputs[-1][1] == .3)
+    assert len(h.backend.runs) == 1 and h.manager.readiness_lost_at is None
+    h.backend.finish(0)
+    assert h.wait(future).status == GoalStatus.STATUS_SUCCEEDED
+
+
+def test_tracker_recheck_hold_expires_into_an_abort(h, monkeypatch):
+    monkeypatch.setitem(h.manager.settings, 'localization_hold_grace', .4)
+    h.set_mode('AUTO')
+    h.prior_verified = True
+    _, future = h.goal()
+    h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
+    h.unready_state = 'WAITING_DATA'
+    h.set_ready(False)
+    h.spin(.2)
+    assert h.manager.desired is not None
+    response = h.wait(future)
+    assert response.status == GoalStatus.STATUS_ABORTED
+    assert '위치 준비 조건 해제' in response.result.error_msg
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.backend.finish(0)
+    h.assert_zero()
+
+
+@pytest.mark.parametrize('reason', ['unverified', 'new_generation', 'failed_state'])
+def test_other_readiness_losses_still_abort_at_once(h, reason):
+    h.set_mode('AUTO')
+    h.prior_verified = reason != 'unverified'
+    _, future = h.goal()
+    h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
+    h.unready_state = 'FAILED' if reason == 'failed_state' else 'WAITING_DATA'
+    h.set_ready(False, new_generation=reason == 'new_generation')
+    assert h.wait(future).status == GoalStatus.STATUS_ABORTED
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.backend.finish(0)
+    h.assert_zero()
+
+
 def test_localization_abort_explains_readiness_loss(h):
     h.set_mode('AUTO')
     handle, future = h.goal()
@@ -524,3 +570,67 @@ def test_localization_abort_explains_readiness_loss(h):
     assert 'Synthetic test heartbeat' in response.result.error_msg
     h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
     h.backend.finish(0)
+
+
+def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h):
+    h.manager.require_estop = True
+    qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    publisher = h.probe.create_publisher(String, '/estop/status', qos)
+    estop = {'state': 'DISARMED', 'epoch': 0, 'sequence': 0}
+
+    def publish():
+        estop['sequence'] += 1
+        state = estop['state']
+        publisher.publish(String(data=json.dumps(dict(
+            session='estop_test', sequence=estop['sequence'], epoch=estop['epoch'],
+            stamp=time.time(), state=state, healthy=state in ('READY', 'BYPASS'),
+            latched=state in ('UNKNOWN', 'ESTOP', 'DISARMED')))))
+    timer = h.probe.create_timer(.05, publish)
+
+    def set_state(state, epoch=None):
+        if epoch is not None:
+            estop['epoch'] = epoch
+        estop['state'] = state
+        h.until(lambda: h.manager.estop.status.get('state') == state)
+
+    set_state('DISARMED')
+    rejected, _ = h.goal()
+    assert not rejected.accepted  # A clear STM32 alone is not a restart.
+    set_state('READY')
+    _, result = h.goal()
+    h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
+
+    # A closed drive gate (ARMING) only holds the goal at zero velocity.
+    set_state('ARMING')
+    h.assert_zero()
+    assert not result.done()
+    set_state('READY')
+    h.until(lambda: h.outputs[-1][1] == .3)
+
+    set_state('ESTOP', epoch=1)
+    response = h.wait(result)
+    assert response.status == GoalStatus.STATUS_ABORTED
+    assert 'E-stop' in response.result.error_msg
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.assert_zero()
+    h.backend.finish(0)
+    h.until(lambda: h.manager.run is None)
+    h.spin(.1)
+    assert h.manager.last_status == 'ESTOP'
+    set_state('DISARMED')
+    rejected, _ = h.goal()
+    assert not rejected.accepted
+    lease = h.probe.create_client(SetBool, '/navigation/maneuver_lease')
+    assert not h.wait(lease.call_async(SetBool.Request(data=True))).success
+    set_state('READY')
+    h.spin()
+    assert len(h.backend.runs) == 1  # Never resumed after approval.
+    h.assert_zero()
+
+    # A lost status stream is treated as an E-stop.
+    _, result = h.goal(1.)
+    h.until(lambda: len(h.backend.runs) == 2)
+    timer.cancel()
+    response = h.wait(result)
+    assert response.status == GoalStatus.STATUS_ABORTED
+    assert 'E-stop' in response.result.error_msg

@@ -22,9 +22,9 @@ floors:
   "3F":
     level: 3
     beacon_floor_code: 3
-    provisional_copy_of: "4F"
-    real_enabled: false              # 실측 지도 전까지 실차 층간 이동 금지
-    map: maps/G_3_floor/3_floor_tmp_from_4F.yaml
+    real_enabled: true               # 2026-10-24 실차 시험(홀 호출~카 안 정렬) 통과 후 켜 둠. 카 비콘 설치 전에는 카 안 SELECT_FLOOR에서 NO_CAR_ACK로 안전 정지 → LB로 수동 회수
+    # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_3_floor/MAP_SOURCE.md)
+    map: maps/G_3_floor/3_floor_1006.yaml
     annotations: maps/G_3_floor/3_floor_tmp_from_4F(영역지정).png
     sim_map: maps/sim_floor3/floor3.yaml
     sim_layer: sim/layers/3_floor_tmp_from_4F_map.usda
@@ -89,13 +89,13 @@ floors:
   "5F":
     level: 5
     beacon_floor_code: 5
-    provisional_copy_of: "4F"
-    real_enabled: false
-    map: maps/G_5_floor/5_floor_tmp_from_4F.yaml
+    real_enabled: false              # 엘리베이터 실차 시험 전까지 실차 층간 이동 금지
+    # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_5_floor/MAP_SOURCE.md)
+    map: maps/G_5_floor/5_floor_1006.yaml
     annotations: maps/G_5_floor/5_floor_tmp_from_4F(영역지정).png
     sim_map: maps/sim_floor5/floor5.yaml
     sim_layer: sim/layers/5_floor_tmp_from_4F_map.usda
-    spawn: [11.5, 3.31, 0.0]
+    spawn: [12.05, 3.31, 0.0]          # 실측 지도의 홀 물체(11.6, 3.2)를 0.3 m 이상 피함
     elevators:
       E1:
         door_center: [9.975, 3.31]
@@ -118,6 +118,15 @@ floors:
       "513-앞문": {goal: [15.0, 19.66, 3.141593], door: [14.03, 19.66]}
       "513-뒷문": {goal: [15.2, 9.16, 3.141593], door: [14.23, 9.16]}
       "514": {goal: [15.58, 20.52, 1.5708], door: [15.58, 21.49]}
+
+# 지도 없는 통과층. 홀 비콘(RF node 0x40 + 층)은 1–7F에 설치돼 있다(docs/ELEVATOR_RF_PROTOCOL.md §6.2).
+# 여기 층에 카가 서면 "다른 층"으로 보고 계속 탑승한다. 목적지로는 고를 수 없다.
+# 실측 지도가 생기면 floors로 옮기고 여기서 지운다. level·beacon_floor_code는 floors와 겹치면 안 된다.
+pass_floors:
+  "1F": {level: 1, beacon_floor_code: 1}
+  "2F": {level: 2, beacon_floor_code: 2}
+  "6F": {level: 6, beacon_floor_code: 6}
+  "7F": {level: 7, beacon_floor_code: 7}
 
 # 시뮬레이션 전용 임시값 (실측 아님)
 sim:

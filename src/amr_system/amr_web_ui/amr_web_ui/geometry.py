@@ -51,10 +51,26 @@ class Grid:
         self.data = list(data)
         self.costmap = costmap
         self.version = 0
+        self._png = None
         self.refresh()
 
     def refresh(self):
+        # Only bump the version; the PNG is encoded when a client asks for it.
+        # Encoding on every costmap update was 9 % of the bridge's CPU.
         self.version += 1
+        self._png = None
+
+    @property
+    def png(self):
+        if self._png is None:
+            self._png = self.render()
+        return self._png
+
+    @png.setter
+    def png(self, value):
+        self._png = value
+
+    def render(self):
         size = (self.info['width'], self.info['height'])
         raw = array('b', self.data).tobytes()
         if self.costmap:
@@ -67,7 +83,7 @@ class Grid:
         image = image.transpose(getattr(Image, 'Transpose', Image).FLIP_TOP_BOTTOM)
         output = io.BytesIO()
         image.save(output, format='PNG')
-        self.png = output.getvalue()
+        return output.getvalue()
 
     def update(self, x, y, width, height, data):
         if (x < 0 or y < 0 or width <= 0 or height <= 0 or

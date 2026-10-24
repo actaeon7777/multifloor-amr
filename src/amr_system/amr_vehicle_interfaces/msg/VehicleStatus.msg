@@ -44,6 +44,16 @@ amr_vehicle_interfaces/DataStatus time_status
 bool time_healthy
 bool time_fault_latched
 string time_detail
+# E-stop interlock from cmd_vel_to_can (/estop/status, STM32 0x202).
+# estop_state: UNKNOWN|ESTOP|DISARMED|ARMING|READY|BYPASS; UNKNOWN when not fresh.
+amr_vehicle_interfaces/DataStatus estop_status
+string estop_state
+bool estop_approval_required
+bool estop_button_pressed
+bool estop_stm32_stopped
+bool estop_drive_enabled
+uint32 estop_trip_count
+string estop_detail
 
 # Counter values are valid only with a fresh diagnostics sample.
 uint8 diagnostic_level

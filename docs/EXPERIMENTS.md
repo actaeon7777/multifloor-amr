@@ -7,6 +7,56 @@
 > `diagnostics/`는 Jetson 작업공간, 나머지는 시뮬레이션 PC 작업공간에 있다. 아래 경로는 그 기준이다.
 > 시뮬레이션 수치는 실물 보정 전 모델(`calibration_status: uncalibrated`)의 결과이며 실차 성능으로 확정하지 않는다.
 
+## 2026-10-24 · 실차 엘리베이터 통합 시험 (4F 홀 호출 ~ 카 안 정렬)
+
+- 조건: `experiment.sh real`에 `start_elevator_link:=true elevator_link_dry_run:=false`, 3F `real_enabled: true`. 설치 비콘은 4F 홀 비콘뿐(카 E1 없음).
+  4F 401에서 3F 301(1차)·302(2차)를 목적지로 2회. 원자료 `diagnostics/elevator_real/2026-10-24_run1_2.log`.
+- 홀 대기 위치 도착 76·73초. `HALL_CALL 4F ▼` → COMPLETED(PRESSED)·BUTTON_ACK 1.0·0.9초, 두 번 모두 첫 RF 시도 성공, rx_bad·tx_fail 0.
+  사람이 누르지 않았는데 ▼ 램프가 켜지고 문이 열렸다(명령 후 8.0·3.7초).
+- 탑승: 2차는 한 번에 4.0초 만에 카 안. 1차는 문턱 직전 문 판별이 OPEN↔CLOSING으로 흔들려 "문턱 전 문 닫힘" 후진 → 홀 복귀 → 재호출 후 성공.
+  카 벽 정합 수렴 후 RMS 6 mm, 카 안 180° 정렬 7.2·3.1초.
+- 종료: 카 비콘이 없어 `SELECT_FLOOR`에서 `NO_CAR_ACK` 안전 정지(설계대로). 카 대상 열림 명령은 RF_TIMEOUT으로 비치명 처리.
+- 남은 것:
+  - 문 판별 중간 상태(OPENING/CLOSING) 안정화. 지금은 확인 스캔 없이 즉시 바뀐다.
+  - 비콘 세기: 홀 대기 위치 BUTTON_ACK가 −80 등급(RPD=0)이었다. 실제 운행의 도착 판정(문 열림 + 홀 비콘 ≥ −70)이 안 될 수 있어,
+    출력을 올린 뒤 RF §9.2로 측정해야 한다.
+  - 카 안 종료 뒤 위치 추정이 SUSPENDED로 남는 것, 스택 재시작 시 현재 층 `ASSUMED`로 미션이 거절되는 것(웹에서 재개·층 지정 필요).
+- 시험 후 3F `real_enabled`는 `true`로 유지했다. 카 비콘 설치 전에 3F 목적지를 보내면 카 안에서 안전 정지하고, LB로 수동 회수한다.
+
+## 2026-10-23 · 실차 CAN 점검과 STM32 윤거 수정
+
+- 수동 주행 중 "재개 승인 필요"가 반복된 원인은 Jetson `can0` bus-off였다(3.6분 주행에 101회, 커널 로그는 대부분 Bit0 Error).
+  bus-off → `0x202` 수신 0.5초 공백 → `status_timeout` E-stop. 소프트웨어가 아니라 배선(커넥터·GND 기준·종단) 의심.
+- 같은 날 Jetson이 아무것도 송신하지 않는 동안에도 Stuff/Format/Bit0 오류 묶음이 짧게 났다(18:45, 18:46). Jetson 송신만의 문제는 아니다.
+- 바퀴를 띄운 6분 주행(격리 도메인에서 `control_mux` AUTO + 브리지 + 수신 노드, 0.1–0.9 m/s, ±0.9 m/s 급반전, 0.8 m/s 40초 유지):
+  bus 오류·bus-off 0, `0x201` 50 ms(최대 52 ms), `0x202`·IMU 100 ms(최대 약 101 ms), 엔코더 10 ms(최대 11 ms), E-stop 상태 READY 유지.
+  직진·후진 추종은 명령과 0.1% 이내였다. 지면 하중·진동·LiDAR·조이스틱이 없는 조건이라 수동 주행 bus-off는 재현되지 않았다.
+- 같은 시험에서 회전 속도가 명령의 0.944배였다. 받은 최신 펌웨어 `main.c`의 `DRIVE_TRACK_WIDTH_DEFAULT_M`이 0.499(v80 이전 윤거)였기 때문이다.
+  0.529로 고쳐 업로드한 뒤 제자리 회전 ±0.4·±0.8 rad/s와 원호에서 0.999–1.002배가 됐다.
+- 남은 것: 바닥 주행(전체 스택)에서 bus-off 재현과 배선 점검.
+
+## 2026-10-20 · LB 끼어들기 모드 (RB 토글 제거)
+
+- 자율주행에 블루투스 조이스틱 연결과 RB 입력이 필요하던 구조를 바꿨다. 기본은 AUTO이고 조이스틱 연결·끊김은 모드에 영향이 없다.
+  LB가 눌린 `/joy`를 받는 즉시 MANUAL(자율 정지, 목표 `OVERRIDDEN`·층간 미션 `MANUAL_OVERRIDE`, 수동 입력 대기),
+  마지막 LB 입력 0.5초(`manual_holdoff`) 뒤 AUTO. 중단된 목표는 재개하지 않고 새 목적지가 필요하다.
+- 같은 날 먼저 "연결 = MANUAL" 방식을 구현·시험했으나, 끼어들려면 컨트롤러 전원 ON·Bluetooth 연결(수 초)이 필요하고
+  범위 가장자리 재연결이 주행 목표를 엉뚱하게 취소할 수 있어 LB 기준으로 바꿨다.
+- `joy_autoselect`는 같은 이름 컨트롤러가 하나면 이름으로 joy_node를 실행한다. 실차에서 Bluetooth 재연결 후 joy_node 재시작 없이
+  `/joy`가 재개되는 것을 확인했다. 무입력 `/joy`는 설정 20 Hz가 아니라 약 13~15 Hz였다(0.5초 판정에는 충분).
+- Jetson 자동 시험(가상 `/joy`, 격리 도메인, 차량 IO 없음): 패키지 단위 시험(amr_control 123, amr_stack 115, amr_web_ui 78,
+  amr_elevator 23, amr_remote_bridge 32, amr_can_bridge 68, amr_sim_bridge 45), gjs 2개, Control_Server 61개,
+  `scripts/test_ros_integration.py` 11개 묶음, 엘리베이터 기동 2개, 시간 복구 2개 통과.
+  엘리베이터 미션 7개 중 `test_same_floor_goal_waits_for_localization_recovery` 1개는 미션 실패로 끝나는 다른 시험 뒤에서만 실패하며,
+  수정 전 커밋(HEAD)에서도 같은 조합이 3/3 실패해 기존 시험 간섭으로 분리했다(미해결).
+  러너 도중 시간 초과로 남은 `amcl` 고아 프로세스(도메인 194)가 이후 `navigation_startup` 시험을 방해한 일이 있어 정리 후 90/90 통과.
+- 실제 Xbox 컨트롤러 dry-run 시험(LiDAR 미연결이라 joy→joy_teleop→control_mux→cmd_vel_to_can만, 시간 상태 검사 해제,
+  가짜 `/cmd_vel_auto` 0.10 m/s): 연결 → AUTO 유지·출력 유지 / LB → 즉시 MANUAL·0, 한 번 누름으로 수동 입력 대기 /
+  LB + 스틱 → 수동(상한 0.97 m/s) / LB 해제 → 0.1초 수동 정지, 0.4초 뒤 AUTO·자율 재출력 / 전원 OFF → AUTO·출력 유지 /
+  LB 누른 채 전원 ON → MANUAL·18초간 0, 해제 후 재입력으로 수동 / LB 누른 채 전원 OFF → 끊기기 직전 컨트롤러가 LB 해제를 보내
+  0.2초 만에 수동 정지, 0.5초 뒤 AUTO(2회 동일).
+- 미실행: Isaac 시뮬레이션 주행(별도 PC), 실제 CAN 송신·바퀴 구동, 웹 UI·Nav2 목표를 포함한 실차 전체 스택(LiDAR 미연결).
+
 ## 2026-10-16 · RotationShim: 목표에서의 반복 회전과 느린 정렬 회전
 
 - `rotate_to_heading_once: true`: 경로가 10초마다 갱신(`nav_to_pose_with_consistent_replanning...`, 시뮬레이션에서 10.7초 간격)될 때마다

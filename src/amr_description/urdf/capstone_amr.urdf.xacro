@@ -361,12 +361,14 @@
     <origin xyz="0 0 0" rpy="0 0 3.141592653589793"/>
   </joint>
 
-  <!-- LSM6DSV16X chip centre measured in CAD; axes match base_link. -->
+  <!-- LSM6DSV16X chip centre measured in CAD (v119 board position, 2026-10-23);
+       axes match base_link. The EKF fuses only gyro Z, so this offset does
+       not change the fused yaw rate. -->
   <link name="imu_link"/>
   <joint name="imu_joint" type="fixed">
     <parent link="base_link"/>
     <child link="imu_link"/>
-    <origin xyz="0.160 0.0035 0.016" rpy="0 0 0"/>
+    <origin xyz="0.097 0 0.021" rpy="0 0 0"/>
   </joint>
 
   <!--

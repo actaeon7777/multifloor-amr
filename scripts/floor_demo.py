@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Watch multi-floor missions in the Isaac Sim GUI (stacked building, domain 107).
 
-Starts ``experiment.sh sim world:=building`` with the Isaac window, switches to AUTO
-with the same synthetic Joy heartbeat as run_sim_trial.py, then sends the given
+Starts ``experiment.sh sim world:=building`` with the Isaac window, waits for AUTO
+(no joystick is started) as in run_sim_trial.py, then sends the given
 floor/room goals in order through /floor_mission/navigate and prints each phase.
 The simulation keeps running afterwards until Ctrl-C.
 

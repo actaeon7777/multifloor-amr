@@ -11,6 +11,11 @@
   let width = 1, height = 1, lastFrame = 0, lastNotice = '', lastRequest = null, headingOverride = false;
   let localizationRequest = null;
   let lastStateAt = 0;
+  // Restart approval is a two-step gesture: arm, then confirm within APPROVE_CONFIRM_MS.
+  const APPROVE_CONFIRM_MS = 3000;
+  let approveArmedUntil = 0;
+  const rfCommandLabels = {RF_TIMEOUT:'버튼 무선 전달 지연 · 재시도', NO_RESULT:'버튼 응답 없음 · 재시도',
+    DEVICE_REJECTED:'비콘이 버튼 명령을 거절', NO_ROUTE:'대상 비콘 없음', BAD_FRAME:'버튼 명령 형식 오류'};
   // Multi-floor: floorsInfo from /api/floors; viewFloor is the floor whose map is shown.
   let floorsInfo = null, viewFloor = null, shownCurrentFloor = null, floorPolls = 0;
   const floorImages = {}, floorLoading = {};
@@ -20,12 +25,15 @@
     RELOCALIZE:'위치 재확인', NAV_TO_GOAL:'목적지로 이동', SUCCEEDED:'층간 이동 완료', FAILED_SAFE:'안전 정지',
     CANCELED:'층간 이동 취소'};
   const terminal = new Set(['SUCCEEDED', 'CANCELED', 'FAILED', 'REJECTED']);
-  const navigationLabels = {IDLE:'목적지 선택', WAITING_AUTO:'출발 대기', WAITING_NAV2:'주행 준비 중',
-    RUNNING:'이동 중', PAUSED:'일시정지', STOPPING:'주행 종료 처리 중',
+  const navigationLabels = {IDLE:'목적지 선택', WAITING_NAV2:'주행 준비 중',
+    RUNNING:'이동 중', STOPPING:'주행 종료 처리 중', MANUAL:'수동 조작 중', OVERRIDDEN:'수동 조작으로 중단됨', ESTOP:'E-stop으로 중단됨',
     SUCCEEDED:'도착했습니다', CANCELED:'주행 취소됨', FAILED:'이동하지 못했습니다', UNKNOWN:'로봇 연결 대기'};
-  const details = {IDLE:'지도에서 이동할 위치를 터치하세요.', WAITING_AUTO:'목표가 보관되어 있습니다. 주행 허용을 기다립니다.',
+  const details = {IDLE:'지도에서 이동할 위치를 터치하세요.',
     WAITING_NAV2:'목표까지의 주행을 준비하고 있습니다.', RUNNING:'선택한 목적지로 이동하고 있습니다.',
-    PAUSED:'목표를 유지하고 있습니다.', STOPPING:'진행 중인 주행을 종료하고 있습니다.',
+    STOPPING:'진행 중인 주행을 종료하고 있습니다.',
+    MANUAL:'조이스틱 LB로 수동 조작 중입니다. LB를 놓으면 목적지를 지정할 수 있습니다.',
+    OVERRIDDEN:'수동 조작(LB)으로 주행을 중단했습니다. 목적지를 다시 지정하세요.',
+    ESTOP:'E-stop으로 주행을 중단했습니다. 재개 승인 후 목적지를 다시 지정하세요.',
     SUCCEEDED:'새 목적지를 선택할 수 있습니다.', CANCELED:'새 목적지를 선택할 수 있습니다.',
     FAILED:'위치와 경로를 확인한 후 다시 선택해 주세요.', UNKNOWN:'내비게이션 데이터를 기다리고 있습니다.'};
   const localizationLabels = {WAITING_DATA:'센서 수신 대기', SEARCHING:'자동 위치 찾는 중',
@@ -61,19 +69,37 @@
   }
   function canResetLocation() {
     const v = state?.velocity;
-    return !['WAITING_AUTO','WAITING_NAV2','RUNNING','PAUSED','STOPPING'].includes(state?.navigation) &&
+    return !['WAITING_NAV2','RUNNING','STOPPING','MANEUVER'].includes(state?.navigation) &&
       !['SENDING','ACCEPTED','CANCELING'].includes(state?.goal?.status) &&
       stateAge(v) < 2 && Math.abs(v.linear) <= .02 && Math.abs(v.angular) <= .03;
+  }
+  // The bridge lease (age + time since this poll) must be live; never approve from a stale view.
+  function estopLive() {
+    const e = state?.estop;
+    return Boolean(e?.fresh && stateAge(e) < (e.timeout ?? .6));
+  }
+  function estopError() {
+    const e = state?.estop;
+    if (!e?.required || (e.healthy && estopLive())) return null;
+    return e.error || 'E-stop 상태를 받지 못했습니다. CAN 브릿지 연결을 확인하세요.';
   }
   function commandError(kind) {
     if (!connected || busy || state?.pending_request) return '이전 요청을 처리 중이거나 연결을 기다리고 있습니다.';
     if (state?.preview || kind === 'cancel') return null;
+    if (kind === 'estop_approve' && state?.remote)
+      return '원격 화면에서는 재개를 승인할 수 없습니다. 로봇 현장(웹 UI 또는 조이스틱)에서 승인하세요.';
+    if (kind === 'estop_approve')
+      return estopLive() && state.estop.approval_required ? null : '지금은 재개를 승인할 수 없습니다. E-stop 상태를 확인하세요.';
+    if (kind === 'goal' && estopError()) return estopError();
+    if (kind === 'goal' && state?.mode === 'MANUAL')
+      return '수동 조작(LB) 중이라 자율주행 명령을 받을 수 없습니다. LB를 놓은 뒤 목적지를 다시 지정하세요.';
+    if (kind === 'goal' && state?.mode !== 'AUTO') return '제어 모드 수신을 기다리고 있습니다.';
     if (kind === 'goal' && (!localized() || !state.action_ready || stateAge(state.robot) >= 2 || state.tf_error))
       return '위치 확인과 주행 준비가 완료될 때까지 기다려 주세요.';
     if (kind === 'goal' && viewingOther() && !state.floor_action_ready)
       return '층간 이동 관리자 연결을 기다리고 있습니다.';
     if (kind === 'goal' && viewingOther() && !floorInfo(viewFloor)?.selectable)
-      return `${viewFloor}은 임시 지도라 실차 층간 이동이 꺼져 있습니다.`;
+      return `${viewFloor}은 실차 층간 이동이 꺼져 있습니다.`;
     if (kind === 'initialpose' && viewingOther()) return '초기 위치는 현재 층 지도에서만 지정할 수 있습니다.';
     if (kind === 'goal' && ['SENDING','CANCELING'].includes(state?.goal?.status))
       return '이전 목표 요청을 처리 중입니다. 잠시 기다려 주세요.';
@@ -124,9 +150,13 @@
     $('cancel').disabled = !connected || busy || !goal ||
       !(state.preview ? goal.status === 'PREVIEW' : goal.status === 'ACCEPTED');
     $('heading').disabled = busy;
+    $('estop-approve').disabled = Boolean(commandError('estop_approve'));
     $('relocalize').disabled = Boolean(commandError('relocalize')) || pending ||
       (!state?.preview && (localizationRequest || state?.localization_reset_pending ||
         (state?.localization?.age < 2 && ['SEARCHING','VERIFYING','STARTING_NAVIGATION'].includes(state.localization.state))));
+    const last = state?.localization?.last_pose;
+    $('last-pose').hidden = !connected || Boolean(state?.preview) || !last || localized() || viewingOther();
+    $('last-pose').disabled = Boolean(commandError('initialpose')) || pending || !activeMap().info;
   }
   function updateSidebar() {
     const s = state, goal = s.goal;
@@ -136,7 +166,8 @@
     let status = s.navigation;
     if (goal?.status === 'SENDING') status = 'SENDING';
     else if (goal?.status === 'CANCELING') status = 'STOPPING';
-    else if (terminal.has(goal?.status)) status = goal.status;
+    // A manual (LB) override or E-stop outranks the aborted goal's FAILED result.
+    else if (terminal.has(goal?.status) && !['MANUAL','OVERRIDDEN','ESTOP'].includes(s.navigation)) status = goal.status;
     if (s.preview) {
       $('nav-status').textContent = '목표를 선택하세요';
       $('nav-detail').textContent = '실제 저장 지도로 터치 조작을 확인합니다.';
@@ -174,8 +205,47 @@
         CANCELING:'취소 중', FAILED:'실패', REJECTED:'거절됨', PREVIEW:'미리보기'}[goal.status] || '선택됨';
     }
     updateFloorUi();
+    updateEstop();
     window.AMRDashboard?.update(s, connected, connectionIssue);
     updateControls();
+  }
+  function updateEstop() {
+    const e = state?.estop, banner = $('estop-banner');
+    // Shown only when the bridge interlock is required and not READY (or bypassed).
+    const visible = Boolean(connected && !state?.preview && e?.required && !(e.healthy && estopLive()));
+    banner.hidden = !visible;
+    if (!visible) return;
+    const live = estopLive(), lost = ['status_timeout', 'invalid_status'].includes(e.reason);
+    const remote = Boolean(state?.remote);
+    const [tone, title, detail] = !live ? ['warn', 'E-stop 상태 수신 없음',
+        '로봇의 E-stop 상태를 받지 못했습니다. 상태가 복구될 때까지 주행할 수 없습니다.'] :
+      e.state === 'ESTOP' ? ['danger', lost ? 'E-stop 상태 수신 끊김 · 정지' : 'E-stop 눌림',
+        lost ? 'STM32 상태가 끊겨 정지했습니다. CAN 연결을 확인하세요.' : '버튼을 원위치로 돌리면 재개 승인을 할 수 있습니다.'] :
+      e.state === 'DISARMED' ? ['danger', 'E-stop 해제됨 — 주변 확인 후 재개 승인 필요', remote ?
+        '재개 승인은 로봇 현장에서만 할 수 있습니다(로봇 웹 UI 또는 조이스틱 승인 버튼 2초).' :
+        '로봇 주변이 안전한지 확인하고 재개 승인을 두 번 누르세요(또는 LB를 뗀 채 조이스틱 승인 버튼을 2초). ' +
+        '승인 후에도 새 목적지나 조작으로만 움직입니다.'] :
+      e.state === 'ARMING' ? ['info', '주행 준비 중', '재개가 승인되었습니다. STM32 주행 준비를 기다리고 있습니다.'] :
+      ['warn', 'E-stop 상태 확인 중', e.detail || 'STM32 E-stop 상태를 기다리고 있습니다.'];
+    banner.className = `estop-banner ${tone}`;
+    $('estop-title').textContent = title;
+    $('estop-detail').textContent = detail;
+    $('estop-approve').hidden = remote || !(live && ['ESTOP', 'DISARMED'].includes(e.state));
+    const armed = performance.now() < approveArmedUntil && e.state === 'DISARMED';
+    if (!armed) approveArmedUntil = 0;
+    $('estop-approve').textContent = armed ? '다시 눌러 승인' : '재개 승인';
+  }
+  function approveClicked() {
+    const blocked = commandError('estop_approve');
+    if (blocked) { approveArmedUntil = 0; activity(blocked, true); updateEstop(); return; }
+    if (performance.now() < approveArmedUntil) {
+      approveArmedUntil = 0;
+      command('estop_approve');
+    } else {
+      approveArmedUntil = performance.now() + APPROVE_CONFIRM_MS;
+      activity('로봇 주변이 안전한지 확인한 뒤 3초 안에 한 번 더 누르면 재개를 승인합니다.');
+    }
+    updateEstop();
   }
   function updateFloorUi() {
     const current = currentFloor();
@@ -196,8 +266,12 @@
     line.hidden = !visible;
     if (visible) {
       const route = mission.start_floor && mission.goal_floor ? `${mission.start_floor} → ${mission.goal_floor}${mission.goal_room ? ' ' + roomLabel(mission.goal_room) : ''} · ` : '';
+      const press = state.elevator?.last_command;
+      const pressNote = press && press.age < 10 && rfCommandLabels[press.status] &&
+        !['SUCCEEDED', 'FAILED_SAFE', 'CANCELED'].includes(mission.phase) ? ` · ${rfCommandLabels[press.status]}` : '';
       line.textContent = `층간 이동: ${route}${missionLabels[mission.phase] || mission.phase}` +
-        (state.floor?.zone === 2 ? ' · 엘리베이터 안' : '') + (mission.detail && mission.phase === 'FAILED_SAFE' ? ` (${mission.detail})` : '');
+        (state.floor?.zone === 2 ? ' · 엘리베이터 안' : '') + pressNote +
+        (mission.detail && mission.phase === 'FAILED_SAFE' ? ` (${mission.detail})` : '');
     }
   }
   function renderFloorTabs() {
@@ -207,7 +281,7 @@
     tabs.replaceChildren(...floors.map(f => {
       const b = document.createElement('button');
       b.type = 'button'; b.dataset.floor = f.name; b.textContent = f.name;
-      b.title = f.selectable ? (f.provisional ? '임시 지도(4층 복사본)' : '') : '실차 층간 이동 비활성(임시 지도)';
+      b.title = f.selectable ? (f.provisional ? '임시 지도(4층 복사본)' : '') : '실차 층간 이동 비활성';
       b.disabled = !f.selectable && f.name !== currentFloor();
       b.addEventListener('click', () => { viewFloor = f.name; renderFloorTabs(); fitted = false; fit(); updateSidebar(); });
       return b;
@@ -316,14 +390,16 @@
     const request_id = requestId(); lastRequest = request_id;
     if (!state.preview && ['initialpose','relocalize'].includes(kind)) localizationRequest = request_id;
     busy = true; updateControls();
-    activity(kind === 'cancel' ? '목표 취소를 요청하고 있습니다.' : kind === 'relocalize' ?
+    activity(kind === 'estop_approve' ? '재개 승인을 요청하고 있습니다.' :
+      kind === 'cancel' ? '목표 취소를 요청하고 있습니다.' : kind === 'relocalize' ?
       '자동 위치 찾기를 요청하고 있습니다.' : '선택한 위치를 전송하고 있습니다.');
     try {
       const response = await fetch(`/api/${kind}`, {method:'POST',
         headers:{'Content-Type':'application/json', 'X-AMR-Request':'1'},
         body:JSON.stringify({request_id, ...(kind === 'relocalize' ? {map_version:state.layers.map?.version} :
           kind === 'goal' && floorsEnabled() ? {...pose, floor:viewFloor, room:pose.room || ''} :
-          kind === 'goal' ? {x:pose.x, y:pose.y, yaw:pose.yaw, map_version:pose.map_version} : pose || {})}),
+          // The server accepts floor/room only on goals; a tapped pose carries the viewed floor.
+          ['goal','initialpose'].includes(kind) ? {x:pose.x, y:pose.y, yaw:pose.yaw, map_version:pose.map_version} : pose || {})}),
         signal:AbortSignal.timeout(5000)});
       const result = await response.json();
       if (!response.ok) {
@@ -333,6 +409,7 @@
       activity(result.status === 'PREVIEW' ? '목표 미리보기입니다. 실제 주행 명령은 전송하지 않았습니다.' :
         kind === 'initialpose' ? '초기 위치 전송을 요청했습니다.' :
         kind === 'relocalize' ? '자동 위치 찾기를 요청했습니다. 위치 확인 완료를 기다려 주세요.' :
+        kind === 'estop_approve' ? '재개 승인을 요청했습니다. 로봇 응답을 기다립니다.' :
         kind === 'cancel' ? '취소 요청을 접수했습니다. 완료 응답을 기다립니다.' : '목표를 전송했습니다. 로봇의 접수 응답을 기다립니다.');
       if (kind === 'initialpose' || (kind === 'cancel' && state.preview)) {
         selected=null; $('goal-x').textContent='—'; $('goal-y').textContent='—';
@@ -493,6 +570,11 @@
   $('send').addEventListener('click',()=>{if(selected)command(mode==='initialpose'?'initialpose':'goal',selected);});
   $('cancel').addEventListener('click',()=>command('cancel'));
   $('relocalize').addEventListener('click',()=>command('relocalize'));
+  // Only previews the saved pose; the operator still confirms with '초기 위치 적용'.
+  $('last-pose').addEventListener('click',()=>{const last=state?.localization?.last_pose,info=activeMap().info;
+    if(!last||!info)return;setMode('initialpose');setSelected({x:last.x,y:last.y,yaw:last.yaw,map_version:info.version});
+    activity('마지막으로 확인된 위치를 표시했습니다. 지도에서 로봇 위치와 맞으면 ‘초기 위치 적용’을 누르세요.');});
+  $('estop-approve').addEventListener('click',approveClicked);
   $('fit').addEventListener('click',fit);$('zoom-in').addEventListener('click',()=>zoom(1.3));$('zoom-out').addEventListener('click',()=>zoom(1/1.3));
   $('follow').addEventListener('click',()=>{follow=!follow;$('follow').classList.toggle('active',follow);$('follow').setAttribute('aria-pressed',String(follow));});
   $('select-goal')?.addEventListener('click',()=>{setMode('goal');canvas.focus();});

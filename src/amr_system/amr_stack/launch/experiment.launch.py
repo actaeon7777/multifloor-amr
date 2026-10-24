@@ -33,7 +33,10 @@ def launch_mode(context):
 
     world = LaunchConfiguration('world').perform(context)
     default_map = f'maps/sim_{world}/{world}.yaml' if sim else 'maps/G_4_floor/4_floor_0522.yaml'
-    elevator = LaunchConfiguration('elevator').perform(context) or ('true' if world == 'building' else 'false')
+    # Real: the floor monitor feeds the web floor tabs and room list; floors with
+    # real_enabled false are still refused and the CAN elevator link stays off.
+    elevator = LaunchConfiguration('elevator').perform(context) or (
+        'true' if world == 'building' or not sim else 'false')
     if elevator not in ('true', 'false'):
         raise ValueError('elevator must be true or false')
     start_floor = LaunchConfiguration('start_floor').perform(context)
@@ -68,6 +71,9 @@ def launch_mode(context):
             'joy_device_id': LaunchConfiguration('joy_device_id'),
             'can_dry_run': LaunchConfiguration('can_dry_run'),
             'control_config': LaunchConfiguration('control_config'),
+            # Real elevator RF relay (CAN 0x210/0x310/0x311); off unless asked.
+            'start_elevator_link': LaunchConfiguration('start_elevator_link'),
+            'elevator_link_dry_run': LaunchConfiguration('elevator_link_dry_run'),
         }),
         include('localization', {'map': map_path}),
         include('navigation', {
@@ -87,7 +93,7 @@ def launch_mode(context):
             Node(package='amr_elevator', executable='elevator_monitor', name='elevator_monitor',
                  parameters=[{**params, 'initial_floor': start_floor}], output='screen'),
             Node(package='amr_elevator', executable='floor_mission_manager', name='floor_mission_manager',
-                 parameters=[{**params, 'simulation': sim}], output='screen'),
+                 parameters=[{**params, 'simulation': sim, 'require_estop': not sim}], output='screen'),
         ]
         if sim:
             actions.append(Node(package='amr_sim_bridge', executable='elevator_sim_relay',
@@ -108,12 +114,16 @@ def generate_launch_description():
         DeclareLaunchArgument('seed', default_value='0'),
         DeclareLaunchArgument('headless', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('can_dry_run', default_value='false'),
+        DeclareLaunchArgument('start_elevator_link', default_value='false', choices=['true', 'false'],
+                              description='Run elevator_can_link (real RF relay over can0).'),
+        DeclareLaunchArgument('elevator_link_dry_run', default_value='true', choices=['true', 'false'],
+                              description='true: preview 0x210 only; false: transmit and press real buttons.'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
         DeclareLaunchArgument('map', default_value=''),
         DeclareLaunchArgument('start_floor', default_value='',
                               description='world:=building only: floor the AMR starts on (default floors.yaml default_floor)'),
         DeclareLaunchArgument('elevator', default_value='',
-                              description='Multi-floor elevator nodes; empty = true only for world:=building'),
+                              description='Multi-floor elevator nodes; empty = true for mode:=real and world:=building'),
         DeclareLaunchArgument('control_config', default_value=str(share / 'config/control_mux.yaml')),
         DeclareLaunchArgument('navigation_config', default_value=str(share / 'config/navigation.yaml')),
         DeclareLaunchArgument('startup_config', default_value=str(share / 'config/localization_startup.yaml')),

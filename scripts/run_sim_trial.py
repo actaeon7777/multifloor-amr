@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One isolated physical Nav2 trial. Synthetic Joy is strictly limited to domain 107."""
+"""One isolated physical Nav2 trial in domain 107. No /joy is published, so control_mux is AUTO."""
 import argparse
 import json
 import hashlib
@@ -19,7 +19,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import Odometry, Path as NavPath
 from nav2_msgs.action import NavigateToPose
-from sensor_msgs.msg import Joy, LaserScan
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
 from rclpy.time import Time
@@ -35,7 +35,6 @@ class Trial(Node):
     def __init__(self, spawn=(0., 0., 0.)):
         super().__init__('sim_trial', parameter_overrides=[Parameter('use_sim_time', value=True)])
         self.spawn = spawn
-        self.joy_pub=self.create_publisher(Joy,'/joy',10)
         self.pose_pub=self.create_publisher(PoseWithCovarianceStamped,'/initialpose',10)
         self.action=ActionClient(self,NavigateToPose,'/navigate_to_pose')
         self.truth=None; self.odom=None; self.scan=None; self.mode=''; self.sim_status={}; self.recoveries=0
@@ -53,7 +52,7 @@ class Trial(Node):
             self.create_subscription(String,'/sim/status',lambda m:setattr(self,'sim_status',json.loads(m.data)),QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)),
             self.create_subscription(String,'/localization/status',lambda m:setattr(self,'localization_status',json.loads(m.data)),QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)),
         ]
-        self.rb=False; self.previous_joy=0.; self.previous_sample=0.
+        self.previous_sample=0.
 
     def command(self,msg):
         self.cmd=(msg.linear.x,msg.angular.z)
@@ -64,10 +63,6 @@ class Trial(Node):
         while time.monotonic()<end:
             rclpy.spin_once(self,timeout_sec=.01)
             now=time.monotonic()
-            if now-self.previous_joy>=.05:
-                self.previous_joy=now
-                joy=Joy();joy.axes=[0.]*4;joy.buttons=[0]*8;joy.buttons[7]=int(self.rb)
-                self.joy_pub.publish(joy)
             if self.truth and now-self.previous_sample>=.05:
                 self.previous_sample=now
                 estimate=None
@@ -102,8 +97,7 @@ class Trial(Node):
             pose.pose.covariance[0]=.01;pose.pose.covariance[7]=.01;pose.pose.covariance[35]=.01
             self.pose_pub.publish(pose);self.spin(.3)
         self.until(lambda:self.tf.can_transform('map','base_footprint',Time()),20)
-        self.spin(.3);self.rb=True;self.spin(.15);self.rb=False
-        self.until(lambda:self.mode=='AUTO',3)
+        self.until(lambda:self.mode=='AUTO',3)  # No joystick connected.
         self.until(lambda:self.action.server_is_ready(),30)
         for name in ('amcl','planner_server','controller_server','behavior_server','bt_navigator'):
             client=self.create_client(GetState,f'/{name}/get_state')
@@ -230,7 +224,6 @@ def main():
     except Exception as exc:
         report['error']=str(exc)
     finally:
-        # Stop synthetic Joy first. No real transport can be running in this mode.
         node.destroy_node();rclpy.shutdown()
         if process.poll() is None:
             os.killpg(process.pid,signal.SIGINT)

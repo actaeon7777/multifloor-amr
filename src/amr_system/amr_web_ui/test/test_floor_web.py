@@ -33,7 +33,8 @@ def test_floor_list_rooms_and_maps(shared):
     assert [f['name'] for f in info['floors']] == ['3F', '4F', '5F']
     assert info['current_floor'] == '4F' and info['default_floor'] == '4F'
     third = info['floors'][0]
-    assert third['provisional'] and third['selectable'] and not third['real_enabled']
+    assert not third['provisional'] and third['selectable'] and third['real_enabled']
+    assert not info['floors'][2]['real_enabled']  # 5F: no real-vehicle transit yet
     assert [r['id'] for r in third['rooms']][:2] == ['301', '302']
     assert third['map']['width'] == 1014 and third['map']['resolution'] == .05
     versions = {f['name']: f['map']['version'] for f in info['floors']}
@@ -62,16 +63,17 @@ def test_cross_floor_goal_validation(shared):
         goal(shared, '3F', request='floor_goal_04')
 
 
-def test_real_vehicle_blocks_provisional_floors_and_unready_missions(shared):
+def test_real_vehicle_blocks_disabled_floors_and_unready_missions(shared):
     shared.state['preview'] = False
     shared.simulation = False
-    with pytest.raises(ApiError, match='임시 지도'):
-        goal(shared, '3F')
+    with pytest.raises(ApiError, match='실차 층간 이동이 꺼져'):
+        goal(shared, '5F')
     shared.simulation = True
     now = time.time()
     shared.update_localization(json.dumps(dict(state='READY', ready=True, detail='ok', source='manual',
                                                stamp=now, generation=1, session='s')))
-    shared.state.update(action_ready=True, robot=dict(x=0, y=0, yaw=0, received_at=time.monotonic()))
+    shared.state.update(action_ready=True, mode='AUTO',
+                        robot=dict(x=0, y=0, yaw=0, received_at=time.monotonic()))
     assert shared.readiness_error('floor_goal') == '층간 이동 관리자에 연결되지 않았습니다.'
     shared.state['floor_action_ready'] = True
     shared.state['floor'] = dict(zone=2, floor='4F', confidence='BEACON')
@@ -104,3 +106,54 @@ def test_http_floor_endpoints(shared):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def rf_status(**overrides):
+    status = dict(
+        live=True, level='WARN', problems=['1F 비콘 배터리 부족 (2100 mV)'],
+        link=dict(radio_ok=True, rx_overflow=False, tx_timeout=False, rx_ok=40, rx_bad=0,
+                  tx_fail=1, pending=0, age=0.4),
+        beacons=[
+            dict(node_id=0x21, label='E1', role='car', floor_code=0, presence_age=0.5,
+                 rssi_dbm=-60, battery_mv=3000, flags=['HAS_DOOR_OPEN'], fw_version=1),
+            dict(node_id=0x44, label='4F', role='hall', floor_code=4, presence_age=0.2,
+                 rssi_dbm=-60, battery_mv=3010, flags=['HAS_UP', 'HAS_DOWN'], fw_version=1),
+            dict(node_id=0x41, label='1F', role='hall', floor_code=1, presence_age=None,
+                 battery_mv=2100, flags=['BATT_LOW', 'HAS_UP'], fw_version=1, device_age=3.),
+            dict(node_id=0x4F, label='15F', role='hall', floor_code=15, presence_age=9.,
+                 rssi_dbm=True, battery_mv='x'),
+        ], last_command=None, session='link', sequence=3, stamp=time.time())
+    status.update(overrides)
+    return json.dumps(status)
+
+
+def test_elevator_rf_panel_lists_every_installed_beacon(shared):
+    elevator = shared.snapshot()['elevator']
+    assert not elevator['received'] and not elevator['fresh']
+    # 1F-7F hall beacons (3F-5F mapped, the rest pass floors) and the car beacon.
+    assert [(b['label'], b['mapped'], b['heard']) for b in elevator['beacons']] == [
+        ('E1', True, False), ('1F', False, False), ('2F', False, False), ('3F', True, False),
+        ('4F', True, False), ('5F', True, False), ('6F', False, False), ('7F', False, False)]
+    assert shared.update_elevator_rf(rf_status())
+    shared.update_elevator_command(0x15, 3, 0x82, 0x44, 1, 'can')
+    elevator = shared.snapshot()['elevator']
+    assert elevator['fresh'] and elevator['level'] == 'WARN' and elevator['link']['rx_ok'] == 40
+    rows = {b['label']: b for b in elevator['beacons']}
+    assert rows['4F']['heard'] and rows['4F']['rssi_dbm'] == -60
+    assert rows['1F']['flags'] == ['BATT_LOW', 'HAS_UP'] and rows['1F']['mapped'] is False
+    assert not rows['2F']['heard']
+    stray = rows['15F']  # Heard but not in floors.yaml; bad types are dropped.
+    assert stray['heard'] and 'rssi_dbm' not in stray and 'battery_mv' not in stray
+    command = elevator['last_command']
+    assert (command['status'], command['device_result'], command['target']) == \
+        ('DEVICE_REJECTED', 'UNSUPPORTED', 0x44)
+    shared.elevator_rf_received -= 5
+    stale = shared.snapshot()['elevator']
+    assert not stale['fresh'] and stale['level'] is None and stale['link'] is None
+    assert not shared.update_elevator_rf('{"level": "BAD"}')
+    assert not shared.update_elevator_rf('garbage')
+
+
+def test_pass_floors_are_not_destinations(shared):
+    names = [f['name'] for f in shared.floors_info()['floors']]
+    assert names == ['3F', '4F', '5F']

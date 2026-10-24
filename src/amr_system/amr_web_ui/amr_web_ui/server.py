@@ -18,11 +18,38 @@ from .telemetry import DisplayTelemetry
 
 LOCALIZATION_STATES = {'WAITING_DATA', 'SEARCHING', 'VERIFYING', 'WAITING_INITIAL_POSE',
                        'STARTING_NAVIGATION', 'READY', 'FAILED', 'SUSPENDED'}
-ACTIVE_NAVIGATION = {'WAITING_AUTO', 'WAITING_NAV2', 'RUNNING', 'PAUSED', 'STOPPING', 'MANEUVER'}
+ACTIVE_NAVIGATION = {'WAITING_NAV2', 'RUNNING', 'STOPPING', 'MANEUVER'}
 FLOOR_MISSION_ACTIVE = {'NAV_TO_HALL', 'CALL_ELEVATOR', 'WAIT_DOOR_OPEN', 'BOARDING', 'BACKING_OUT',
                         'IN_CAR_ALIGN', 'SELECT_FLOOR', 'RIDING', 'SWITCH_MAP', 'ALIGHTING',
                         'RETURN_TO_CAR', 'RELOCALIZE', 'NAV_TO_GOAL'}
 ACTIVE_GOALS = {'SENDING', 'ACCEPTED', 'CANCELING'}
+ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'DISARMED', 'ARMING', 'READY', 'BYPASS'}
+ESTOP_STM32_KEYS = ('raw', 'debounced', 'latched', 'inhibit', 'odrv_idle', 'bus_off', 'odrv_hb_ok',
+                    'drive_enabled', 'stopped', 'trip_count', 'release_count', 'reset_rejected', 'sequence')
+# /elevator/rf_status is published at 1 Hz (elevator_can_link); allow two misses.
+ELEVATOR_RF_TIMEOUT = 3.
+RF_LEVELS = {'OK', 'WARN', 'ERROR'}
+RF_LINK_KEYS = {'radio_ok': bool, 'rx_overflow': bool, 'tx_timeout': bool, 'rx_ok': int,
+                'rx_bad': int, 'tx_fail': int, 'pending': int}
+RF_BEACON_KEYS = {'node_id': int, 'label': str, 'role': str, 'floor_code': int,
+                  'presence_age': (int, float), 'rssi_dbm': int, 'battery_mv': int,
+                  'fw_version': int, 'device_age': (int, float)}
+COMMAND_STATUS_NAMES = {1: 'DELIVERED', 2: 'COMPLETED', 3: 'DEVICE_REJECTED', 4: 'RF_TIMEOUT',
+                        5: 'NO_RESULT', 6: 'NO_ROUTE', 7: 'BAD_FRAME', 8: 'REPLACED'}
+DEVICE_RESULT_NAMES = {0x00: 'PRESSED', 0x01: 'DUPLICATE', 0x81: 'WRONG_DEVICE', 0x82: 'UNSUPPORTED',
+                       0x83: 'BUTTON_FAULT', 0x84: 'BAD_REQUEST', 0xFF: 'NONE'}
+
+
+def _typed(source, keys):
+    """Copy whitelisted keys whose value has the expected type (bool is not an int here)."""
+    result = {}
+    for key, kind in keys.items():
+        value = source.get(key)
+        if value is None or (isinstance(value, bool) and kind is not bool):
+            continue
+        if isinstance(value, kind) and (not isinstance(value, float) or math.isfinite(value)):
+            result[key] = value[:40] if isinstance(value, str) else value
+    return result
 
 
 class ApiError(Exception):
@@ -45,6 +72,13 @@ class SharedState:
         self.localization_order = SessionOrder()
         self.time_health = HealthLease()
         self.require_time_health = False
+        # /estop/status from cmd_vel_to_can; a stale or missing lease blocks goals.
+        self.estop = HealthLease()
+        self.require_estop = False
+        # Elevator RF relay health (/elevator/rf_status) and the last command status.
+        self.elevator_rf = None
+        self.elevator_rf_received = -math.inf
+        self.elevator_command = None
         self.connection_epoch = 0
         self.telemetry = DisplayTelemetry()
         # Multi-floor (floors.yaml); None when the elevator packages are absent.
@@ -80,6 +114,11 @@ class SharedState:
                 raise ValueError('Invalid localization tracking diagnostics')
             status.update(tracking_warning=warning[:1000], prior_verified=prior_verified,
                           tracking_bad_samples=bad_samples, tracking_bad_duration=bad_duration)
+            # Advisory only: a malformed saved pose is dropped, never trusted.
+            last = value.get('last_pose')
+            keys = ('x', 'y', 'yaw', 'saved_at')
+            status['last_pose'] = ({k: float(last[k]) for k in keys} if isinstance(last, dict) and all(
+                type(last.get(k)) in (int, float) and math.isfinite(last[k]) for k in keys) else None)
             stamp, generation, session = value.get('stamp'), value.get('generation'), value.get('session')
             if (not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not math.isfinite(stamp)
                     or not isinstance(generation, int) or isinstance(generation, bool)
@@ -118,6 +157,113 @@ class SharedState:
                     self.state['localization_reset_pending'] = False
             status['received_at'] = time.monotonic()
             self.state['localization'] = status
+
+    def update_estop(self, text):
+        with self.lock:
+            accepted = self.estop.receive(text)
+            if accepted and self.estop.status.get('state') not in ESTOP_STATES:
+                self.estop.status = {}
+            return accepted
+
+    def update_elevator_rf(self, text):
+        """Keep only typed, whitelisted fields; anything malformed is dropped."""
+        try:
+            value = json.loads(text, parse_constant=lambda _s: None)
+            if not isinstance(value, dict) or value.get('level') not in RF_LEVELS:
+                raise ValueError('invalid RF status')
+            link = value.get('link')
+            beacons = value.get('beacons') if isinstance(value.get('beacons'), list) else []
+            status = dict(
+                level=value['level'], live=value.get('live') is True,
+                problems=[str(p)[:200] for p in value.get('problems', [])[:16]
+                          if isinstance(p, str)] if isinstance(value.get('problems'), list) else [],
+                link=dict(_typed(link, RF_LINK_KEYS), age=link.get('age') if type(link.get('age')) in (int, float) else None)
+                if isinstance(link, dict) else None,
+                beacons=[])
+            for beacon in beacons[:32]:
+                if not isinstance(beacon, dict):
+                    continue
+                entry = _typed(beacon, RF_BEACON_KEYS)
+                flags = beacon.get('flags')
+                entry['flags'] = ([str(f)[:20] for f in flags[:8]] if isinstance(flags, list) else None)
+                if 'node_id' in entry and 'label' in entry:
+                    status['beacons'].append(entry)
+        except (ValueError, TypeError, AttributeError):
+            return False
+        with self.lock:
+            self.elevator_rf, self.elevator_rf_received = status, time.monotonic()
+        return True
+
+    def update_elevator_command(self, cmd_seq, status, device_result, target, attempts, source):
+        with self.lock:
+            self.elevator_command = dict(
+                cmd_seq=cmd_seq, status=COMMAND_STATUS_NAMES.get(status, str(status)),
+                device_result=DEVICE_RESULT_NAMES.get(device_result, f'0x{device_result:02X}'),
+                target=target, attempts=attempts, source=source[:8], received_at=time.monotonic())
+
+    def expected_beacons(self):
+        """Every installed beacon: floors with a map, pass floors (no map) and the car."""
+        if self.building is None:
+            return []
+        rows = [dict(label=f.name, floor_code=f.beacon_floor_code, level=f.level, role='hall', mapped=mapped)
+                for floors, mapped in ((self.building.floors, True),
+                                       (getattr(self.building, 'pass_floors', {}), False))
+                for f in floors.values() if isinstance(getattr(f, 'beacon_floor_code', None), int)]
+        rows.sort(key=lambda r: r['level'])
+        cars = [dict(label=elevator, role='car', mapped=True)
+                for elevator in getattr(self.building, 'elevators', {})]
+        return cars + rows
+
+    def elevator_snapshot(self, now):
+        with self.lock:
+            rf, received = deepcopy(self.elevator_rf), self.elevator_rf_received
+            command = dict(self.elevator_command) if self.elevator_command else None
+            expected = self.expected_beacons()
+        if command is not None:
+            command['age'] = max(0., now - command.pop('received_at'))
+        if rf is None and command is None and not expected:
+            return None
+        fresh = rf is not None and 0 <= now - received < ELEVATOR_RF_TIMEOUT
+        heard = {}
+        for beacon in (rf or {}).get('beacons', []):
+            key = 'E1' if beacon.get('role') == 'car' else beacon.get('floor_code')
+            heard[key] = beacon
+        rows = []
+        for row in expected:
+            beacon = heard.pop('E1' if row['role'] == 'car' else row['floor_code'], None)
+            rows.append({**row, **(beacon or {}), 'label': row['label'], 'heard': beacon is not None})
+        rows += [{**b, 'mapped': False, 'heard': True} for b in heard.values()]  # Not in floors.yaml.
+        return dict(
+            received=rf is not None, fresh=fresh, timeout=ELEVATOR_RF_TIMEOUT,
+            age=max(0., now - received) if math.isfinite(received) else None,
+            live=bool(rf and rf['live']), level=rf['level'] if fresh else None,
+            problems=rf['problems'] if fresh else [], link=rf['link'] if fresh else None,
+            beacons=rows, last_command=command)
+
+    def estop_live(self, now=None):
+        """Latest bridge status while its lease is alive, else None."""
+        now = time.monotonic() if now is None else now
+        status = self.estop.status
+        if status and 0 <= now-self.estop.received < self.estop.timeout:
+            return status
+        return None
+
+    def estop_error(self, now=None):
+        if not self.require_estop or self.estop.healthy(now):
+            return None
+        status = self.estop_live(now)
+        state = status.get('state') if status else None
+        if state == 'ESTOP':
+            if status.get('reason') in ('status_timeout', 'invalid_status'):
+                return 'STM32 E-stop 상태 수신이 끊겨 정지했습니다. CAN 연결을 확인하세요.'
+            return 'E-stop이 눌려 있습니다. 버튼을 원위치로 돌린 뒤 재개를 승인하세요.'
+        if state == 'DISARMED':
+            return 'E-stop이 해제되었습니다. 주변을 확인하고 재개를 승인한 뒤 목적지를 지정하세요.'
+        if state == 'ARMING':
+            return '재개 승인 후 주행 준비 중입니다. 잠시 후 다시 시도하세요.'
+        if state == 'UNKNOWN':
+            return 'STM32 E-stop 상태를 기다리고 있습니다.'
+        return 'E-stop 상태를 받지 못했습니다. CAN 브릿지 연결을 확인하세요.'
 
     def reset_connection(self, reason):
         """Invalidate display/request state; never replay a command after restart."""
@@ -217,6 +363,14 @@ class SharedState:
             if pending and pending['request_id'] != request_id:
                 return '이전 요청을 처리 중입니다. 잠시 기다려 주세요.'
             if kind in ('goal', 'floor_goal'):
+                estop = self.estop_error()
+                if estop:
+                    return estop
+                if self.state['mode'] == 'MANUAL':
+                    return ('수동 조작(LB) 중이라 자율주행 명령을 받을 수 없습니다. '
+                            'LB를 놓은 뒤 목적지를 다시 지정하세요.')
+                if self.state['mode'] != 'AUTO':
+                    return '제어 모드 수신을 기다리고 있습니다.'
                 if self.require_time_health and not self.time_health.healthy():
                     return '로봇의 시간·센서 상태를 확인하고 있습니다. ' + self.time_health.status.get('detail', '')
                 localization = self.state['localization']
@@ -244,7 +398,7 @@ class SharedState:
             elif kind in ('initialpose', 'relocalize'):
                 if (self.state['navigation'] in ACTIVE_NAVIGATION
                         or (self.state.get('goal') or {}).get('status') in ACTIVE_GOALS):
-                    return '보관·일시정지 중인 목표도 취소한 뒤 위치를 다시 설정해 주세요.'
+                    return '진행 중인 목표를 취소한 뒤 위치를 다시 설정해 주세요.'
                 velocity = self.state['velocity']
                 if not velocity or time.monotonic()-velocity['received_at'] >= 2:
                     return '정지 상태를 확인할 수 없습니다. 속도 데이터 수신을 기다려 주세요.'
@@ -254,11 +408,26 @@ class SharedState:
                 goal = self.state.get('goal')
                 if not goal or goal['status'] != 'ACCEPTED':
                     return '이 웹에서 실행한 취소 가능한 목표가 없습니다.'
+            elif kind == 'estop_approve':
+                status = self.estop_live()
+                if not status:
+                    return 'E-stop 상태를 받지 못해 재개를 승인할 수 없습니다.'
+                if status.get('approval_required') is not True:
+                    return {'ESTOP': 'E-stop이 아직 눌려 있거나 해제가 확정되지 않았습니다.',
+                            'ARMING': '이미 재개 승인되어 주행 준비 중입니다.',
+                            'READY': '이미 주행 가능 상태입니다.',
+                            'BYPASS': 'E-stop 확인이 꺼져 있어 승인이 필요 없습니다.'}.get(
+                        status.get('state'), '지금은 재개를 승인할 수 없습니다.')
             return None
 
     def snapshot(self):
         with self.lock:
-            result = deepcopy(self.state)
+            # Writers replace whole entries (set_state), never mutate them, so
+            # one level of copying is enough for the per-call edits below. A
+            # deepcopy of the 3,240-point scan at 5 Hz per client was 30 % of
+            # this process's CPU on the Jetson (py-spy, 2026-10-23).
+            result = {key: (dict(value) if isinstance(value, dict) else value)
+                      for key, value in self.state.items()}
             result['connection_epoch'] = self.connection_epoch
             result['layers'] = {name: grid.metadata() for name, grid in self.grids.items()}
             result['telemetry'] = self.telemetry.snapshot()
@@ -276,6 +445,8 @@ class SharedState:
                       if now-self.time_health.received >= self.time_health.timeout
                       else self.time_health.status.get('detail', '로봇 응답 대기'))
             result['tf_error'] = '시간·센서 상태 확인 필요: ' + detail
+        result['estop'] = self.estop_snapshot(now)
+        result['elevator'] = self.elevator_snapshot(now)
         for name in ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization'):
             item = result.get(name)
             if item:
@@ -289,11 +460,28 @@ class SharedState:
                                      and (not self.require_time_health or self.time_health.healthy(now)))
         return result
 
+    def estop_snapshot(self, now):
+        with self.lock:
+            status, received = dict(self.estop.status), self.estop.received
+        live = bool(status) and 0 <= now-received < self.estop.timeout
+        stm32 = status.get('stm32') if isinstance(status.get('stm32'), dict) else {}
+        return dict(
+            required=self.require_estop, received=bool(status), fresh=live,
+            age=max(0., now-received) if math.isfinite(received) else None, timeout=self.estop.timeout,
+            state=status.get('state') if live else None,
+            healthy=self.estop.healthy(now), approval_required=live and status.get('approval_required') is True,
+            detail=str(status.get('detail', ''))[:300], reason=str(status.get('reason', ''))[:80],
+            rx_error=str(status.get('rx_error', ''))[:300], reboot_suspected=status.get('reboot_suspected') is True,
+            status_age=status.get('status_age'),
+            stm32={key: stm32[key] for key in ESTOP_STM32_KEYS
+                   if type(stm32.get(key)) in (bool, int)},
+            error=self.estop_error(now))
+
     def request(self, kind, payload):
         request_id = payload.get('request_id', '')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ApiError(400, '요청 ID가 필요합니다.')
-        if kind not in ('goal', 'initialpose', 'cancel', 'relocalize'):
+        if kind not in ('goal', 'initialpose', 'cancel', 'relocalize', 'estop_approve'):
             raise ApiError(400, '지원하지 않는 명령입니다.')
         pose = validate_pose(payload) if kind in ('goal', 'initialpose') else None
         floor_name, room = payload.get('floor'), payload.get('room', '')
@@ -316,7 +504,7 @@ class SharedState:
             if kind == 'floor_goal':
                 grid = self.floor_grid(floor_name)
                 if not (self.simulation or self.state['preview'] or self.building.floor(floor_name).real_enabled):
-                    raise ApiError(409, f'{floor_name}은 임시 지도라 실차 층간 이동이 꺼져 있습니다.')
+                    raise ApiError(409, f'{floor_name}은 실차 층간 이동이 꺼져 있습니다.')
                 if payload.get('map_version') != grid.version:
                     raise ApiError(409, '지도가 갱신되었습니다. 목적지를 다시 선택해 주세요.')
                 occupancy = grid.cell(pose[0], pose[1])
@@ -463,7 +651,8 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 if not isinstance(payload, dict):
                     raise ValueError('JSON object required')
                 kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
-                         '/api/cancel': 'cancel', '/api/relocalize': 'relocalize'}
+                         '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
+                         '/api/estop_approve': 'estop_approve'}
                 if self.path not in kinds:
                     raise ApiError(404, 'Not found')
                 result = shared.request(kinds[self.path], payload)
@@ -503,12 +692,11 @@ def main(args=None):
         node = executor = None
     else:
         import rclpy
-        from rclpy.executors import SingleThreadedExecutor
-        from .ros_bridge import WebBridge
+        from .ros_bridge import WebBridge, spin_executor
         from rclpy.signals import SignalHandlerOptions
         rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
         node = WebBridge(shared)
-        executor = SingleThreadedExecutor()
+        executor = spin_executor()
         executor.add_node(node)
         thread = threading.Thread(target=executor.spin, daemon=True)
         thread.start()

@@ -28,6 +28,15 @@ navigation_startup:
     # require a shorter window with distinct AMCL poses as well as new scans.
     manual_verification_duration: 1.0
     manual_verification_samples: 4
+    # Scan-match a manual/elevator prior within this window before AMCL
+    # verifies it; a failed match keeps the given pose unchanged.
+    manual_refinement: true
+    refinement_position_window: 1.0
+    refinement_yaw_window: 0.4363323129985824
+    refinement_timeout: 5.0
+    # Last verified stopped pose per map, offered in the web UI as a prior the
+    # operator confirms. Empty string disables saving.
+    last_pose_file: ~/.ros/amr_last_pose.json
     # Refresh stationary AMCL faster only while localization is being verified.
     initialization_update_interval: 0.25
     tracking_update_interval: 1.0
@@ -37,6 +46,20 @@ navigation_startup:
     # faults still close the gate. Their recovery requires new stopped evidence.
     tracking_verification_duration: 1.0
     tracking_verification_samples: 4
+    # After READY, an AMCL pose vs map->odom gap up to these bounds is a warning
+    # (AMCL future-stamps TF, so a correction briefly blends old and new);
+    # beyond them the gate closes as before.
+    tracking_tf_jump_xy: 1.0
+    tracking_tf_jump_yaw: 0.5
+    # Covariance limits for the tracking_warning after READY. The admission
+    # limits (0.35 m / 0.25 rad) stay for initialization; a long corridor
+    # legitimately reaches 0.36-0.39 m between distinctive features.
+    tracking_max_xy_std: 0.6
+    tracking_max_yaw_std: 0.35
+    # Match-ratio limit for the tracking_warning after READY; admission keeps
+    # min_match_ratio 0.70. Objects missing from the map (401 doorway) give
+    # 68-70 % at the correct pose.
+    tracking_min_match_ratio: 0.60
     max_xy_std: 0.35
     max_yaw_std: 0.25
     min_particle_concentration: 0.90

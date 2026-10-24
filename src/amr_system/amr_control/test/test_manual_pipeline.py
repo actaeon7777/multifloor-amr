@@ -172,31 +172,25 @@ def test_manual_pipeline():
         expect(drive(True, 1.0, 0.0), (0.0, 0.0))  # No automatic restart.
         expect(drive(False), (0.0, 0.0))
         expect(drive(True, 1.0, 0.0), (wheel_speed_limit, 0.0))
-        # AUTO input alone cannot take control. RB enables it, even with LB held.
-        expect(drive(False, auto_command=(0.1, -0.2)), (0.0, 0.0))
-        expect(drive(True, 1.0, 1.0, rb=True, auto_command=(0.1, -0.2)), (0.1, -0.2))
+        # LB released: manual stops, then AUTO input drives after manual_holdoff even
+        # though the joystick stays connected. RB has no role.
+        expect(drive(False, rb=True, auto_command=(0.1, -0.2), duration=1.0), (0.1, -0.2))
         assert modes[-1] == 'AUTO'
-        expect(drive(False, rb=True, auto_command=(1.0, 0.8)), full_turn)
-        expect(drive(False, rb=True, auto_command=(0.1, -0.2)), (0.1, -0.2))
-        # A short RB false pulse is not a new toggle.
-        drive(False, rb=False, auto_command=(0.1, -0.2), duration=0.04)
-        expect(drive(True, -1.0, 1.0, rb=True, auto_command=(0.1, -0.2)), (0.1, -0.2))
-        expect(drive(True, 1.0, 1.0, rb=True, duration=0.85), (0.0, 0.0))
+        expect(drive(False, 1.0, 1.0, auto_command=(1.0, 0.8)), full_turn)
+        expect(drive(None, auto_command=(0.1, -0.2)), (0.1, -0.2))  # Bluetooth loss: AUTO continues.
+        expect(drive(False, auto_command=(0.1, -0.2)), (0.1, -0.2))  # Reconnect: still AUTO.
+        expect(drive(False, duration=0.85), (0.0, 0.0))
         assert modes[-1] == 'AUTO'  # Timeout cannot fall back to manual.
-        expect(drive(True, 1.0, 1.0, rb=True, auto_command=(0.1, -0.2)), (0.1, -0.2))
-        expect(drive(True, 1.0, 1.0, rb=False, auto_command=(0.1, -0.2)), (0.1, -0.2))
-        expect(drive(True, 1.0, 1.0, rb=True, auto_command=(0.1, -0.2)), (0.0, 0.0))
+        expect(drive(False, auto_command=(0.1, -0.2)), (0.1, -0.2))
+        # One LB press takes over at once and arms manual; AUTO input is ignored.
+        expect(drive(True, 1.0, 0.0, auto_command=(0.1, -0.2)), (wheel_speed_limit, 0.0))
         assert modes[-1] == 'MANUAL'
-        expect(drive(True, 1.0, 1.0, rb=True), (0.0, 0.0))
-        expect(drive(False), (0.0, 0.0))
-        expect(drive(True, 1.0, 0.0), (wheel_speed_limit, 0.0))
-        expect(drive(False, rb=True, auto_command=(0.1, -0.2)), (0.1, -0.2))
-        expect(drive(None, auto_command=(0.1, -0.2), duration=0.85), (0.0, 0.0))
-        assert modes[-1] == 'MANUAL'
-        expect(drive(True, 1.0, 1.0, rb=True, auto_command=(0.1, -0.2)), (0.0, 0.0))
+        expect(drive(True, auto_command=(0.1, -0.2)), (0.0, 0.0))  # LB held, stick neutral.
+        expect(drive(False, auto_command=(0.1, -0.2), duration=1.0), (0.1, -0.2))
+        assert modes[-1] == 'AUTO'
 
         # Exercise the actual standalone script through mux and CAN preview.
-        expect(drive(False), (0.0, 0.0))
+        expect(drive(False, duration=1.0), (0.0, 0.0))  # Let the last AUTO command expire.
         script = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve().parents[4] / 'scripts/auto_turn_test.py')],
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
@@ -206,19 +200,21 @@ def test_manual_pipeline():
             assert script.poll() is None
             assert time.monotonic() < deadline
             drive(False, duration=0.2)
-        expect(drive(False), (0.0, 0.0))
+        expect(drive(False), (0.0, 0.0))  # Already AUTO at script start: no turn.
         def expect_script_turn(angular):
             # Mode delivery/discovery is asynchronous. Anchor checks to the
-            # script's observed phase, not wall time since the RB press.
+            # script's observed phase, not wall time since LB was released.
             first_sample = len(auto_received)
             deadline = time.monotonic() + 5.0
             while not any(w == pytest.approx(angular) for _, _, w
                           in auto_received[first_sample:]):
                 assert script.poll() is None, 'Auto turn script exited'
                 assert time.monotonic() < deadline, 'Auto turn phase timed out'
-                drive(True, 1.0, 1.0, rb=True, duration=0.1)
-            expect(drive(True, 1.0, 1.0, rb=True, duration=0.25), (0.0, angular))
+                drive(False, duration=0.1)
+            expect(drive(False, duration=0.25), (0.0, angular))
 
+        drive(True, duration=0.3)  # LB press and release: MANUAL -> AUTO starts the script.
+        assert modes[-1] == 'MANUAL'
         auto_received.clear()
         expect_script_turn(-0.2)
         expect_script_turn(0.2)
@@ -229,13 +225,11 @@ def test_manual_pipeline():
         assert left - right == pytest.approx(2.0, abs=0.15)
         assert repeated_right - left == pytest.approx(2.0, abs=0.15)
         assert all(v == 0.0 for _, v, _ in auto_received)
-        # OFF/ON repeats from right; cancelling with held LB stays stopped.
-        drive(True, rb=False)
-        expect(drive(True, 1.0, 1.0, rb=True), (0.0, 0.0))
-        drive(True, rb=False)
+        # LB takes over from the script; releasing it repeats from the right turn.
+        expect(drive(True, 1.0, 1.0), full_turn)
+        assert modes[-1] == 'MANUAL'
         expect_script_turn(-0.2)
-        drive(True, rb=False, duration=0.2)
-        expect(drive(True, 1.0, 1.0, rb=True), (0.0, 0.0))
+        expect(drive(True), (0.0, 0.0))
     finally:
         for process in (script, launch):
             if process is not None and process.poll() is None:
@@ -249,4 +243,149 @@ def test_manual_pipeline():
         print(log.read())
         log.close()
         node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_mux_drops_motion_until_estop_ready():
+    from geometry_msgs.msg import Twist
+    from rclpy.parameter import Parameter
+    from std_msgs.msg import String
+
+    from amr_control.control_mux import ControlMux
+
+    rclpy.init()
+    mux = ControlMux(parameter_overrides=[Parameter('require_estop', value=True)])
+    sent = []
+    mux.publisher.publish = lambda message: sent.append((message.linear.x, message.angular.z))
+    sequence = [0]
+
+    def estop(state):
+        sequence[0] += 1
+        mux.on_estop(String(data=json.dumps(dict(
+            session='bridge', sequence=sequence[0], stamp=time.time(), epoch=1, state=state,
+            healthy=state == 'READY', latched=state in ('ESTOP', 'DISARMED')))))
+
+    def auto(v):
+        message = Twist()
+        message.linear.x = v
+        mux.on_auto_command(message)
+        return sent[-1]
+
+    try:
+        assert auto(0.1) == (0.0, 0.0)  # No status yet.
+        assert mux.last_status == 'estop_not_ready'
+        estop('READY')
+        assert auto(0.1) == (pytest.approx(0.1), 0.0)
+        estop('ESTOP')
+        assert sent[-1] == (0.0, 0.0)
+        assert mux.gate.auto_command is None  # Cached AUTO motion is discarded.
+        estop('ARMING')
+        mux.publish_command()
+        assert sent[-1] == (0.0, 0.0)
+        estop('READY')
+        assert sent[-1] == (0.0, 0.0)  # Nothing cached survives the E-stop.
+        assert auto(0.1) == (pytest.approx(0.1), 0.0)
+    finally:
+        mux.destroy_node()
+        rclpy.shutdown()
+
+
+def test_estop_needs_a_new_lb_press_and_joystick_long_press_approves():
+    from geometry_msgs.msg import Twist
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.parameter import Parameter
+    from std_msgs.msg import String
+    from std_srvs.srv import Trigger
+
+    from amr_control.control_mux import ControlMux
+
+    rclpy.init()
+    mux = ControlMux(parameter_overrides=[
+        Parameter('require_estop', value=True), Parameter('approve_button', value=11),
+        Parameter('approve_hold', value=0.2)])
+    probe = rclpy.create_node('approve_probe')
+    calls = []
+
+    def approve(_request, response):
+        calls.append(time.monotonic())
+        response.success, response.message = True, 'approved'
+        return response
+
+    probe.create_service(Trigger, '/estop/approve_resume', approve)
+    executor = SingleThreadedExecutor(context=mux.context)
+    executor.add_node(mux)
+    executor.add_node(probe)
+    sent = []
+    mux.publisher.publish = lambda message: sent.append((message.linear.x, message.angular.z))
+    sequence = [0]
+
+    def estop(state):
+        sequence[0] += 1
+        mux.on_estop(String(data=json.dumps(dict(
+            session='bridge', sequence=sequence[0], stamp=time.time(), epoch=1, state=state,
+            healthy=state == 'READY', latched=state in ('ESTOP', 'DISARMED'),
+            approval_required=state == 'DISARMED'))))
+
+    def joy(lb=0, approve=0, linear=0.0):
+        message = Joy()
+        message.axes = [0.0] * 6
+        message.axes[1] = linear
+        message.buttons = [0] * 15
+        message.buttons[6], message.buttons[11] = lb, approve
+        mux.on_joy(message)
+
+    def manual(v):
+        message = Twist()
+        message.linear.x = v
+        mux.on_command(message)
+        return sent[-1]
+
+    def hold_lb(duration=0.2, linear=0.0):
+        # Longer than mode_stop_duration, so a MANUAL takeover can pass commands.
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            joy(lb=1, linear=linear)
+            time.sleep(0.02)
+
+    try:
+        assert mux.approve_client.wait_for_service(timeout_sec=5.0)
+        estop('READY')
+        joy(lb=0)
+        hold_lb()
+        assert manual(0.1) == (pytest.approx(0.1), 0.0)
+
+        # LB and stick held through the E-stop: READY alone must not move the robot.
+        estop('ESTOP')
+        joy(lb=1, linear=0.5)
+        assert manual(0.1) == (0.0, 0.0)
+        estop('DISARMED')
+        # Approval is refused while LB is held, even for a long press.
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            joy(lb=1, approve=1)
+            executor.spin_once(timeout_sec=0.02)
+        assert calls == []
+        joy(lb=0)
+        estop('DISARMED')
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            joy(approve=1)
+            executor.spin_once(timeout_sec=0.02)
+        deadline = time.monotonic() + 2.0
+        while not calls and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.05)
+        assert len(calls) == 1  # One request per press.
+
+        estop('ARMING')
+        hold_lb(linear=0.5)
+        estop('READY')
+        hold_lb(linear=0.5)
+        assert manual(0.1) == (0.0, 0.0)  # LB pressed during ARMING is not a new press.
+        joy(lb=0)
+        hold_lb()
+        assert manual(0.1) == (pytest.approx(0.1), 0.0)
+    finally:
+        executor.shutdown()
+        probe.destroy_node()
+        mux.destroy_node()
         rclpy.shutdown()

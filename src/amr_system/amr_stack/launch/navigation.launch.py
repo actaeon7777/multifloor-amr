@@ -42,6 +42,9 @@ def launch_nodes(context):
     if IfCondition(LaunchConfiguration('use_rviz')).evaluate(context):
         rviz_env = rviz_plugin_environment(share)
     use_sim_time = LaunchConfiguration('use_sim_time').perform(context).lower() == 'true'
+    require_estop = LaunchConfiguration('require_estop').perform(context).lower() or str(not use_sim_time).lower()
+    if require_estop not in ('true', 'false'):
+        raise ValueError('require_estop must be true, false or empty')
     # Rewrite nested costmap parameters too, so all Nav2 clocks agree.
     config = RewrittenYaml(
         source_file=LaunchConfiguration('navigation_config'),
@@ -82,7 +85,8 @@ def launch_nodes(context):
                  ('goal_pose', '/navigation/internal_goal_pose'),
              ], output='screen'),
         Node(package='amr_stack', executable='navigation_manager', name='navigation_manager',
-             parameters=[config, {'require_localization_ready': True, 'require_time_health': True}], output='screen'),
+             parameters=[config, {'require_localization_ready': True, 'require_time_health': True,
+                                  'require_estop': require_estop == 'true'}], output='screen'),
         Node(package='amr_tim_localization', executable='tim_global_localizer',
              name='tim_global_localizer',
              parameters=[LaunchConfiguration('tim_config'), {'use_sim_time': use_sim_time}],
@@ -133,5 +137,7 @@ def generate_launch_description():
         DeclareLaunchArgument('control_config', default_value=str(share/'config/control_mux.yaml'),
                               description='Same geometry/limits file used by the running control_mux.'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
+        DeclareLaunchArgument('require_estop', default_value='',
+                              description='Goals need /estop/status READY; empty = true unless use_sim_time.'),
         OpaqueFunction(function=launch_nodes),
     ])

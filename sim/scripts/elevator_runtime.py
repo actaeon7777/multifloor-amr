@@ -3,8 +3,9 @@
 Runs inside the Isaac process (bundled rclpy, std_msgs only).  The ROS-typed
 /elevator/command and /elevator/beacon are translated by the system-Python
 ``elevator_sim_relay`` node over JSON topics:
-  /sim/elevator/command_raw  (in)   {"command", "floor_code", "direction", "sequence"}
+  /sim/elevator/command_raw  (in)   {"command", "floor_code", "direction", "sequence", "repeat"}
   /sim/elevator/beacon_raw   (out)  [{"event", "location", "floor_code", "sequence", ...}]
+  /sim/elevator/command_status_raw (out) [{"cmd_seq", "status", "device_result", "target", ...}]
   /sim/elevator/status       (out)  ground truth for evaluation (latched)
   /sim/elevator/inject       (in)   {"faults": {...}} | {"obstruct": bool}
 """
@@ -60,6 +61,7 @@ class ElevatorRuntime:
         self.next_status = 0.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.beacon_pub = node.create_publisher(String, '/sim/elevator/beacon_raw', 50)
+        self.command_status_pub = node.create_publisher(String, '/sim/elevator/command_status_raw', 20)
         self.status_pub = node.create_publisher(String, '/sim/elevator/status', latched)
         node.create_subscription(String, '/sim/elevator/command_raw', self.on_command, 20)
         node.create_subscription(String, '/sim/elevator/inject', self.on_inject, 10)
@@ -78,7 +80,7 @@ class ElevatorRuntime:
         try:
             c = json.loads(message.data)
             self.model.command(self.now, int(c['command']), int(c['floor_code']), int(c.get('direction', 0)),
-                               int(c['sequence']))
+                               int(c['sequence']), int(c.get('repeat', 0)))
         except (ValueError, KeyError, TypeError):
             pass
 
@@ -112,6 +114,9 @@ class ElevatorRuntime:
         frames = self.model.step(elapsed)
         if frames:
             self.beacon_pub.publish(self.String(data=json.dumps([frame.__dict__ for frame in frames])))
+        statuses = self.model.take_statuses()
+        if statuses:
+            self.command_status_pub.publish(self.String(data=json.dumps([s.__dict__ for s in statuses])))
         self.apply()
         if elapsed >= self.next_status:
             self.publish_status()

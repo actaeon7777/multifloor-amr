@@ -39,6 +39,14 @@ class RivalQuality:
     best_pose: Optional[tuple]
 
 
+@dataclass(frozen=True)
+class RefinedPose:
+    pose: tuple
+    quality: ScanQuality
+    hint_quality: ScanQuality
+    candidates_evaluated: int
+
+
 def covariance_is_bounded(
     covariance: Sequence[float], max_xy_std: float = 0.35,
     max_yaw_std: float = 0.25,
@@ -242,6 +250,89 @@ class MapQuality:
         return ScanQuality(
             count, int(matched.sum()), int(known.sum()), int(obstructed.sum()),
             float(matched.mean()), float(known.mean()), float(obstructed.mean()), origin_free)
+
+    def _soft_scores(self, candidates, distances, angles, sigma):
+        """Mean Gaussian endpoint-to-wall likelihood; zero for non-free origins."""
+        results = np.zeros(len(candidates))
+        for start in range(0, len(candidates), 1024):
+            group = candidates[start:start + 1024]
+            headings = group[:, 2, None] + angles
+            gx, gy, inside = self._cells(
+                group[:, 0, None] + distances * np.cos(headings),
+                group[:, 1, None] + distances * np.sin(headings))
+            known = inside & self.known[gy, gx]
+            soft = np.exp(-.5 * (self._distance[gy, gx] / sigma) ** 2) * known
+            ox, oy, oinside = self._cells(group[:, 0], group[:, 1])
+            results[start:start + len(group)] = soft.mean(axis=1) * (oinside & self.free[oy, ox])
+        return results
+
+    def refine_pose(
+        self, ranges: Sequence[float], angle_min: float, angle_increment: float,
+        range_min: float, range_max: float, laser_pose: Sequence[float],
+        position_window: float = 1.0, yaw_window: float = math.radians(25),
+        max_beams: int = 180, score_beams: int = 360, max_range: float = 30.0,
+        seeds: int = 4, prior_weight: float = .02,
+    ) -> RefinedPose:
+        """Correlative scan match around an operator-supplied laser pose.
+
+        This is a local correction of a human prior, not a global search: the
+        window only absorbs click/heading error. A coarse soft-likelihood grid
+        keeps a few separated basins, each refined twice, and the strict
+        ``score`` with ``score_beams`` ranks them. A small quadratic prior
+        breaks ties toward the hint along featureless corridor axes.
+        """
+        hint = np.asarray(laser_pose, dtype=float)
+        if (hint.shape != (3,) or not np.isfinite(hint).all()
+                or not all(math.isfinite(v) and v > 0 for v in (position_window, yaw_window, prior_weight))
+                or seeds < 1):
+            raise ValueError('Invalid pose refinement configuration')
+        scan = dict(ranges=ranges, angle_min=angle_min, angle_increment=angle_increment,
+                    range_min=range_min, range_max=range_max)
+        hint_quality = self.score(**scan, laser_pose=hint, max_beams=score_beams, max_range=max_range)
+        distances, angles = self._rays(**scan, max_beams=max_beams, max_range=max_range)
+        if not len(distances):
+            return RefinedPose(tuple(float(v) for v in hint), hint_quality, hint_quality, 0)
+
+        def prior(candidates):
+            offset = candidates - hint
+            heading = angular_distance(candidates[:, 2], hint[2])
+            return prior_weight * (np.sum(offset[:, :2] ** 2, axis=1) / position_window ** 2
+                                   + heading ** 2 / yaw_window ** 2)
+
+        def lattice(center, span, step, yaw_span, yaw_step):
+            xy = np.arange(-span, span + step / 2, step)
+            turn = np.arange(-yaw_span, yaw_span + yaw_step / 2, yaw_step)
+            dx, dy, dyaw = np.meshgrid(xy, xy, turn, indexing='ij')
+            return center + np.column_stack((dx.ravel(), dy.ravel(), dyaw.ravel()))
+
+        evaluated = 0
+        coarse = lattice(hint, position_window, .10, yaw_window, math.radians(2.5))
+        coarse_scores = self._soft_scores(coarse, distances, angles, .25) - prior(coarse)
+        evaluated += len(coarse)
+        basins = []
+        for index in np.argsort(coarse_scores)[::-1]:
+            candidate = coarse[index]
+            if all(math.hypot(*(candidate[:2] - b[:2])) > .3
+                   or angular_distance(candidate[2], b[2]) > math.radians(10) for b in basins):
+                basins.append(candidate)
+            if len(basins) >= seeds:
+                break
+        best = None
+        for candidate in basins:
+            for span, step, yaw_span, yaw_step, sigma in ((.15, .03, math.radians(3.75), math.radians(.75), .12),
+                                                         (.04, .01, math.radians(1), math.radians(.25), .06)):
+                local = lattice(candidate, span, step, yaw_span, yaw_step)
+                scores = self._soft_scores(local, distances, angles, sigma) - prior(local)
+                evaluated += len(local)
+                candidate = local[int(np.argmax(scores))]
+            candidate[2] = math.atan2(math.sin(candidate[2]), math.cos(candidate[2]))
+            quality = self.score(**scan, laser_pose=candidate, max_beams=score_beams, max_range=max_range)
+            rank = quality.match_ratio - float(prior(candidate[None, :])[0])
+            if quality.origin_free and (best is None or rank > best[0]):
+                best = (rank, candidate, quality)
+        if best is None:
+            return RefinedPose(tuple(float(v) for v in hint), hint_quality, hint_quality, evaluated)
+        return RefinedPose(tuple(float(v) for v in best[1]), best[2], hint_quality, evaluated)
 
     def find_rival(
         self, ranges: Sequence[float], angle_min: float, angle_increment: float,

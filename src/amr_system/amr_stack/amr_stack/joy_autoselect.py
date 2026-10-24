@@ -174,8 +174,15 @@ def wait_for_device(reader, keep_running, report, clock=time.monotonic, sleep=ti
     return None
 
 
-def driver_arguments(original, device):
-    """Later ROS parameter overrides win over the original named YAML config."""
+def driver_arguments(original, device, unique):
+    """Later ROS parameter overrides win over the original named YAML config.
+
+    A unique name stays configured so joy_node re-finds the controller by name
+    when Bluetooth reconnects it at another SDL index; control_mux relies on that
+    /joy resuming to take MANUAL priority. Duplicate names must pin the index.
+    """
+    if unique:
+        return list(original)
     return [*original, '--ros-args', '-p', f'device_id:={device.index}',
             '-p', 'device_name:=""']
 
@@ -190,6 +197,7 @@ def main(args=None):
     reader = None
     node = None
     selected = None
+    unique = False
     driver = Path(get_package_prefix('joy')) / 'lib/joy/joy_node'
     stop_requested = False
 
@@ -217,6 +225,7 @@ def main(args=None):
                 reader, lambda: not stop_requested and rclpy.ok(), node.get_logger().info)
             if selected is None:
                 return
+            unique = len(reader.snapshot()) == 1
             node.get_logger().info(
                 f'조이스틱 자동 선택: SDL ID {selected.index} ({selected.name}). '
                 'LB를 놓았다가 다시 누르면 수동 주행할 수 있습니다.')
@@ -238,7 +247,7 @@ def main(args=None):
             signal.signal(sig, handler)
     if stop_requested:
         return
-    argv = driver_arguments(original, selected) if selected is not None else original
+    argv = driver_arguments(original, selected, unique) if selected is not None else original
     os.execv(str(driver), [str(driver), *argv])
 
 

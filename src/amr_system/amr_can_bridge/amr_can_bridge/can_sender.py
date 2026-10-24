@@ -34,7 +34,7 @@ def require_interface_up(channel):
 
 class CanSender:
     def __init__(self, channel='can0', can_id=DRIVE_CAN_ID, dry_run=True,
-                 send_timeout=0.01, bus_factory=None):
+                 send_timeout=0.01, receive_ids=(), bus_factory=None):
         if not isinstance(channel, str) or not channel.strip():
             raise ValueError('channel must be a nonempty string')
         if type(can_id) is not int or not 0 <= can_id <= 0x7ff:
@@ -43,6 +43,8 @@ class CanSender:
             raise ValueError('dry_run must be a boolean')
         if not isfinite(send_timeout) or send_timeout < 0:
             raise ValueError('send_timeout must be finite and non-negative')
+        if any(type(cid) is not int or not 0 <= cid <= 0x7ff for cid in receive_ids):
+            raise ValueError('receive_ids must be 11-bit standard identifiers')
         self.channel = channel
         self.can_id = can_id
         self.dry_run = dry_run
@@ -61,7 +63,11 @@ class CanSender:
             # Direct backend supports Ubuntu's python-can 3.x and newer versions,
             # and avoids implicitly selecting an interface from user config.
             factory = bus_factory if bus_factory is not None else SocketcanBus
-            self.bus = factory(channel=channel, receive_own_messages=False, fd=False)
+            options = {}
+            if receive_ids:
+                options['can_filters'] = [{'can_id': cid, 'can_mask': 0x7ff, 'extended': False}
+                                          for cid in receive_ids]
+            self.bus = factory(channel=channel, receive_own_messages=False, fd=False, **options)
 
     def send(self, payload):
         if self.closed:
@@ -74,6 +80,18 @@ class CanSender:
                 is_remote_frame=False, is_error_frame=False, is_fd=False, check=True,
             )
             self.bus.send(message, timeout=self.send_timeout)
+
+    def receive(self, limit=50):
+        """Drain up to limit filtered frames without blocking."""
+        if self.closed:
+            raise RuntimeError('CAN sender is closed')
+        frames = []
+        while self.bus is not None and len(frames) < limit:
+            message = self.bus.recv(timeout=0.0)
+            if message is None:
+                break
+            frames.append(message)
+        return frames
 
     def close(self, count=5, period=0.05, on_stop=None, sleep_fn=sleep):
         """Best-effort repeated stops even if an earlier write fails, then close."""

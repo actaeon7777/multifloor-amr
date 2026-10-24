@@ -8,7 +8,8 @@ Jetson(JetPack 7.2.1 / Ubuntu 24.04 / arm64)에서 도는 실차 스택의 동�
 ```text
 joy_node → /joy → joy_teleop → /cmd_vel_manual ─┐
                                                 ├→ control_mux → /cmd_vel → cmd_vel_to_can → CAN 0x201 → STM32 → ODrive
-Nav2 → navigation_manager → /cmd_vel_auto ──────┘   (바퀴 속도 제한)
+Nav2 → navigation_manager → /cmd_vel_auto ──────┘   (바퀴 속도 제한)        ▲
+                                                          STM32 E-stop 상태 0x202 ┘ → /estop/status
 
 CAN 피드백 → can_telemetry → /wheel/odometry, /joint_states, /imu/data_raw → EKF → odom → base_footprint
 S2 LiDAR → /scan_raw → scan_body_filter → /scan → AMCL → map → odom
@@ -56,12 +57,13 @@ Xbox 컨트롤러의 `/joy` 인덱스(0부터). `joy.device_name`은 SDL 이름 
 
 | 기능 | 입력 | 출력 |
 |---|---|---|
-| LB 데드맨 | `buttons[6]` | MANUAL에서 누르는 동안만 수동 명령 허용 |
-| RB 토글 | `buttons[7]` | MANUAL ↔ AUTO, AUTO → MANUAL 시 정지 |
+| LB 끼어들기·데드맨 | `buttons[6]` | 누르는 순간 MANUAL(자율 정지·목표 중단), 누르는 동안만 수동 명령 허용, 마지막 입력 0.5초 뒤 AUTO |
+| 조이스틱 연결 | `/joy` 수신 | 모드에 영향 없음 (RB 등 다른 버튼도 모드를 바꾸지 않음) |
 | 전진·후진 | `axes[1]` | `linear.x`, 최대 ±1.00 m/s, 전진 양수 |
 | 좌회전·우회전 | `axes[2]` | `angular.z`, 최대 ±0.80 rad/s, 좌회전 양수 |
 
 `axes[0]`·`axes[3]`은 사용하지 않는다. 스틱 데드존 0.05, `/joy` 20 Hz. 설정은 `joy_teleop.yaml`.
+`autorepeat_rate`(20 Hz)는 스틱을 움직이지 않고 LB만 누르고 있어도 `/joy`를 계속 발행하게 하므로 0으로 바꾸지 않는다(LB 유지·`/joy` 만료 판정에 필요).
 YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 rad/s를 사용한다.
 
 ### 모드 규칙
@@ -70,12 +72,16 @@ YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 ra
 자율 노드는 `/cmd_vel_auto`에 발행하고 **`/cmd_vel`은 mux만 발행**한다. `/cmd_vel`을 쓰는 기존 자율 노드에는
 그 노드에만 `--ros-args -r /cmd_vel:=/cmd_vel_auto`를 적용한다.
 
-- 시작은 MANUAL이다. RB를 0.10초 이상 놓은 뒤 누르면 토글된다(`joy.sticky_buttons=false`, mux에서 RB만 토글).
-- AUTO에서는 LB·스틱·수동 명령을 무시한다. 수동 입력 오류도 자율 출력을 덮어쓰지 않는다.
-- 모드 전환마다 0.10초 동안 0을 출력하고, AUTO 진입 전에 받은 자율 명령은 버린다.
-- AUTO OFF 시 정지하며, LB가 이미 눌려 있어도 즉시 움직이지 않는다. LB를 놓았다 다시 누르고 새 수동 명령이 와야 한다.
+- 시작과 기본은 AUTO다. 조이스틱 연결·끊김·재연결, 잘못된 `/joy`는 모드를 바꾸지 않는다.
+- 유효한 `/joy`에서 LB가 눌려 있으면 즉시 MANUAL. 연결된 상태에서 LB 해제가 한 번 관찰됐다면 그 누름이 곧 수동 무장이라
+  바로 수동 입력 대기(`waiting_command`)가 된다. 연결 시 LB가 이미 눌려 있으면 MANUAL(자율 정지)이지만 수동은 LB를 놓았다 다시 눌러야 한다.
+- 마지막으로 LB가 눌린 `/joy`로부터 `manual_holdoff`(0.50초)가 지나면 AUTO로 돌아간다. 40 ms 같은 짧은 LB 튐은 MANUAL을 끝내지 않는다.
+- MANUAL에서는 자율 명령을 버린다. AUTO에서는 스틱·수동 명령을 무시하고 수동 입력 오류도 자율 출력을 덮어쓰지 않는다.
+- 모드 전환마다 0.10초 동안 0을 출력하고, 이전 모드에서 받은 명령은 버린다.
 - 자율 명령이 0.50초 만료되거나 잘못되면 0을 출력한다. 수동으로 대체하지 않으며 새 유효 명령이 오면 재개한다.
-- `/joy`가 0.50초 만료되거나 잘못되면 정지하고 MANUAL로 돌아간다. 재연결 시 RB가 눌려 있어도 AUTO로 복귀하지 않는다.
+- LB를 누른 채 `/joy`가 끊기면 0.50초 뒤 수동 출력을 멈추고 AUTO로 돌아간다. 재연결 후 수동은 LB 재입력이 필요하다.
+- `joy_autoselect`는 같은 이름의 컨트롤러가 하나뿐이면 이름(`device_name`)으로 joy_node를 실행해, Bluetooth가 다른 SDL 번호로
+  재연결해도 `/joy`가 다시 나오게 한다. 같은 이름이 여러 개면 고른 번호로 고정하므로 재연결이 보장되지 않는다(실차에서 한 대만 켠다).
 - `/control_mux/mode`(`MANUAL`/`AUTO`)와 `/control_mux/status`는 transient-local이라 늦게 구독해도 마지막 상태를 받는다.
 
 ### 정지 처리
@@ -111,6 +117,10 @@ YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 ra
 3. LB + 왼쪽 스틱 앞/뒤 → `linear.x` 양/음, LB + 오른쪽 스틱 왼/오 → `angular.z` 양/음.
 4. 스틱 중립 → 0, 스틱을 기울인 채 LB를 0.10초 이상 놓음 → 0.
 5. 컨트롤러 전원을 끄거나 Bluetooth를 끊어 정지와 재연결을 확인한다. `/joy`가 0.50초 이상 끊긴 뒤에는 LB를 다시 눌러야 한다.
+6. 컨트롤러를 켜고 끄는 동안 `/control_mux/mode`가 `AUTO`로 유지되는지, LB를 누르면 즉시 `MANUAL`, 놓으면 0.5초 뒤 `AUTO`가 되는지 확인한다
+   (`ros2 topic echo /control_mux/mode --qos-durability transient_local`). 재연결 후 `ros2 topic hz /joy`가 다시 나와야 한다(Bluetooth 무입력 시 실측 약 13~15 Hz, 조작 중 더 높음).
+7. 바퀴를 띄우고 웹에서 목표를 보내 주행 중 컨트롤러를 켠다 → 주행 계속. LB를 누른다 → 즉시 0, 웹 **수동 조작 중**, 목표 전송 거절.
+   LB를 놓는다 → 정지 유지, 웹 **수동 조작으로 중단됨** → 새 목표로만 다시 출발. 주행 중 컨트롤러를 끈다 → 주행 계속.
 
 ## 4. 바퀴 속도 제한과 STM32 변환
 
@@ -144,10 +154,46 @@ YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 ra
   송신 모드에서 장치를 열 수 없으면 dry_run으로 자동 전환하지 않고 실패한다.
 - 정지 조건:
   - `/cmd_vel`이 0.50초 만료되면 0을 보내고, 새 유효 명령이 오면 복구한다.
-  - 시작 시, 잘못된 입력·송신 오류 뒤에는 새 0 명령을 받아야 비영점 명령을 허용한다(MANUAL은 LB 재입력, AUTO는 RB OFF/ON).
+  - 시작 시, 잘못된 입력·송신 오류 뒤에는 새 0 명령을 받아야 비영점 명령을 허용한다(MANUAL은 LB 재입력, AUTO는 모드 전환 시 0 출력).
   - 송신 오류 시 이전 속도를 버리고 0 프레임만 재시도한다. 송신 대기는 최대 0.01초.
 - 기존 키보드 송신 프로그램이나 다른 CAN 브리지와 함께 실행하지 않는다. 최초 실차 검증은 바퀴를 띄운 상태에서 정지와 방향을 먼저 확인한다.
   실제 프레임은 `candump can0,201:7FF`로 관찰한다.
+
+### E-stop 연동 (`0x202`)
+
+STM32는 하드웨어 E-stop을 `0x202` 상태 프레임으로 알리고, 버튼이 원위치로 돌아오면 스스로 정지를 해제한다.
+**재가동 승인은 Jetson 책임**이라 `cmd_vel_to_can`이 아래 상태 머신으로 `0x201` 송신을 막는다. 프로토콜 전체는 [ESTOP_CAN_PROTOCOL.md](ESTOP_CAN_PROTOCOL.md)에 있다.
+
+| 상태 | 뜻 | `0x201` 송신 |
+|---|---|---|
+| `UNKNOWN` | 부팅 후 `0x202`를 아직 받지 못함 | 보내지 않음 |
+| `ESTOP` | 버튼 눌림·단선, `trip_count` 증가, `0x202` 0.5초 미수신, 잘못된 상태 프레임 | 보내지 않음 |
+| `DISARMED` | STM32는 해제됐지만 운영자 승인 전 | 보내지 않음 |
+| `ARMING` | 승인 후 STM32 주행 gate가 열리기를 기다림 | `(0, 0)`만 |
+| `READY` | `drive_enabled=1` | `/cmd_vel` (승인 뒤 새로 받은 0 명령 이후부터) |
+| `BYPASS` | `can_dry_run:=true` 또는 `require_estop_status: false` | 기존 동작 |
+
+- **매 부팅과 매 E-stop 뒤에 재개 승인이 필요하다.** `DISARMED`에서만 받아들이며, 로봇 현장에서 아래 셋 중 하나로 한다.
+  - 로봇 웹 UI의 **재개 승인**을 3초 안에 두 번 누른다(첫 누름은 확인 요청). 원격 중계·Control_Server 화면에는 버튼이 없다.
+  - 조이스틱: LB를 뗀 채 스틱을 중앙에 두고 승인 버튼(`control_mux.yaml`의 `approve_button`, 기본 11 = Menu ≡)을 2초 누른다.
+    누른 채로 E-stop을 지났거나 도중에 LB·스틱을 움직이면 떼었다가 다시 눌러야 한다. 버튼 번호는 실제 패드에서 `ros2 topic echo /joy`로 확인한다.
+  - 아래 서비스.
+
+  ```bash
+  ROS_DOMAIN_ID=7 ros2 service call /estop/approve_resume std_srvs/srv/Trigger '{}'
+  ROS_DOMAIN_ID=7 ros2 topic echo /estop/status --once   # state, stm32.trip_count 등 JSON
+  ```
+
+- 승인은 주행을 다시 시작하지 않는다. E-stop이 나면 `navigation_manager`가 목표를 끝내고(층간 미션은 `ESTOP`으로 중단),
+  `control_mux`가 캐시된 AUTO 명령을 버리고 수동 gate를 닫는다. 승인 뒤에는 새 목표나 **LB를 새로 누른** 조이스틱 입력으로만 움직인다.
+- `0x202`의 `sequence`가 뒤로 가거나 64 넘게 건너뛰면(STM32 재부팅, 상태 유실) E-stop과 같이 처리한다. IWDG 리셋이 0.5초 안에 끝나도 승인을 다시 받는다.
+- 승인 뒤 5초 넘게 `ARMING`이면 상태 안내가 "STM32 주행 준비가 늦어짐"으로 바뀐다. ODrive 연결·오류를 확인한다.
+- `READY`에서 STM32 gate가 닫히면(명령 공백 300 ms, ODrive fault, bus-off) E-stop이 아니므로 승인 없이 `ARMING`으로 돌아가 `(0, 0)`부터 다시 보낸다.
+- E-stop 상태(`ESTOP`·`DISARMED`·`UNKNOWN`)에서는 종료 시 정지 프레임도 보내지 않는다. 0 명령이 STM32 gate를 열기 때문이다.
+- `0x202`를 보내지 않는 구 펌웨어에서는 `can_bridge.yaml`의 `require_estop_status: false`로 기존 동작을 쓴다. 이때는 E-stop 뒤 재가동을 브리지가 막지 못한다.
+- 상태 프레임은 `candump can0,202:7FF`로 관찰한다. 래치 중 IMU(`0x301`/`0x302`)는 끊기고, 해제 뒤 `seq`가 건너뛰는 것은 정상이다(진단 `imu_seq_gaps`).
+  EKF는 yaw rate를 IMU에서만 받으므로, 회전 중 E-stop이면 래치 동안 odom yaw가 흐를 수 있다(실측 전). 해제 뒤 IMU가 돌아와도
+  `time_health`가 1초 동안 회복을 기다려 그사이 목표가 거절될 수 있다.
 
 ## 6. CAN 수신 (`can_telemetry`)
 
@@ -191,7 +237,7 @@ YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 ra
 ```text
 base_footprint
 └── base_link                      z = 0.086 m
-    ├── imu_link                   xyz = (0.160, 0.0035, 0.016) m
+    ├── imu_link                   xyz = (0.097, 0, 0.021) m  (최신 CAD, 2026-10-23)
     ├── lidar_mount_link           z = -0.029 m
     │   └── lidar_link             z = 0.137605 m
     │       └── laser              yaw = pi
@@ -202,7 +248,10 @@ base_footprint
 - `/scan.header.frame_id=laser`, `inverted=false`를 유지한다. S2 런치 인자 `serial_port`, `serial_baudrate`, `scan_mode`로 드라이버를 바꿀 수 있다.
 - v80 차체의 2020 기둥 4개가 스캔 평면을 지나 약 ±22~30°, ±149~157° 방향 0.27~0.28 m에 보인다. 드라이버는 `/scan_raw`로 내보내고
   `scan_body_filter`가 `scan_body_filter.yaml`의 `base_link` 상자(기둥 외곽 + 0.03 m) 안에 떨어지는 점을 NaN으로 바꿔 `/scan`을 낸다.
-  상자는 Nav2 footprint 안쪽이라 로봇 밖의 점은 지우지 않는다. 기둥 너머는 실제로 가려져 보이지 않는다.
+  상자는 Nav2 footprint 안쪽이다. 기둥 모서리를 스친 빔은 기둥보다 10~20 cm 먼 0.36~0.50 m에 중간 거리 점을 내고(최대 2.9°
+  바깥), footprint 밖이라 상자로는 지워지지 않아 코스트맵에 로봇에 붙은 장애물로 남았다(2026-10-23, DWB "No valid trajectories").
+  그래서 각 기둥이 가리는 방향 ± `shadow_margin_deg`(3°) 안에서 `shadow_range`(0.7 m) 이내 점도 지운다. 기둥 너머는 원래 보이지 않으므로
+  잃는 영역은 여유 각도뿐이다(0.7 m에서 폭 약 3.7 cm). 실측: 로봇 밖 0.7 m 이내 점이 스캔당 32.6개에서 0개, 추가로 지운 점은 유효 점의 1.3 %.
   `laser` TF를 받기 전에는 스캔을 내보내지 않는다. `start_lidar:=false`이면 필터도 뜨지 않는다. `record_trial.sh`는 두 토픽을 모두 기록한다.
 - URDF는 `src/amr_description/urdf/capstone_amr.urdf.xacro`와 확장본 `.urdf`. 런치는 확장본을 읽어 mesh 경로를
   `package://amr_description/meshes/visual/`로 바꿔 `/robot_description`으로 제공한다. Xacro 수정 시 확장본도 재생성한다.
@@ -248,17 +297,19 @@ base_footprint
 
 | 상황 | 동작 |
 |---|---|
-| MANUAL에서 목표 지정 | 목표 보관, AUTO 진입 대기 |
+| MANUAL(LB 끼어들기)에서 목표 지정 | 거절. 웹 UI·중앙 관제는 409와 안내 문구 |
 | AUTO에서 목표 지정 | 경로 계산 후 주행 |
-| RB OFF 또는 Joy 만료로 MANUAL 전환 | mux 정지, 내부 Nav2 작업 중단, 목표 보관 |
-| RB로 AUTO 재진입 | 이전 내부 작업 종료 확인 후 현재 위치에서 재계획 |
+| 주행 중 LB 누름(MANUAL) | mux 정지, 내부 Nav2 작업 취소, 목표 중단(`OVERRIDDEN`, 결과 ABORTED) |
+| LB 해제로 AUTO 복귀 | 아무 목표도 재개하지 않음. 새 목표가 와야 주행 |
+| 주행 중 조이스틱 연결·끊김 | 영향 없음 |
 | 새 목표 | 이전 목표 종료 후 교체 |
 | 취소 | 실행·보관 목표 모두 삭제 |
 | 도착 또는 최종 실패 / navigation 재시작 | 목표 종료, 자동 재실행·복원하지 않음 |
 
-- `/navigation/status`(transient-local): `IDLE`, `WAITING_AUTO`, `WAITING_NAV2`, `RUNNING`, `PAUSED`, `STOPPING`, `MANEUVER`,
-  `SUCCEEDED`, `FAILED`, `CANCELED`. 명령 전달은 20 Hz, 마지막 명령이 0.20초 지연되면 0을 전달한다.
-- 목표 교체·빠른 RB OFF/ON에서도 이전 내부 액션의 실제 terminal result를 기다린 뒤 다음을 실행한다. Nav2 핵심 프로세스가 죽으면 navigation launch도 종료한다.
+- `/navigation/status`(transient-local): `IDLE`, `WAITING_NAV2`, `RUNNING`, `STOPPING`, `MANEUVER`, `MANUAL`(LB 끼어들기 중, 목표 없음),
+  `SUCCEEDED`, `FAILED`, `CANCELED`, `OVERRIDDEN`(LB 끼어들기로 중단). 명령 전달은 20 Hz, 마지막 명령이 0.20초 지연되면 0을 전달한다.
+- 목표 교체·LB 해제 직후 새 목표에서도 이전 내부 액션의 실제 terminal result를 기다린 뒤 다음을 실행한다. Nav2 핵심 프로세스가 죽으면 navigation launch도 종료한다.
+- MANUAL에서는 엘리베이터 기동 임대(`/navigation/maneuver_lease`)도 거절한다.
 - 취소: `ros2 service call /navigate_to_pose/_action/cancel_goal action_msgs/srv/CancelGoal "{}"`.
 - `scripts/auto_turn_test.py` 등 다른 `/cmd_vel_auto` 발행 프로그램은 navigation과 동시에 실행하지 않는다.
 
@@ -284,11 +335,30 @@ base_footprint
 ### RViz
 
 - `rviz2 -d src/amr_system/amr_stack/rviz/navigation.rviz`. Fixed Frame `map`, **2D Pose Estimate** = `/initialpose`, **2D Goal Pose** = `/goal_pose`.
-  목표는 navigation_manager를 거쳐 RB·취소·속도 제한을 똑같이 적용받는다.
+  목표는 navigation_manager를 거쳐 LB 끼어들기·취소·속도 제한을 똑같이 적용받는다.
 - 기본 화면은 `amr_rviz_plugins/SingleThreadedTF`로 TF 수신·표시를 한 스레드에서 처리한다(TF 메시지 필터 교착 회피). 화면을 저장할 때도
   `Transformation -> Current` 선택을 유지한다. 플러그인이 설치되지 않았으면 navigation launch가 빌드 안내와 함께 중단한다.
 - Navigation 2 패널·GoalTool·ParticleCloud는 기본 화면에서 뺐다. 15 fps, CAD 모델·전역 costmap·경로 화살표는 기본으로 끈다.
 - 초록 **Robot Footprint**는 충돌 검사 외곽(0.656×0.574 m + 0.02 m), 장애물 주변 색 띠는 inflation 비용(1.60 m 전체가 통행 금지는 아님).
+
+## 9a. CPU 부하 (Jetson Orin Nano, 2026-10-23)
+
+- 실차 스택 전체를 올리면 부하 평균이 코어 6개에 12~13까지 올라 `odom → base_footprint` TF가 평균 0.3초, 최대 3초 늦게 도착했다.
+  그러면 `navigation_startup`이 최신 스캔을 변환하지 못해 READY를 잠시 풀고 `navigation_manager`가 목표를 중단했다
+  (`Localization readiness lost`). 컨트롤러 주기도 20 Hz에서 9~15 Hz로 떨어졌다.
+- 코어 1개 기준 CPU: `vehicle_status` 67 %, `navigation_startup` 58 %, `web_ui` 42 %, `can_telemetry` 33 %, `control_mux`·`time_health`·
+  `elevator_monitor`·`floor_mission_manager` 각 25 %. 모두 Python이며 대부분 `/tf`(57 msg/s)를 구독한다.
+- `vehicle_status`는 웹 텔레메트리 카드만 쓰므로 bringup 기본값을 `start_vehicle_status:=false`로 바꿨다. 필요하면 인자로 켠다.
+- 주행 중 Chromium은 웹 UI 탭 하나만 둔다. 다른 VS Code 서버·Codex·cpptools를 띄워 두면 RAM 100 MB·스왑 0까지 떨어진 적이 있다.
+- 주행 4회에서 멈춤 13회가 모두 `navigation_startup`의 "odom·base·LiDAR 좌표 변환을 기다립니다"였고, 그때 이 노드는 CPU 92 %였다
+  (DDS 지연은 정상). 파이썬 노드라 TF 수신 스레드가 자기 연산에 밀린 것이다. py-spy(`sudo sysctl kernel.yama.ptrace_scope=0` 후
+  `py-spy record -p <pid> -d 15 -f raw`)로 잰 비중: 빔별 TF 조회 360회/틱 27 %, 입자 2,000개 역직렬화 9 %, `valid_scan` 파이썬 루프 6 %,
+  10 Hz 틱마다 같은 스캔 재채점. 조치: TF는 10 ms 간격 지점만 조회해 보간, 입자 구름은 초기 검증 때만 역직렬화, 스캔 검사 numpy,
+  READY에서는 새 스캔·AMCL 추정이 왔을 때만 채점, 보정 전 점수는 정렬 실패 때만 계산. 재시작 직후 측정 42 %(채점 전 두 항목 적용 전).
+- `web_ui` 50~75 %: `/api/state`마다 상태 deepcopy(30 %), 스캔 3,240점 파이썬 변환(13 %), 코스트맵 갱신마다 PNG 인코딩(9 %).
+  얕은 복사, numpy 변환, 요청 시 인코딩으로 바꿨다.
+- `can_telemetry` 30~40 %: 5 ms 타이머로 초당 200번 실행기를 깨워 CAN 소켓을 비웠다(프레임은 초당 약 60개). 이제 수신 스레드가
+  커널 `recv`에서 블록하다가 프레임이 올 때만 깨고, 실행기는 1 Hz 진단 타이머만 돌린다. 메시지 내용·타임스탬프는 그대로다.
 
 ## 10. 시간 이상 처리
 
@@ -355,10 +425,10 @@ ros2 launch amr_stack bringup.launch.py start_can_bridge:=false
 ros2 run amr_can_bridge cmd_vel_to_can [--ros-args -p dry_run:=true]
 ```
 
-### RB 자율 모드 회전 시험
+### 자율 모드 회전 시험
 
-`scripts/auto_turn_test.py`는 AUTO 상태에서 우회전 2초(-0.20 rad/s) → 좌회전 2초(+0.20 rad/s)를 20 Hz로 반복하고, AUTO가 아니면 0을 발행한다.
-RB OFF는 반복을 멈추고 다시 ON 하면 우회전부터 시작한다.
+`scripts/auto_turn_test.py`는 MANUAL → AUTO 전환(LB를 눌렀다 놓고 0.5초)을 본 뒤 우회전 2초(-0.20 rad/s) → 좌회전 2초(+0.20 rad/s)를 20 Hz로 반복하고,
+그 밖에는 0을 발행한다. 스크립트 시작 시 이미 AUTO이면 시작하지 않는다. LB를 누르면(MANUAL) 멈추고, 놓으면 우회전부터 다시 시작한다.
 
 ```bash
 ros2 launch amr_stack bringup.launch.py can_dry_run:=true start_lidar:=false start_can_telemetry:=false
@@ -368,7 +438,7 @@ ros2 topic echo /cmd_vel_to_can/tx_preview             # CAN 변환 미리보기
 ros2 topic echo /control_mux/mode --qos-durability transient_local
 ```
 
-확인: AUTO 중 LB·스틱을 움직여도 최종 출력은 자율 명령만 따른다. 회전 도중 RB를 누르면 즉시 0. 스크립트를 종료하면 0.
+확인: 회전 도중 컨트롤러를 켜거나 꺼도 회전은 계속되고, LB를 누르면 즉시 0. 스크립트를 종료하면 0.
 
 ## 12. 주행 기록
 

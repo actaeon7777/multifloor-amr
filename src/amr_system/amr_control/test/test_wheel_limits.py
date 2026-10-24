@@ -18,22 +18,25 @@ from amr_control.wheel_limiter import WheelSpeedLimiter
                                  (1.0, -0.8), (-1.0, -0.8)])
 def test_turn_keeps_curvature_in_both_modes_and_straight_recovers(mode, v, w):
     gate = ControlGate(max_linear_speed=1.0, max_angular_speed=0.8)
-    gate.receive_joy([0.0] * 3, [0] * 8, 0.0)
-    gate.receive_joy([0.0] * 3, [0] * 6 + [int(mode == 'MANUAL'), int(mode == 'AUTO')], 0.12)
-    receive = gate.receive_command if mode == 'MANUAL' else gate.receive_auto_command
-    receive((v, 0, 0, 0, 0, w), 0.13)
-    if mode == 'AUTO':
-        assert gate.output(0.15) == (0.0, 0.0)
-    limited_v, limited_w = gate.output(0.23)
+    if mode == 'MANUAL':
+        t = 0.0
+        gate.receive_joy([0.0] * 3, [0] * 8, 0.0)
+        gate.receive_joy([0.0] * 3, [0] * 6 + [1, 0], 0.12)
+        receive = gate.receive_command
+    else:
+        t = 0.0  # AUTO is the default; no LB pressed.
+        receive = gate.receive_auto_command
+    receive((v, 0, 0, 0, 0, w), t + 0.13)
+    limited_v, limited_w = gate.output(t + 0.23)
     assert limited_w / limited_v == pytest.approx(w / v)
     assert max(abs(limited_v + limited_w * 0.2645),
                abs(limited_v - limited_w * 0.2645)) == pytest.approx(pi * 0.172 * 1.8)
     assert 0 < limited_v / v < 1
     assert 0 < limited_w / w < 1
-    receive((v, 0, 0, 0, 0, 0), 0.24)
-    assert abs(gate.output(0.25)[0]) == pytest.approx(pi * 0.172 * 1.8)
-    assert gate.output(0.25)[1] == 0
-    assert gate.output(0.70) == (0.0, 0.0)  # Joy timeout must still stop.
+    receive((v, 0, 0, 0, 0, 0), t + 0.24)
+    assert abs(gate.output(t + 0.25)[0]) == pytest.approx(pi * 0.172 * 1.8)
+    assert gate.output(t + 0.25)[1] == 0
+    assert gate.output(t + 0.75) == (0.0, 0.0)  # Joy or AUTO command timeout must still stop.
 
 
 def test_small_input_is_unchanged_and_oversized_rotation_is_bounded():

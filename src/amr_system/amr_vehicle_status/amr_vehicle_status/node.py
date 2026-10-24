@@ -20,6 +20,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 from .model import StatusModel, TIMEOUTS
 
+ESTOP_STATES = {'UNKNOWN','ESTOP','DISARMED','ARMING','READY','BYPASS'}
 LOCALIZATION_STATES = {'WAITING_DATA','SEARCHING','VERIFYING','WAITING_INITIAL_POSE',
                        'STARTING_NAVIGATION','READY','FAILED','SUSPENDED'}
 
@@ -34,6 +35,7 @@ class VehicleStatusNode(Node):
         self.session, self.sequence, self.epoch = str(uuid.uuid4()), 0, 0
         self.clock_monitor = ClockMonitor()
         self.health = HealthLease()
+        self.estop = HealthLease()
         self.localization_order = SessionOrder()
         self.control_mode = self.navigation = 'UNKNOWN'
         self.mode_received = self.navigation_received = False
@@ -52,7 +54,8 @@ class VehicleStatusNode(Node):
                 lambda msg,s=side:self.on_motor(s,msg),qos_profile_sensor_data))
         retained = QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)
         for topic, callback in [('/control_mux/mode',self.on_mode),('/navigation/status',self.on_navigation),
-                                 ('/localization/status',self.on_localization),('/system/time_health',self.on_time)]:
+                                 ('/localization/status',self.on_localization),('/system/time_health',self.on_time),
+                                 ('/estop/status',self.on_estop)]:
             self.sources.append(self.create_subscription(String,topic,callback,retained))
         self.create_timer(1/rate,self.tick,clock=Clock(clock_type=ClockType.STEADY_TIME))
 
@@ -99,6 +102,22 @@ class VehicleStatusNode(Node):
                 now,base_age=max(0.,time.time()-self.health.status['stamp']))
         elif not self.health.status:
             self.model.reject('time',now)
+
+    def on_estop(self, msg):
+        now = time.monotonic()
+        if self.estop.receive(msg.data,now=now) and self.estop.status.get('state') in ESTOP_STATES:
+            status = self.estop.status
+            stm32 = status.get('stm32') if isinstance(status.get('stm32'),dict) else {}
+            trips = stm32.get('trip_count',0)
+            self.model.observe('estop',dict(state=status['state'],
+                approval_required=status.get('approval_required') is True,
+                pressed=stm32.get('raw') is True,stopped=stm32.get('stopped') is True,
+                drive_enabled=stm32.get('drive_enabled') is True,
+                trip_count=trips if type(trips) is int and 0 <= trips < 2**32 else 0,
+                detail=str(status.get('detail',''))[:1000]),
+                now,base_age=max(0.,time.time()-status['stamp']))
+        elif not self.estop.status or self.estop.status.get('state') not in ESTOP_STATES:
+            self.model.reject('estop',now)
 
     def on_sample(self, name, msg):
         now = time.monotonic()
@@ -249,6 +268,17 @@ class VehicleStatusNode(Node):
         msg.time_healthy = health['fresh'] and self.health.healthy(now)
         msg.time_fault_latched = health['values'].get('latched',False)
         msg.time_detail = health['values'].get('detail','')
+        estop = samples['estop']
+        msg.estop_status = self.metadata(estop)
+        values = estop['values'] if estop['fresh'] else {}
+        msg.estop_state = values.get('state','UNKNOWN')
+        msg.estop_approval_required = values.get('approval_required',False)
+        msg.estop_button_pressed = values.get('pressed',False)
+        msg.estop_stm32_stopped = values.get('stopped',False)
+        msg.estop_drive_enabled = values.get('drive_enabled',False)
+        msg.estop_trip_count = estop['values'].get('trip_count',0)
+        msg.estop_detail = values.get('detail','E-stop 상태 수신 시간이 초과되었습니다.'
+                                      if estop['received'] else '')
         diag = samples['diagnostics']['values']
         msg.diagnostic_level,msg.diagnostic_detail = diag.get('level',3),diag.get('detail','')
         for field,key in [('received_frames','received'),('invalid_frames','invalid'),('stale_frames','stale_frames'),

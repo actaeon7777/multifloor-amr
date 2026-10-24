@@ -1,7 +1,7 @@
 """ROS adapter for the simulated elevator (replaces RF -> STM32 -> CAN in simulation).
 
-Publishes the same /elevator/beacon the real elevator_can_link does and consumes
-/elevator/command.  ``ElevatorRosAdapter`` can be attached to any node, so the
+Publishes the same /elevator/beacon and /elevator/command_status the real
+elevator_can_link does and consumes /elevator/command.  ``ElevatorRosAdapter`` can be attached to any node, so the
 Isaac runner can step it with physics; ``elevator_sim`` runs it standalone for
 ROS-only tests.  /sim/elevator/status (JSON) is ground truth for evaluation and
 must not be used by AMR logic.
@@ -10,7 +10,7 @@ must not be used by AMR logic.
 import json
 import math
 
-from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand
+from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -48,6 +48,8 @@ class ElevatorRosAdapter:
         self.model.set_robot(self.reference_index, False)
         self.robot_override = False
         self.beacon_pub = node.create_publisher(ElevatorBeacon, 'elevator/beacon', 20)
+        self.command_status_pub = node.create_publisher(
+            ElevatorCommandStatus, 'elevator/command_status', 20)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = node.create_publisher(String, 'sim/elevator/status', latched)
         node.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 10)
@@ -67,7 +69,7 @@ class ElevatorRosAdapter:
 
     def on_command(self, message):
         self.model.command(self.now(), message.command, message.floor_code, message.direction,
-                           message.sequence)
+                           message.sequence, message.repeat)
 
     def on_inject(self, message):
         try:
@@ -103,6 +105,8 @@ class ElevatorRosAdapter:
                 rssi_dbm=max(-128, min(127, frame.rssi_dbm)), source='sim')
             beacon.header.stamp = Time(nanoseconds=round(max(0., frame.stamp) * 1e9)).to_msg()
             self.beacon_pub.publish(beacon)
+        for record in self.model.take_statuses():
+            self.command_status_pub.publish(command_status(record))
         status = self.model.status()
         status.update(elevator_id=self.elevator_id, car_z_m=self.car_z(), sim_time=now,
                       robot_level=self.model.robot_level, robot_in_car=self.model.robot_in_car)
@@ -135,20 +139,42 @@ class ElevatorSimNode(Node):
             self.adapter.tick()
 
 
+def command_status(record):
+    """ElevatorSim CommandStatus (or its JSON dict) -> ElevatorCommandStatus."""
+    get = record.get if isinstance(record, dict) else lambda key: getattr(record, key)
+    message = ElevatorCommandStatus(
+        cmd_seq=int(get('cmd_seq')) & 0xff, status=int(get('status')),
+        device_result=int(get('device_result')) & 0xff, target=int(get('target')) & 0xff,
+        attempts=int(get('attempts')) & 0xff, source='sim')
+    message.header.stamp = Time(nanoseconds=round(max(0., float(get('stamp'))) * 1e9)).to_msg()
+    return message
+
+
 class ElevatorRelayNode(Node):
     """Typed elevator topics <-> the Isaac process's JSON topics (Isaac has no custom msgs)."""
 
     def __init__(self, **kwargs):
         super().__init__('elevator_sim_relay', **kwargs)
         self.beacon_pub = self.create_publisher(ElevatorBeacon, 'elevator/beacon', 50)
+        self.command_status_pub = self.create_publisher(
+            ElevatorCommandStatus, 'elevator/command_status', 20)
         self.raw_pub = self.create_publisher(String, 'sim/elevator/command_raw', 20)
         self.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 20)
         self.create_subscription(String, 'sim/elevator/beacon_raw', self.on_raw, 50)
+        self.create_subscription(String, 'sim/elevator/command_status_raw', self.on_status_raw, 20)
 
     def on_command(self, message):
         self.raw_pub.publish(String(data=json.dumps({
             'command': message.command, 'floor_code': message.floor_code,
-            'direction': message.direction, 'sequence': message.sequence})))
+            'direction': message.direction, 'sequence': message.sequence,
+            'repeat': message.repeat})))
+
+    def on_status_raw(self, message):
+        try:
+            for record in json.loads(message.data):
+                self.command_status_pub.publish(command_status(record))
+        except (ValueError, KeyError, TypeError) as error:
+            self.get_logger().error(f'Invalid simulated command status: {error}')
 
     def on_raw(self, message):
         try:

@@ -14,9 +14,9 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .common import (AGED_FIELDS, COMMANDS, FLOOR_LAYER, LAYERS, MAX_COMMAND, MAX_FLOORS, MAX_MESSAGE,
-                     PROTOCOL_VERSION, REQUEST_ID, dumps, floor_layer, floor_map_version, identifier,
-                     layer_floor, loads, positive, read_token)
+from .common import (AGED_FIELDS, COMMANDS, FLOOR_LAYER, LAYERS, LEASED_FIELDS, MAX_COMMAND, MAX_FLOORS,
+                     MAX_MESSAGE, PROTOCOL_VERSION, REQUEST_ID, dumps, floor_layer, floor_map_version,
+                     identifier, layer_floor, loads, positive, read_token)
 
 DISPLAY_FIELDS = ('scan', 'wheel', 'imu', 'ekf', 'joints', 'command', 'diagnostics', 'power',
                   'vehicle', 'pose', 'localization', 'time', 'battery')
@@ -35,6 +35,35 @@ def age_items(state):
         for name in DISPLAY_FIELDS:
             if telemetry.get(name) is not None:
                 yield telemetry[name]
+
+
+def _number(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def lease_items(state):
+    """E-stop / elevator status blocks: a dict whose age is null or a non-negative number."""
+    for name in LEASED_FIELDS:
+        item = state.get(name)
+        if item is None:
+            continue
+        if (not isinstance(item, dict) or not (item.get('age') is None or _number(item['age']))
+                or not (item.get('timeout') is None or _number(item['timeout']))):
+            raise ApiError(400, f'Invalid {name} status')
+        yield item
+
+
+def age_lease(item, extra_age):
+    """Add the relay delay; a lease that ran out is no longer fresh, never extended."""
+    if item.get('age') is None:
+        return
+    item['age'] += extra_age
+    timeout = item.get('timeout')
+    if timeout is not None and item['age'] >= timeout:
+        item['fresh'] = False
+        for key in ('approval_required', 'healthy'):
+            if key in item:
+                item[key] = False
 
 
 class ApiError(Exception):
@@ -166,6 +195,7 @@ class Registry:
                 if (not isinstance(item, dict) or not isinstance(item.get('age'), (int, float)) or
                         isinstance(item.get('age'), bool) or not math.isfinite(item['age']) or item['age'] < 0):
                     raise ApiError(400, 'Invalid sensor age')
+            list(lease_items(state))  # Raises on a malformed E-stop or elevator block.
             goal = state.get('goal')
             if isinstance(goal, dict) and 'feedback_age' in goal:
                 value = goal['feedback_age']
@@ -269,6 +299,8 @@ class Registry:
             extra_age = now - robot.captured
             for item in age_items(result):
                 item['age'] += extra_age
+            for item in lease_items(result):
+                age_lease(item, extra_age)
             if isinstance(result.get('goal'), dict) and 'feedback_age' in result['goal']:
                 result['goal']['feedback_age'] += extra_age
             telemetry = result.get('telemetry') or {}
@@ -399,8 +431,19 @@ class Registry:
             return [dict(robot_id=robot.robot_id, online=self._fresh(robot, now),
                          age=now - robot.last_exchange if robot.last_exchange is not None else None,
                          local_api_available=robot.state is not None,
-                         navigation=robot.state.get('navigation') if robot.state else None)
+                         navigation=robot.state.get('navigation') if robot.state else None,
+                         **self._badges(robot))
                     for robot in self.robots.values()]
+
+    @staticmethod
+    def _badges(robot):
+        """E-stop state and elevator RF level for the fleet list (None when unknown)."""
+        state = robot.state or {}
+        estop, elevator = state.get('estop') or {}, state.get('elevator') or {}
+        live = estop.get('fresh') is True
+        return dict(estop=str(estop['state'])[:16] if live and estop.get('state') else None,
+                    estop_required=estop.get('required') is True,
+                    elevator_rf=elevator.get('level') if elevator.get('fresh') is True else None)
 
 
 def find_assets(explicit=None):

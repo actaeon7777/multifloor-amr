@@ -39,9 +39,32 @@ def test_three_floors_with_unique_beacons(config):
     assert config.floor_by_beacon_code(0) is None
 
 
-def test_only_measured_floor_is_enabled_on_the_real_vehicle(config):
-    assert {n for n, f in config.floors.items() if f.real_enabled} == {'4F'}
-    assert all(f.provisional_copy_of == '4F' for n, f in config.floors.items() if n != '4F')
+def test_floors_without_a_map_are_pass_floors(config):
+    # Hall beacons are installed on 1F-7F; floors without a map are only for floor tracking.
+    assert sorted(config.pass_floors) == ['1F', '2F', '6F', '7F']
+    codes = {f.beacon_floor_code for f in (*config.floors.values(), *config.pass_floors.values())}
+    assert codes == set(range(1, 8))
+    assert config.pass_floor_by_beacon_code(6).name == '6F'
+    assert config.floor_by_beacon_code(6) is None and config.pass_floor_by_beacon_code(4) is None
+    with pytest.raises(FloorConfigError):
+        config.floor('6F')  # Never a mission goal or a map.
+
+
+def test_only_the_elevator_tested_floors_are_enabled_on_the_real_vehicle(config):
+    # 3F: hall call to in-car alignment passed on the real vehicle (2026-10-24). 5F is not tested yet.
+    assert {n for n, f in config.floors.items() if f.real_enabled} == {'3F', '4F'}
+    assert all(f.provisional_copy_of is None for f in config.floors.values())
+
+
+def test_real_floor_maps_share_the_reference_lattice(config):
+    """Floor switches keep the pose numbers, so every real map uses 4F's frame and cell lattice."""
+    reference = yaml.safe_load(config.map_path('4F', False).read_text())
+    for name in config.floors:
+        meta = yaml.safe_load(config.map_path(name, False).read_text())
+        assert meta['resolution'] == reference['resolution'], name
+        for axis in (0, 1):
+            cells = (meta['origin'][axis]-reference['origin'][axis])/meta['resolution']
+            assert abs(cells-round(cells)) < 1e-6, (name, axis)
 
 
 def test_referenced_files_exist(config):
@@ -195,6 +218,12 @@ def _broken(raw, mutate):
     (lambda d: d['elevators']['E1'].update(car_interior_m=[1.87, -1]), 'positive'),
     (lambda d: d['sim'].update(floor_height_m=0), 'floor_height_m'),
     (lambda d: d.update(floors={}), 'no floors'),
+    (lambda d: d['floors']['3F'].update(beacon_floor_code=21), '-8..20'),
+    (lambda d: d['pass_floors'].update({'4F': {'level': 9, 'beacon_floor_code': 9}}), 'also a mapped'),
+    (lambda d: d['pass_floors']['6F'].update(level=5), 'duplicate level'),
+    (lambda d: d['pass_floors']['6F'].update(beacon_floor_code=4), 'duplicate beacon_floor_code'),
+    (lambda d: d['pass_floors']['6F'].update(beacon_floor_code=0), 'non-zero int8'),
+    (lambda d: d['pass_floors'].update({'8F': {'level': 8}}), 'non-zero int8'),
 ])
 def test_invalid_configs_are_rejected(raw, mutate, message):
     with pytest.raises(FloorConfigError, match=message):

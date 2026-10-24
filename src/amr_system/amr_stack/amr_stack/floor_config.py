@@ -11,7 +11,7 @@ Path conventions:
 * ``sim_layer`` is relative to the AMR workspace root (simulation only).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
@@ -77,6 +77,18 @@ class Floor:
 
 
 @dataclass(frozen=True)
+class PassFloor:
+    """A floor the car stops at but the AMR has no map for (``pass_floors``).
+
+    Its hall beacon only tells the floor state that the car is at another floor,
+    so the ride continues; it can never be a mission goal.
+    """
+    name: str
+    level: int
+    beacon_floor_code: int
+
+
+@dataclass(frozen=True)
 class SimSettings:
     floor_height_m: float
     car_speed_m_s: float
@@ -107,6 +119,7 @@ class BuildingConfig:
     sim: SimSettings
     source: Optional[Path] = None
     package_root: Path = _PACKAGE_ROOT
+    pass_floors: Mapping[str, PassFloor] = field(default_factory=dict)
 
     def floor(self, name: str) -> Floor:
         try:
@@ -116,6 +129,9 @@ class BuildingConfig:
 
     def floor_by_beacon_code(self, code: int) -> Optional[Floor]:
         return next((f for f in self.floors.values() if f.beacon_floor_code == code), None)
+
+    def pass_floor_by_beacon_code(self, code: int) -> Optional[PassFloor]:
+        return next((f for f in self.pass_floors.values() if f.beacon_floor_code == code), None)
 
     def find_room(self, room_id: str, floor: Optional[str] = None) -> Tuple[Floor, Room]:
         """Return the floor and room; ``floor`` is required only if ambiguous."""
@@ -210,8 +226,14 @@ def parse_floor_config(raw, source: Optional[Path] = None,
     default_floor = str(data.get('default_floor'))
     if default_floor not in floors:
         raise FloorConfigError(f'{where}: default_floor {default_floor!r} is not a floor')
+    pass_floors = {str(k): PassFloor(str(k), *_level_and_code(
+                       f'pass floor {k}', _mapping(v, f'{where}.pass_floors.{k}')))
+                   for k, v in _mapping(data.get('pass_floors', {}), f'{where}.pass_floors').items()}
+    for name in pass_floors:
+        if name in floors:
+            raise FloorConfigError(f'{where}: pass floor {name!r} is also a mapped floor')
     for key in ('level', 'beacon_floor_code'):
-        values = [getattr(f, key) for f in floors.values()]
+        values = [getattr(f, key) for f in (*floors.values(), *pass_floors.values())]
         if len(set(values)) != len(values):
             raise FloorConfigError(f'{where}: duplicate {key}')
     for item in floors.values():
@@ -224,7 +246,7 @@ def parse_floor_config(raw, source: Optional[Path] = None,
         car_accel_m_s2=_positive(sim.get('car_accel_m_s2', 0.5), 'sim.car_accel_m_s2'),
     )
     return BuildingConfig(SCHEMA_VERSION, str(data.get('building', '')), default_floor,
-                          elevators, floors, settings, source, Path(package_root))
+                          elevators, floors, settings, source, Path(package_root), pass_floors)
 
 
 def _elevator_spec(name, data) -> ElevatorSpec:
@@ -244,14 +266,22 @@ def _elevator_spec(name, data) -> ElevatorSpec:
     return ElevatorSpec(name, width, depth, door, offset, threshold, (open_min, open_max))
 
 
-def _floor(name, data, elevators) -> Floor:
-    label = f'floor {name}'
+def _level_and_code(label, data):
     code = data.get('beacon_floor_code')
     if not isinstance(code, int) or isinstance(code, bool) or not -128 <= code <= 127 or code == 0:
         raise FloorConfigError(f'{label}: beacon_floor_code must be a non-zero int8 (0 is the car)')
+    if not -8 <= code <= 20:
+        # Hall beacon RF node 0x40 + code must stay in 0x38-0x54 (ELEVATOR_RF_PROTOCOL.md 4).
+        raise FloorConfigError(f'{label}: beacon_floor_code must be in -8..20')
     level = data.get('level')
     if not isinstance(level, int) or isinstance(level, bool):
         raise FloorConfigError(f'{label}: level must be an integer')
+    return level, code
+
+
+def _floor(name, data, elevators) -> Floor:
+    label = f'floor {name}'
+    level, code = _level_and_code(label, data)
     real_enabled = data.get('real_enabled', False)
     if not isinstance(real_enabled, bool):
         raise FloorConfigError(f'{label}: real_enabled must be true or false')

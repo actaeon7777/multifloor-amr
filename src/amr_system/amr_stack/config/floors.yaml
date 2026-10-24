@@ -22,7 +22,7 @@ floors:
   "3F":
     level: 3
     beacon_floor_code: 3
-    real_enabled: false              # 엘리베이터 실차 시험 전까지 실차 층간 이동 금지
+    real_enabled: true               # 2026-10-24 실차 시험(홀 호출~카 안 정렬) 통과 후 켜 둠. 카 비콘 설치 전에는 카 안 SELECT_FLOOR에서 NO_CAR_ACK로 안전 정지 → LB로 수동 회수
     # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_3_floor/MAP_SOURCE.md)
     map: maps/G_3_floor/3_floor_1006.yaml
     annotations: maps/G_3_floor/3_floor_tmp_from_4F(영역지정).png

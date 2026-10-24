@@ -7,6 +7,22 @@
 > `diagnostics/`는 Jetson 작업공간, 나머지는 시뮬레이션 PC 작업공간에 있다. 아래 경로는 그 기준이다.
 > 시뮬레이션 수치는 실물 보정 전 모델(`calibration_status: uncalibrated`)의 결과이며 실차 성능으로 확정하지 않는다.
 
+## 2026-10-24 · 실차 엘리베이터 통합 시험 (4F 홀 호출 ~ 카 안 정렬)
+
+- 조건: `experiment.sh real`에 `start_elevator_link:=true elevator_link_dry_run:=false`, 3F `real_enabled: true`. 설치 비콘은 4F 홀 비콘뿐(카 E1 없음).
+  4F 401에서 3F 301(1차)·302(2차)를 목적지로 2회. 원자료 `diagnostics/elevator_real/2026-10-24_run1_2.log`.
+- 홀 대기 위치 도착 76·73초. `HALL_CALL 4F ▼` → COMPLETED(PRESSED)·BUTTON_ACK 1.0·0.9초, 두 번 모두 첫 RF 시도 성공, rx_bad·tx_fail 0.
+  사람이 누르지 않았는데 ▼ 램프가 켜지고 문이 열렸다(명령 후 8.0·3.7초).
+- 탑승: 2차는 한 번에 4.0초 만에 카 안. 1차는 문턱 직전 문 판별이 OPEN↔CLOSING으로 흔들려 "문턱 전 문 닫힘" 후진 → 홀 복귀 → 재호출 후 성공.
+  카 벽 정합 수렴 후 RMS 6 mm, 카 안 180° 정렬 7.2·3.1초.
+- 종료: 카 비콘이 없어 `SELECT_FLOOR`에서 `NO_CAR_ACK` 안전 정지(설계대로). 카 대상 열림 명령은 RF_TIMEOUT으로 비치명 처리.
+- 남은 것:
+  - 문 판별 중간 상태(OPENING/CLOSING) 안정화. 지금은 확인 스캔 없이 즉시 바뀐다.
+  - 비콘 세기: 홀 대기 위치 BUTTON_ACK가 −80 등급(RPD=0)이었다. 실제 운행의 도착 판정(문 열림 + 홀 비콘 ≥ −70)이 안 될 수 있어,
+    출력을 올린 뒤 RF §9.2로 측정해야 한다.
+  - 카 안 종료 뒤 위치 추정이 SUSPENDED로 남는 것, 스택 재시작 시 현재 층 `ASSUMED`로 미션이 거절되는 것(웹에서 재개·층 지정 필요).
+- 시험 후 3F `real_enabled`는 `true`로 유지했다. 카 비콘 설치 전에 3F 목적지를 보내면 카 안에서 안전 정지하고, LB로 수동 회수한다.
+
 ## 2026-10-23 · 실차 CAN 점검과 STM32 윤거 수정
 
 - 수동 주행 중 "재개 승인 필요"가 반복된 원인은 Jetson `can0` bus-off였다(3.6분 주행에 101회, 커널 로그는 대부분 Bit0 Error).

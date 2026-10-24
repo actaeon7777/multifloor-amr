@@ -50,9 +50,9 @@ def test_floors_without_a_map_are_pass_floors(config):
         config.floor('6F')  # Never a mission goal or a map.
 
 
-def test_only_the_elevator_tested_floor_is_enabled_on_the_real_vehicle(config):
-    # 3F/5F have measured maps but the elevator ride is not yet tested on the real vehicle.
-    assert {n for n, f in config.floors.items() if f.real_enabled} == {'4F'}
+def test_only_the_elevator_tested_floors_are_enabled_on_the_real_vehicle(config):
+    # 3F: hall call to in-car alignment passed on the real vehicle (2026-10-24). 5F is not tested yet.
+    assert {n for n, f in config.floors.items() if f.real_enabled} == {'3F', '4F'}
     assert all(f.provisional_copy_of is None for f in config.floors.values())
 
 

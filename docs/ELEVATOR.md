@@ -51,7 +51,8 @@
 | `elevator_sim_relay` | `amr_sim_bridge` | Isaac JSON 토픽 ↔ `/elevator/*` | 시뮬레이션 전용 |
 
 `experiment.sh sim world:=building`이면 monitor·mission·relay가 자동으로 실행된다. 실차(`experiment.sh real`)도 2026-10-23부터 monitor·mission을
-기본으로 실행해 웹에 층 탭·호실 목록이 나온다(`elevator:=false`로 끔). `real_enabled: false` 층은 계속 거절되고 `elevator_can_link`는 꺼져 있다.
+기본으로 실행해 웹에 층 탭·호실 목록이 나온다(`elevator:=false`로 끔). `real_enabled: false` 층은 계속 거절된다. `elevator_can_link`는 기본 꺼짐이고
+`start_elevator_link:=true`로 켠다. 이때도 `elevator_link_dry_run`이 기본 `true`라 0x210을 미리보기만 하며, `false`여야 실제 버튼을 누른다.
 
 ### 토픽·서비스·액션
 
@@ -186,7 +187,7 @@ IDLE ─(같은 층)────────────────────
 |---|---|
 | `elevators.<id>` | 카 치수, 출입구 폭·위치, 문턱 깊이, 문 열림 시간 |
 | `floors.<층>.level`, `beacon_floor_code` | 층 순서, 비콘 층 코드 |
-| `real_enabled` | 실차 층간 이동 허용. 3F·5F는 엘리베이터 실차 시험 전까지 `false` |
+| `real_enabled` | 실차 층간 이동 허용. 4F·3F `true`(3F는 2026-10-24 실차 시험 후), 5F `false` |
 | `provisional_copy_of` | 다른 층 지도를 복사한 임시본이면 원본 층. 현재 없음 (3F·5F는 2026-10-23 실측 지도로 교체) |
 | `map`, `annotations`, `sim_map` | 실차 지도, 영역 주석 PNG, 시뮬레이션 지도 (`amr_stack` 패키지 기준 경로) |
 | `sim_layer`, `spawn` | 시뮬레이션 층 USD, 시작 자세 |
@@ -197,7 +198,7 @@ IDLE ─(같은 층)────────────────────
 현재 엘리베이터 지점(3개 층 공통): 홀 문 중심 (9.975, 3.31), 호출·대기 (10.575, 3.31, π), 하차 종료 (10.775, 3.31, 0).
 `sim/config/floor4_rooms.json`은 `sim_demo.py` 호환용이다.
 
-## 6. 실차 CAN 경로 (**프로토콜 v1.1 · 하위제어기 구현 · Jetson 반영 · 통합 미시험**)
+## 6. 실차 CAN 경로 (**프로토콜 v1.1 · 하위제어기 구현 · Jetson 반영 · 홀 호출~카 안 정렬 실차 통과, 카 비콘 이후 미시험**)
 
 확정 명세는 두 문서로 나뉜다. 무선 구간(nRF24 설정, RF 프레임, 비콘 동작)은 [엘리베이터 RF 프로토콜](ELEVATOR_RF_PROTOCOL.md),
 하위제어기 ↔ Jetson CAN 프레임은 [엘리베이터 RF 중계 CAN 프로토콜](ELEVATOR_CAN_PROTOCOL.md)이다. 이 절은 요약이다.
@@ -348,8 +349,8 @@ python3 scripts/run_floor_suite.py --output logs/elevator/<새 폴더> [--scenar
 | 문 | 카 문과 홀 문이 함께 열리고 닫힌다 — 가정 |
 | 기동 | 전진 진입 → 카 안 180° 회전 → 전진 하차 (회전 지름 약 0.84 m < 카 폭 1.87 m) |
 | 지도 | 3F·5F 실차 지도는 실측(2026-10-06 SLAM)을 4F 좌표계로 정렬해 넣었다(`scripts/align_floor_map.py`, 엘리베이터 문 위치 차 3F 6.5 cm·5F 4.5 cm). 층 전환이 자세 값을 그대로 쓰므로 모든 층 지도는 같은 좌표계여야 한다. 시뮬레이션 3F·5F 장면·영역지정과 호실 좌표는 아직 4F 복사본 (`maps/G_3_floor/MAP_SOURCE.md`) |
-| 실차 | 3F·5F `real_enabled: false`. 호실 문 위치 현장 확인, 엘리베이터 실측(문턱 높이·틈)·실차 통합 시험 후 활성화 |
-| CAN·RF | 프로토콜 v1.1([RF](ELEVATOR_RF_PROTOCOL.md), [CAN](ELEVATOR_CAN_PROTOCOL.md)). 하위제어기 구현·단독 검증, 4F 홀 비콘 bench 왕복 확인, Jetson 반영. 실차 통합·현장 채널·RPD 보정 남음 |
+| 실차 | 3F `real_enabled: true`(2026-10-24 홀 호출~카 안 정렬 실차 2회 통과 후). 카 비콘이 없어 카 안 `SELECT_FLOOR`에서 `NO_CAR_ACK`로 안전 정지하며, LB로 수동 회수한다. 5F `false` |
+| CAN·RF | 프로토콜 v1.1([RF](ELEVATOR_RF_PROTOCOL.md), [CAN](ELEVATOR_CAN_PROTOCOL.md)). 하위제어기 구현·단독 검증, Jetson 반영. 실차에서 4F 홀 호출 → 실제 버튼 눌림(램프 점등) → ACK 확인(2026-10-24). 현장 채널·RPD 보정, 카 비콘 남음 |
 | 카 "열림" 버튼 | `repeat` 정의(1.1), 카 비콘 펌웨어 미구현. 없어도 후퇴·재호출 규칙으로 동작 |
 | 통과층 | 1·2·6·7F는 지도 없이 비콘만 쓴다. 시뮬레이션 장면에는 없다 |
 | 수치 | 층고 3.6 m, 카 속도 1.0 m/s, 센서 노이즈 0은 임시값 |

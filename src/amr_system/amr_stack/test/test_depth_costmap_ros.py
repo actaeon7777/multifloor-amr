@@ -21,7 +21,7 @@ from geometry_msgs.msg import PoseStamped, TransformStamped
 from lifecycle_msgs.msg import Transition
 from lifecycle_msgs.srv import ChangeState
 from nav2_msgs.action import ComputePathToPose
-from nav2_msgs.srv import IsPathValid
+from nav2_msgs.srv import ClearCostmapExceptRegion, ClearEntireCostmap, IsPathValid
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
@@ -134,6 +134,31 @@ def test_low_box_marking_floor_rejection_and_clearing(tmp_path, legacy_threshold
             grid = feed([(2.825, .025, z) for z in [0., .12]])
             # The farther return may inflate this cell, but the old box is gone.
             assert cost(grid, 2.425, .025) < 100
+
+            # Recovery clearing (navigate_to_pose_keep_nearby.xml): an obstacle in
+            # the camera's blind zone just ahead of the robot must survive, a far
+            # one is refreshed. The blind zone is modelled by publishing nothing.
+            near = [(x, y, height) for x in [.625, .675] for y in [-.075, -.025, .025, .075]]
+            far = [(x, y, height) for x in [2.375, 2.425] for y in [-.075, -.025, .025, .075]]
+            feed(near + far)
+            grid = feed([])
+            assert cost(grid, .65, .025) == 100 and cost(grid, 2.4, .025) == 100
+
+            def call(kind, request):
+                name = f'/clear_{kind}_costmap'  # standalone Costmap2DROS is named 'costmap'
+                client = node.create_client(
+                    ClearCostmapExceptRegion if kind == 'except' else ClearEntireCostmap, name)
+                spin_until(client.service_is_ready)
+                future = client.call_async(request)
+                spin_until(future.done)
+                return feed([])
+
+            grid = call('except', ClearCostmapExceptRegion.Request(reset_distance=2.))
+            assert cost(grid, .65, .025) == 100, 'Blind-zone obstacle was forgotten'
+            assert cost(grid, 2.4, .025) < 100, 'Far obstacle outside the kept square was not cleared'
+            # The stock recovery (clear entirely) is what forgot the 2026-10-25 slipper.
+            grid = call('entirely', ClearEntireCostmap.Request())
+            assert cost(grid, .65, .025) < 100
     finally:
         if process is not None and process.poll() is None:
             for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]:

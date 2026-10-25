@@ -59,7 +59,6 @@ def launch_nodes(context):
         if not isfinite(value) or value <= 0:
             raise ValueError(f'{control_path}: {name} must be positive and finite')
         geometry['FollowPath.WheelSpeed.' + name] = value
-    tree = Path(get_package_share_directory('nav2_bt_navigator')) / 'behavior_trees'
     # Action endpoints must be remapped explicitly; remapping only the
     # action base name does not move its hidden services/topics.
     action_remaps = [
@@ -79,8 +78,10 @@ def launch_nodes(context):
              parameters=[config, {
                  # Keep a valid route around an obstacle instead of changing sides
                  # at every 1 Hz replan. Check validity at 2 Hz, refresh after 10 s.
+                 # Recoveries keep a 2 m square around the robot: obstacles in the
+                 # depth camera's blind zone must not be forgotten (see the XML).
                  'default_nav_to_pose_bt_xml': str(
-                     tree / 'nav_to_pose_with_consistent_replanning_and_if_path_becomes_invalid.xml'),
+                     share / 'behavior_trees/navigate_to_pose_keep_nearby.xml'),
              }], remappings=action_remaps + [
                  ('goal_pose', '/navigation/internal_goal_pose'),
              ], output='screen'),

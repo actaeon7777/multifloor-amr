@@ -14,6 +14,7 @@ Nav2 → navigation_manager → /cmd_vel_auto ──────┘   (바퀴 �
 CAN 피드백 → can_telemetry → /wheel/odometry, /joint_states, /imu/data_raw → EKF → odom → base_footprint
 S2 LiDAR → /scan_raw → scan_body_filter → /scan → AMCL → map → odom
 Gemini 2 (start_camera:=true) → /camera/depth/points → depth_persistence_filter(같은 odom 5 cm 칸에 3프레임 연속일 때만 장애물 점 통과) → /camera/depth/points_filtered → 전역·지역 costmap depth_layer 표시(지우기는 원본 점군), time_health depth 감시(필터 출력)
+                              (Nav2 복구는 behavior_trees/navigate_to_pose_keep_nearby.xml: 로봇 주변 2 m 정사각형은 지우지 않음 — 카메라 사각지대 낮은 물체 보존)
                               → /camera/color/image_raw/compressed → web_ui /api/camera.jpg → 중앙 관제 중계
 ```
 

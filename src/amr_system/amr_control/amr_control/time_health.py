@@ -59,13 +59,15 @@ class TimeHealth(Node):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         for kind, typ, topic in [('scan', LaserScan, '/scan'), ('wheel', Odometry, '/wheel/odometry'),
                                  ('imu', Imu, '/imu/data_raw')]:
-            self.create_subscription(typ, topic, lambda m, k=kind: self.observe(k, m), qos_profile_sensor_data)
+            self.create_subscription(typ, topic, self.raw_observer(kind),
+                                     qos_profile_sensor_data, raw=True)
         if self.watch_depth:
             # Raw bytes: deserializing a ~1 MB PointCloud2 in Python at 10 Hz would
             # cost the CPU this node exists to protect. Only the header stamp is read.
             self.create_subscription(PointCloud2, self.depth_topic, self.on_depth_raw,
                                      qos_profile_sensor_data, raw=True)
         self.create_subscription(Odometry, '/odometry/filtered', self.on_odom, qos_profile_sensor_data)
+        # Every transform is inspected, including matches after the first entry.
         self.create_subscription(TFMessage, '/tf', self.on_tf, 100)
         self.create_service(Trigger, '/system/reset_time_fault', self.reset_fault)
         self.create_timer(.05, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
@@ -95,11 +97,20 @@ class TimeHealth(Node):
         return sec, nanosec
 
     def on_depth_raw(self, data):
+        self.observe_raw('depth', data)
+
+    def raw_observer(self, kind):
+        # One argument: EventsExecutor does not support MessageInfo callbacks.
+        def callback(data):
+            self.observe_raw(kind, data)
+        return callback
+
+    def observe_raw(self, kind, data):
         try:
-            sec, nanosec = self.header_stamp(bytes(data))
+            sec, nanosec = self.header_stamp(data)
         except (ValueError, struct.error):
             return
-        self.observe_stamp('depth', sec + nanosec/1e9)
+        self.observe_stamp(kind, sec + nanosec/1e9)
 
     def on_odom(self, message):
         if self.observe('odom', message):

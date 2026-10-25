@@ -187,11 +187,15 @@ class CmdVelToCan(Node):
             self.publish_status()
 
     def publish_preview(self, v, w, payload, reason):
+        # The shutdown stop frame also lands here; check the context before rcl.
+        if not rclpy.ok(context=self.context):
+            return
+        if self.preview.get_subscription_count() == 0:
+            return  # tests and debugging only; skip the hex formatting at 20 Hz
         mode = 'DRY_RUN' if self.sender.dry_run else 'CAN_TX'
         line = (f'{mode} {self.sender.channel} {self.sender.can_id:03X}#{payload.hex().upper()} '
                 f'v={v:+.6f} w={w:+.6f} reason={reason}')
-        if rclpy.ok(context=self.context):
-            self.preview.publish(String(data=line))
+        self.preview.publish(String(data=line))
 
     def publish_status(self):
         if not rclpy.ok(context=self.context):

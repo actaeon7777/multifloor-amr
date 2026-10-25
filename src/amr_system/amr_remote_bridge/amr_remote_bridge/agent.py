@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 
 class Agent:
     def __init__(self, server_url, token, robot_id='amr-01', local_url='http://127.0.0.1:8080',
-                 rate=5, timeout=1.5, layer_refresh=5, reconnect_max=10, stop=None, camera_refresh=1.):
+                 rate=5, timeout=1.5, layer_refresh=60, reconnect_max=10, stop=None, camera_refresh=1.):
         self.server_url = base_url(server_url)
         self.local_url = base_url(local_url, local=True)
         self.robot_id = identifier(robot_id)
@@ -48,6 +48,7 @@ class Agent:
         # Multi-floor: the local /api/floors document (None without floor support).
         self.floors = None
         self.floors_checked = None
+        self.state_body = None
 
     def layer_url(self, name):
         floor = layer_floor(name)
@@ -86,6 +87,7 @@ class Agent:
             state = loads(body)
             if not isinstance(state, dict) or not isinstance(state.get('layers'), dict):
                 raise ValueError('Invalid local /api/state response')
+            self.state_body = body
             return state, captured
 
         started = time.monotonic()
@@ -132,7 +134,9 @@ class Agent:
                     updates[name] = dict(version=info['version'], png=base64.b64encode(png).decode('ascii'))
             except Exception as exc:
                 LOG.warning('Local map layer %s unavailable (%s); state exchange continues', name, type(exc).__name__)
-        if pending or camera is not None:
+        if pending:
+            # Preserve freshness/version checks after potentially slow PNG work.
+            # Camera-only cycles reuse the already parsed state and raw body.
             state, captured = read_state()
             updates = {name: image for name, image in updates.items()
                        if self.layer_version(name, state) == image['version']}
@@ -232,15 +236,19 @@ class Agent:
             error = type(exc).__name__ + ': local web API unavailable'
         self.sequence += 1
         envelope = dict(protocol=PROTOCOL_VERSION, robot_id=self.robot_id,
-                        session_id=self.session_id, sequence=self.sequence, state=state,
+                        session_id=self.session_id, sequence=self.sequence,
                         state_age=time.monotonic() - captured + self.round_trip,
                         layers=updates, results=list(self.results.values()), local_error=error,
                         floors=self.floors if state is not None else None, camera=camera)
-        self.exchange_metrics.update(payload_bytes=len(dumps(envelope)), state_age=envelope['state_age'])
+        # The state was parsed once for layer/camera metadata. Relay its original
+        # JSON unchanged instead of walking the scan again for size and request.
+        state_body = self.state_body if state is not None else b'null'
+        payload = dumps(envelope)[:-1] + b',"state":' + state_body + b'}'
+        self.exchange_metrics.update(payload_bytes=len(payload), state_age=envelope['state_age'])
         if self.exchange_metrics['payload_bytes'] > MAX_MESSAGE:
             raise ValueError('Telemetry exceeds 8 MiB; reduce local map/scan data size')
         started = time.monotonic()
-        status, _, body = self.http.request(self.server_url + '/api/agent/exchange', envelope,
+        status, _, body = self.http.request(self.server_url + '/api/agent/exchange', payload,
                                           {'Authorization': 'Bearer ' + self.token}, timeout=self.timeout)
         round_trip = time.monotonic() - started
         self.exchange_metrics.update(host_http_status=status, round_trip_ms=round_trip*1000)
@@ -309,7 +317,7 @@ def main(args=None):
     parser.add_argument('--local-url', default='http://127.0.0.1:8080')
     parser.add_argument('--rate', type=float, default=5)
     parser.add_argument('--timeout', type=float, default=1.5)
-    parser.add_argument('--layer-refresh', type=float, default=5)
+    parser.add_argument('--layer-refresh', type=float, default=60)
     parser.add_argument('--camera-refresh', type=float, default=1,
                         help='Seconds between relayed camera snapshots (JPEG, <= 300 KiB)')
     parser.add_argument('--log-file', type=Path, help='Diagnostic file; defaults to diagnostics/remote_client under the working directory')

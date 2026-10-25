@@ -52,7 +52,7 @@ def test_png_orientation_and_partial_costmap_update():
     with pytest.raises(ValueError):
         grid.update(1, 1, 2, 2, [0]*4)
     cost = Grid(2, 1, 1., [0, 0, 0], [0, 100], costmap=True)
-    assert Image.open(io.BytesIO(cost.png)).getpixel((0, 0))[3] == 0
+    assert Image.open(io.BytesIO(cost.png)).convert('RGBA').getpixel((0, 0))[3] == 0
 
 
 def test_lookup_table_preserves_every_occupancy_pixel():
@@ -64,7 +64,7 @@ def test_lookup_table_preserves_every_occupancy_pixel():
     expected = [(0, 0, 0, 0) if value <= 0 else
                 (159, 39, 111, 200) if value >= 99 else
                 (90+int(value*1.1), 95, 220, 30+int(value*1.2)) for value in values]
-    assert list(Image.open(io.BytesIO(cost.png)).getdata()) == expected
+    assert list(Image.open(io.BytesIO(cost.png)).convert('RGBA').getdata()) == expected
 
 
 def test_full_quaternion_scan_projection():

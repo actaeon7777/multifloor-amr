@@ -118,7 +118,7 @@ class HttpClient:
 
     def request(self, url, payload=None, headers=None, timeout=2, limit=MAX_MESSAGE):
         request_headers = dict(headers or {})
-        data = dumps(payload) if payload is not None else None
+        data = payload if isinstance(payload, bytes) else dumps(payload) if payload is not None else None
         if data is not None:
             request_headers['Content-Type'] = 'application/json'
         req = Request(url, data=data, headers=request_headers)

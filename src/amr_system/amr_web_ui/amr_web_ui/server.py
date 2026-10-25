@@ -1,5 +1,6 @@
 """Offline-capable HTTP UI. ROS commands are executed only on the ROS executor."""
 import argparse
+from array import array
 from collections import OrderedDict, deque
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -100,6 +101,40 @@ class ApiError(Exception):
         self.status = status
 
 
+def json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
+
+
+class ScanPoints(list):
+    """Replace as a whole: snapshots share both the points and their JSON fragment.
+
+    The fragment is encoded on the first request for this scan, not on arrival:
+    scans come at 10 Hz but the page polls at <= 5 Hz, and encoding every scan
+    cost more than the per-request encoding it replaced (bag replay 2026-10-25).
+    """
+    def __init__(self, points):
+        super().__init__(points)
+        self._json = None
+
+    @property
+    def json(self):
+        # Two request threads may race here; both produce the same bytes.
+        if self._json is None:
+            self._json = json_bytes(self)
+        return self._json
+
+
+def encode_snapshot(snapshot):
+    scan = snapshot.get('scan')
+    if not scan or not isinstance(scan.get('points'), ScanPoints):
+        return json_bytes(snapshot)
+    # Encode only changing metadata; never walk the cached point list here.
+    scan_meta = {key: value for key, value in scan.items() if key != 'points'}
+    scan_json = json_bytes(scan_meta)[:-1] + b',"points":' + scan['points'].json + b'}'
+    rest = {key: value for key, value in snapshot.items() if key != 'scan'}
+    return json_bytes(rest)[:-1] + b',"scan":' + scan_json + b'}'
+
+
 class SharedState:
     def __init__(self, preview=False):
         self.lock = threading.RLock()
@@ -136,6 +171,8 @@ class SharedState:
         self.building = None
         self.simulation = False
         self.floor_grids = {}
+        self.floor_errors = {}
+        self.scan_stamp = None
         # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
         # Encoded by the camera driver; this process never decodes or re-encodes images.
         self.camera = None
@@ -489,6 +526,7 @@ class SharedState:
         """Invalidate display/request state; never replay a command after restart."""
         with self.lock:
             self.connection_epoch += 1
+            self.scan_stamp = None
             self.telemetry.reset()
             for key in ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint',
                         'velocity', 'localization', 'goal'):
@@ -513,34 +551,46 @@ class SharedState:
                 self.grids.pop(name, None)
 
     def set_building(self, building, simulation):
+        # Load/hash static files before publishing the building. No disk I/O or
+        # image conversion may hold the ROS callbacks' shared lock.
+        grids, errors = {}, {}
+        if building is not None:
+            from amr_stack.floor_config import load_occupancy_map
+            import hashlib
+            for name, floor in building.floors.items():
+                try:
+                    path = building.map_path(name, simulation)
+                    occupancy = load_occupancy_map(path)
+                    height, width = occupancy.cells.shape
+                    raw = occupancy.cells.tobytes()
+                    grid = Grid(width, height, occupancy.resolution, occupancy.origin,
+                                array('b', raw))
+                    digest = hashlib.sha256(name.encode() + path.read_bytes() + raw)
+                    grid.version = int(digest.hexdigest()[:12], 16)
+                    grid.floor = floor.name
+                    grids[name] = grid
+                except Exception as error:  # noqa: BLE001 - one bad floor must not disable the others
+                    # Keep the text, not the exception: re-raising one instance
+                    # grows its traceback (and pinned frames) on every request.
+                    errors[name] = f'{type(error).__name__}: {error}'
         with self.lock:
             self.building, self.simulation = building, bool(simulation)
-            self.floor_grids.clear()
+            self.floor_grids, self.floor_errors = grids, errors
 
     def floor_grid(self, name):
-        """Static map of any configured floor (current or not) for choosing a destination."""
+        """Static maps are prepared by set_building, outside the shared lock."""
         with self.lock:
             if self.building is None:
                 raise ApiError(404, '층 설정이 없습니다.')
             if name in self.floor_grids:
                 return self.floor_grids[name]
             try:
-                floor = self.building.floor(name)
+                self.building.floor(name)
             except ValueError:
                 raise ApiError(404, '알 수 없는 층입니다.') from None
-            from amr_stack.floor_config import load_occupancy_map
-            import hashlib
-            path = self.building.map_path(name, self.simulation)
-            occupancy = load_occupancy_map(path)
-            height, width = occupancy.cells.shape
-            grid = Grid(width, height, occupancy.resolution, list(occupancy.origin),
-                        occupancy.cells.ravel().tolist())
-            # Stable across restarts for the same file, distinct between floors and map revisions.
-            digest = hashlib.sha256(name.encode() + path.read_bytes() + occupancy.cells.tobytes())
-            grid.version = int(digest.hexdigest()[:12], 16)
-            grid.floor = floor.name
-            self.floor_grids[name] = grid
-            return grid
+            if name in self.floor_errors:
+                raise ApiError(503, f'층 지도를 읽지 못했습니다: {self.floor_errors[name]}')
+            raise ApiError(404, '층 지도가 없습니다.')
 
     def current_floor(self):
         floor = self.state.get('floor')
@@ -793,15 +843,22 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
     assets = Path(assets)
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        # Keep-alive holds a thread per connection; drop idle or half-open
+        # clients (a tablet leaving Wi-Fi) instead of keeping them forever.
+        timeout = 30
+
         def log_message(self, *_args):
             pass
 
         def respond(self, status, body, mime='application/json', headers=None):
             if not isinstance(body, bytes):
-                body = json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
+                body = json_bytes(body)
             self.send_response(status)
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
+            if self.close_connection:
+                self.send_header('Connection', 'close')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Content-Security-Policy',
@@ -818,7 +875,7 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
         def do_GET(self):
             path = urlsplit(self.path).path
             if path == '/api/state':
-                self.respond(200, shared.snapshot())
+                self.respond(200, encode_snapshot(shared.snapshot()))
             elif path == '/api/floors':
                 self.respond(200, shared.floors_info())
             elif path.startswith('/api/floors/') and path.endswith('/map.png'):
@@ -856,7 +913,10 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 self.respond(404, dict(error='Not found'))
 
         def do_POST(self):
+            consumed = False
             try:
+                if self.headers.get('Transfer-Encoding'):
+                    raise ApiError(400, 'Chunked requests are not supported')
                 origin = self.headers.get('Origin')
                 if origin and urlsplit(origin).netloc != self.headers.get('Host'):
                     raise ApiError(403, '다른 웹사이트에서 보낸 명령은 허용하지 않습니다.')
@@ -867,7 +927,9 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 size = int(self.headers.get('Content-Length', '0'))
                 if size <= 0 or size > 4096:
                     raise ApiError(413, '요청 크기가 유효하지 않습니다.')
-                payload = json.loads(self.rfile.read(size))
+                raw = self.rfile.read(size)
+                consumed = len(raw) == size
+                payload = json.loads(raw)
                 if not isinstance(payload, dict):
                     raise ValueError('JSON object required')
                 kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
@@ -877,8 +939,10 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 result = shared.request(kinds[self.path], payload)
                 self.respond(202, result)
             except ApiError as error:
+                self.close_connection = self.close_connection or not consumed
                 self.respond(error.status, dict(error=str(error)))
             except (ValueError, TypeError, json.JSONDecodeError) as error:
+                self.close_connection = self.close_connection or not consumed
                 self.respond(400, dict(error=str(error)))
 
     server = ThreadingHTTPServer((host, port), Handler)

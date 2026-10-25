@@ -1,6 +1,8 @@
 """The public navigation Action is the same manager used by RViz /goal_pose."""
 import math
 
+from .server import ScanPoints
+
 import numpy as np
 import queue
 import time
@@ -198,7 +200,7 @@ class WebBridge(Node):
                 if msg.header.frame_id and msg.header.frame_id != grid.info['frame']:
                     return
                 try:
-                    grid.update(msg.x, msg.y, msg.width, msg.height, list(msg.data))
+                    grid.update(msg.x, msg.y, msg.width, msg.height, msg.data)
                 except ValueError as error:
                     self.get_logger().warning(str(error))
 
@@ -275,6 +277,11 @@ class WebBridge(Node):
         if self.pending_scan is None:
             return
         msg, received = self.pending_scan
+        stamp = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
+        with self.shared.lock:
+            if stamp == self.shared.scan_stamp:
+                self.pending_scan = None
+                return
         try:
             tf = self.transform(msg.header.frame_id, msg.header.stamp)
             # Keep all valid rays; decimation is not needed for a single 2D scan.
@@ -292,11 +299,17 @@ class WebBridge(Node):
             intensities = np.asarray(msg.intensities, dtype=float)
             if len(intensities) == len(ranges):
                 intensity = intensities[index]
-                intensity = [v if math.isfinite(v) else None for v in intensity.tolist()]
+                finite = np.isfinite(intensity)
+                values = np.trunc(np.where(finite, intensity, 0.)).astype(np.int64).tolist()
+                for i in np.flatnonzero(~finite).tolist():
+                    values[i] = None
             else:
-                intensity = [None]*len(index)
-            points = [[px, py, pi] for px, py, pi in zip(x.tolist(), y.tolist(), intensity)]
-            self.set_state(scan=dict(points=points, received_at=received))
+                values = [None]*len(index)
+            # Millimetres are plenty for display; round in numpy, not per point in Python.
+            points = ScanPoints(map(list, zip(np.round(x, 3).tolist(), np.round(y, 3).tolist(), values)))
+            with self.shared.lock:
+                self.shared.state['scan'] = dict(points=points, received_at=received)
+                self.shared.scan_stamp = stamp
             self.pending_scan = None
         except TransformException:
             if time.monotonic()-received > 1:

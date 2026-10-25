@@ -631,3 +631,158 @@ def test_camera_snapshot_is_relayed_validated_and_expires(system):
     agent.exchange()
     registry.robots['amr-01'].camera['received'] -= 4
     assert system['request']('/robots/amr-01/api/camera.jpg')[0] == 404
+
+
+def test_http_client_preencoded_bytes_have_identical_wire_body():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from amr_remote_bridge.common import dumps
+    bodies = []
+
+    class Echo(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            bodies.append((self.headers['Content-Type'], body))
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Echo)
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+    thread.start()
+    value = dict(protocol=PROTOCOL_VERSION, state=dict(scan=dict(points=[[.123, -4.567, 12], [0, 0, None]])),
+                 results=[], local_error='한글 상태')
+    encoded = dumps(value)
+    try:
+        client = HttpClient()
+        for payload in (value, encoded):
+            status, _, body = client.request(f'http://127.0.0.1:{server.server_port}/echo', payload)
+            assert status == 200 and body == encoded
+        assert bodies == [('application/json', encoded)] * 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('with_camera', [False, True])
+def test_agent_reads_state_once_on_cached_layer_and_camera_cycles(system, monkeypatch, with_camera):
+    from amr_remote_bridge import agent as agent_module
+    agent, shared = system['agent'], system['shared']
+    # No layer work is pending in this cycle; a fresh camera uses the same state.
+    agent.layer_refresh = 60
+    agent.layer_cache = {name: (grid.version, time.monotonic()) for name, grid in shared.grids.items()}
+    if with_camera:
+        assert shared.update_camera(small_jpeg((12, 34, 56)))
+    original = agent.http.request
+    reads, envelopes, state_bodies = [], [], []
+
+    def record(url, payload=None, *args, **kwargs):
+        if url.endswith('/api/agent/exchange'):
+            assert isinstance(payload, bytes)
+            envelopes.append(payload)
+        result = original(url, payload, *args, **kwargs)
+        if url.endswith('/api/state'):
+            reads.append(url)
+            status, headers, body = result
+            # Significant source formatting proves that the state was spliced,
+            # rather than parsed and encoded again inside the envelope.
+            body = b'{"display_test":1.2300,' + body[1:]
+            state_bodies.append(body)
+            return status, headers, body
+        return result
+
+    original_dumps, encoded = agent_module.dumps, []
+
+    def count_encoding(value):
+        encoded.append(value)
+        assert 'state' not in value
+        return original_dumps(value)
+
+    monkeypatch.setattr(agent.http, 'request', record)
+    monkeypatch.setattr(agent_module, 'dumps', count_encoding)
+    assert agent.exchange()
+    assert len(reads) == len(envelopes) == len(encoded) == 1
+    assert b'"state":' + state_bodies[0] in envelopes[0]
+    envelope = loads(envelopes[0])
+    assert envelope['state'] == loads(state_bodies[0])
+    assert bool(envelope['camera']) == with_camera
+    assert agent.exchange_metrics['payload_bytes'] == len(envelopes[0])
+    assert set(envelope) == {'protocol', 'robot_id', 'session_id', 'sequence', 'state', 'state_age',
+                             'layers', 'results', 'local_error', 'floors', 'camera'}
+
+
+def test_agent_layer_refresh_defaults_to_sixty_seconds():
+    assert Agent('http://127.0.0.1:8081', TOKEN).layer_refresh == 60
+
+
+def test_preencoded_request_bypasses_json_encoder(monkeypatch):
+    from amr_remote_bridge import common
+    client = HttpClient()
+    value = dict(scan=dict(points=[[1.234, -2.345, None]]), message='상태')
+    encoded = common.dumps(value)
+    requests = []
+
+    class Reply(io.BytesIO):
+        status = 200
+        headers = {'Content-Type': 'application/json'}
+
+    def open_request(request, timeout):
+        requests.append(request)
+        return Reply(request.data)
+
+    monkeypatch.setattr(client.opener, 'open', open_request)
+    assert client.request('http://127.0.0.1:8080/test', value)[2] == encoded
+
+    def no_encode(_):
+        raise AssertionError('Pre-encoded bytes must not pass through dumps')
+
+    monkeypatch.setattr(common, 'dumps', no_encode)
+    assert client.request('http://127.0.0.1:8080/test', encoded)[2] is not None
+    assert requests[0].data == requests[1].data == encoded
+    assert requests[1].data is encoded
+    assert requests[0].headers == requests[1].headers
+
+
+@pytest.mark.parametrize('camera', [None, {'age': 0.1}])
+def test_agent_single_state_read_and_raw_envelope_without_sockets(monkeypatch, camera):
+    from amr_remote_bridge import agent as agent_module
+    from amr_remote_bridge.common import dumps
+    agent = Agent('http://127.0.0.1:8081', TOKEN)
+    raw = b'{"layers":{}, "scan":{"points":[[1.2300,-0.001,4]]},"camera":' + dumps(camera) + b'}'
+    requests, envelopes, encoded = [], [], []
+    jpeg = small_jpeg((12, 34, 56))
+
+    def request(url, payload=None, *args, **kwargs):
+        requests.append(url)
+        if url.endswith('/api/floors'):
+            return 404, {}, b'{}'
+        if url.endswith('/api/state'):
+            return 200, {}, raw
+        if url.endswith('/api/camera.jpg'):
+            return 200, {}, jpeg
+        assert url.endswith('/api/agent/exchange') and isinstance(payload, bytes)
+        envelopes.append(payload)
+        return 200, {}, dumps(dict(protocol=PROTOCOL_VERSION, session_id=agent.session_id,
+                                  sequence=agent.sequence))
+
+    def encode(value):
+        encoded.append(value)
+        assert 'state' not in value
+        return dumps(value)
+
+    monkeypatch.setattr(agent.http, 'request', request)
+    monkeypatch.setattr(agent_module, 'dumps', encode)
+    assert agent.exchange()
+    assert sum(url.endswith('/api/state') for url in requests) == 1
+    assert len(envelopes) == len(encoded) == 1
+    envelope = loads(envelopes[0])
+    assert envelope['state'] == loads(raw)
+    assert b'"state":' + raw in envelopes[0]
+    assert bool(envelope['camera']) == bool(camera)
+    assert agent.exchange_metrics['payload_bytes'] == len(envelopes[0])

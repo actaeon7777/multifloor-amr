@@ -233,3 +233,26 @@ def test_floor_transit_beacon_timeline(shared, monkeypatch):
     now[0] += 61
     rows = {b['label']: b for b in shared.snapshot()['transit']['beacons']}
     assert rows['4F']['presence_age'] is None and rows['4F']['bins'] == [None]*60
+
+
+def test_one_unreadable_floor_map_disables_only_that_floor(monkeypatch):
+    """A malformed map (any exception type) fails its own floor, not the floor list."""
+    from amr_stack import floor_config
+    building = load_floor_config()
+    real = floor_config.load_occupancy_map
+
+    def load(path):
+        if path == building.map_path('3F', simulation=True):
+            raise KeyError('resolution')  # e.g. a YAML key missing from 3F
+        return real(path)
+
+    monkeypatch.setattr(floor_config, 'load_occupancy_map', load)
+    state = SharedState(preview=True)
+    state.set_building(building, simulation=True)
+    info = state.floors_info()
+    maps = {f['name']: f['map'] for f in info['floors']}
+    assert maps['3F'] is None and maps['4F'] is not None and maps['5F'] is not None
+    for _ in range(3):  # the stored error is text: every request raises a fresh ApiError
+        with pytest.raises(ApiError) as error:
+            state.floor_grid('3F')
+        assert error.value.status == 503 and 'KeyError' in str(error.value)

@@ -126,3 +126,53 @@ def test_grid_replaced_during_transform_keeps_its_own_origin():
     bridge.grid_render_state = replace_during_lookup
     bridge.update_grid_origins()
     assert layer(bridge)['render_origin'] == pytest.approx([21.4, .5, 0.])
+
+
+def test_scan_fragment_is_reused_per_stamp_and_reset_reacquires(monkeypatch):
+    import json
+    from sensor_msgs.msg import LaserScan
+    from amr_web_ui import server
+
+    calls = []
+    bridge = SimpleNamespace(shared=SharedState(), pending_scan=None)
+    bridge.transform = lambda frame, stamp: calls.append((frame, stamp.sec))
+    msg = LaserScan()
+    msg.header.frame_id = 'map'
+    msg.header.stamp.sec = 1
+    msg.range_min, msg.range_max = .1, 10.
+    msg.ranges = [1.23456, float('inf'), 2.34567]
+    msg.intensities = [12.9, 40., float('nan')]
+    WebBridge.on_scan(bridge, msg)
+    WebBridge.update_scan(bridge)
+    points = bridge.shared.state['scan']['points']
+    assert points == [[1.235, 0., 12], [2.346, 0., None]]
+    fragment = points.json
+    first = bridge.shared.snapshot()
+    original = server.json_bytes
+
+    def no_point_encoding(value):
+        assert value is not points
+        if isinstance(value, dict):
+            assert 'points' not in value and 'scan' not in value
+        return original(value)
+
+    monkeypatch.setattr(server, 'json_bytes', no_point_encoding)
+    assert json.loads(server.encode_snapshot(first)) == json.loads(json.dumps(first))
+    WebBridge.on_scan(bridge, msg)
+    WebBridge.update_scan(bridge)
+    second = bridge.shared.snapshot()
+    assert bridge.shared.state['scan']['points'] is points
+    assert fragment in server.encode_snapshot(second)
+    assert second['scan']['age'] >= first['scan']['age']
+    assert len(calls) == 1  # Duplicate stamp does not repeat the transform.
+    monkeypatch.setattr(server, 'json_bytes', original)
+    msg.header.stamp.sec = 2
+    msg.ranges = [3., 4., 5.]
+    WebBridge.on_scan(bridge, msg)
+    WebBridge.update_scan(bridge)
+    assert bridge.shared.state['scan']['points'].json != fragment
+    assert first['scan']['points'].json == fragment  # In-flight snapshot remains consistent.
+    bridge.shared.reset_connection('test reset')
+    WebBridge.on_scan(bridge, msg)
+    WebBridge.update_scan(bridge)
+    assert bridge.shared.state['scan'] is not None and len(calls) == 3

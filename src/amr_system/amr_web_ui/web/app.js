@@ -8,9 +8,13 @@
   const images = {}, loading = {}, pointers = new Map();
   let state = null, connected = false, connectionIssue = '', mode = 'goal', selected = null, gesture = null;
   let multiTouch = false, pinch = null, follow = false, fitted = false, busy = false;
-  let width = 1, height = 1, lastFrame = 0, lastNotice = '', lastRequest = null, headingOverride = false;
+  let width = 1, height = 1, drawFrame = null, lastNotice = '', lastRequest = null, headingOverride = false;
   let localizationRequest = null;
-  let lastStateAt = 0;
+  let lastStateAt = 0, pollTimer = null, polling = false;
+  const scanColors = Array.from({length:32}, (_, i) => `hsl(${(1-i/31)*240},78%,48%)`).concat('#009bb9');
+  function requestDraw() {
+    if (drawFrame === null && !document.hidden) drawFrame = requestAnimationFrame(draw);
+  }
   const rfCommandLabels = {RF_TIMEOUT:'버튼 무선 전달 지연 · 재시도', NO_RESULT:'버튼 응답 없음 · 재시도',
     DEVICE_REJECTED:'비콘이 버튼 명령을 거절', NO_ROUTE:'대상 비콘 없음', BAD_FRAME:'버튼 명령 형식 오류'};
   // Multi-floor: floorsInfo from /api/floors; viewFloor is the floor whose map is shown.
@@ -108,6 +112,7 @@
     return {x:event.clientX-rect.left, y:event.clientY-rect.top};
   }
   function setMode(value) {
+    requestDraw();
     mode = value; gesture = null;
     document.querySelectorAll('[data-mode]').forEach(e => {
       e.classList.toggle('active', e.dataset.mode === value);
@@ -120,6 +125,7 @@
     updateControls();
   }
   function setSelected(pose) {
+    requestDraw();
     selected = pose;
     $('goal-x').textContent = pose.x.toFixed(2);
     $('goal-y').textContent = pose.y.toFixed(2);
@@ -258,6 +264,7 @@
     if (state) updateFloorUi();
   }
   async function fetchFloors() {
+    if (document.hidden) return;
     try {
       const response = await fetch('/api/floors', {signal:AbortSignal.timeout(4000)});
       if (response.ok) {
@@ -269,6 +276,7 @@
     } catch (_error) { /* floors are optional */ }
   }
   async function fetchFloorLayer(name, info) {
+    if (document.hidden) return;
     if (floorImages[name]?.version === info.version || floorLoading[name]) return;
     floorLoading[name] = true;
     try {
@@ -277,10 +285,12 @@
       const bitmap = await createImageBitmap(await response.blob());
       floorImages[name]?.bitmap.close();
       floorImages[name] = {bitmap, version:Number(response.headers.get('X-Map-Version'))};
+      requestDraw();
     } catch (_error) { /* keep the previous image */ }
     finally { floorLoading[name] = false; }
   }
   async function fetchLayer(name, info) {
+    if (document.hidden) return;
     if (images[name]?.version === info.version || loading[name]) return;
     loading[name] = true;
     try {
@@ -291,12 +301,16 @@
       if (state?.layers[name]?.version !== version) { bitmap.close(); return; }
       images[name]?.bitmap.close();
       images[name] = {bitmap, version};
+      requestDraw();
       if (name === 'map' && !fitted && canvas.clientWidth && canvas.clientHeight) { fit(); fitted = true; }
     } catch (_error) {
       // Retain the prior image; no coordinate commands use an outdated map image.
     } finally { loading[name] = false; }
   }
   async function poll() {
+    if (document.hidden || polling) return;
+    clearTimeout(pollTimer);
+    polling = true;
     try {
       const response = await fetch('/api/state', {signal:AbortSignal.timeout(2500)});
       if (!response.ok) {
@@ -316,7 +330,13 @@
       if (info) $('map-meta').textContent = `${info.width} × ${info.height} · ${info.resolution} m/cell`;
       if (state.scan) {
         const intensities = state.scan.points.map(p=>p[2]).filter(Number.isFinite);
-        state.scan.bounds = intensities.length ? [Math.min(...intensities), Math.max(...intensities)] : null;
+        const bounds = intensities.length ? [Math.min(...intensities), Math.max(...intensities)] : null;
+        state.scan.buckets = Array.from({length:33}, () => []);
+        for (const point of state.scan.points) {
+          const value = bounds && point[2] !== null ? (point[2]-bounds[0])/(bounds[1]-bounds[0] || 1) : null;
+          const bucket = value === null ? 32 : Math.max(0, Math.min(31, Math.round(value*31)));
+          state.scan.buckets[bucket].push(point);
+        }
       }
       const notice = state.notice;
       const key = notice ? JSON.stringify(notice) : '';
@@ -343,7 +363,11 @@
         window.AMRDashboard?.update(null, false, connectionIssue);
       }
       updateControls();
-    } finally { setTimeout(poll, 200); }
+    } finally {
+      polling = false;
+      requestDraw();
+      if (!document.hidden) pollTimer = setTimeout(poll, 200);
+    }
   }
   function requestId() {
     return crypto.randomUUID ? crypto.randomUUID() : `web_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -382,9 +406,10 @@
       }
     } catch (error) {
       activity(error.name === 'TimeoutError' ? '응답이 지연되고 있습니다. 현재 상태를 확인해 주세요.' : error.message, true);
-    } finally { busy = false; updateControls(); }
+    } finally { busy = false; updateControls(); requestDraw(); }
   }
   function fit() {
+    requestDraw();
     const info = activeMap().info;
     if (!info) return;
     const corners = [[0,0],[info.width,0],[0,info.height],[info.width,info.height]]
@@ -396,6 +421,7 @@
     follow = false; $('follow').classList.remove('active'); $('follow').setAttribute('aria-pressed','false');
   }
   function zoom(factor, anchor={x:width/2,y:height/2}) {
+    requestDraw();
     const before = world(anchor);
     camera.scale = Math.max(2, Math.min(350, camera.scale*factor));
     const after = world(anchor); camera.x += before.x-after.x; camera.y += before.y-after.y;
@@ -438,10 +464,9 @@
     ctx.ellipse(0,0,major*camera.scale,minor*camera.scale,0,0,Math.PI*2);
     ctx.fillStyle='#ffb40040';ctx.fill();ctx.strokeStyle='#ffb40090';ctx.lineWidth=1;ctx.stroke();ctx.restore();
   }
-  function draw(timestamp) {
-    requestAnimationFrame(draw);
-    if (timestamp-lastFrame < 1000/15) return;
-    lastFrame=timestamp;
+  function draw() {
+    drawFrame = null;
+    if (document.hidden) return;
     const ratio=Math.min(devicePixelRatio||1,2), rect=canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     const resized = Math.abs(width-rect.width) > 1;
@@ -469,12 +494,15 @@
       if(layers.global_path)line(state.global_path?.points,'#ff3737',2.3,false,alpha);
       if(layers.local_path)line(state.local_path?.points,'#263cff',2.5,false,alpha);
       if(layers.scan&&connected&&state.scan?.age<1){
-        const bounds=state.scan.bounds;
-        for(const [x,y,intensity] of state.scan.points){const p=screen({x,y});
-          if(p.x<0||p.x>width||p.y<0||p.y>height)continue;
-          const value=bounds&&intensity!==null?(intensity-bounds[0])/(bounds[1]-bounds[0]||1):null;
-          ctx.fillStyle=value===null?'#009bb9':`hsl(${(1-value)*240},78%,48%)`;ctx.fillRect(p.x-1.5,p.y-1.5,3,3);
-        }
+        state.scan.buckets.forEach((points, bucket) => {
+          if (!points.length) return;
+          ctx.fillStyle=scanColors[bucket];ctx.beginPath();
+          for(const [x,y] of points){const p=screen({x,y});
+            if(p.x<0||p.x>width||p.y<0||p.y>height)continue;
+            ctx.rect(p.x-1.5,p.y-1.5,3,3);
+          }
+          ctx.fill();
+        });
       }
       if(layers.footprint)line(state.footprint?.points,'#29dc13',2,true,alpha);
       if(layers.amcl&&state.amcl){ctx.globalAlpha=alpha;uncertainty(state.amcl);arrow(state.amcl,'#ffb400',9);ctx.globalAlpha=1;}
@@ -491,6 +519,7 @@
 
   canvas.addEventListener('pointerdown', event=>{
     if(event.button!==0)return;
+    requestDraw();
     const p=local(event);pointers.set(event.pointerId,p);canvas.setPointerCapture(event.pointerId);
     if(pointers.size>1){multiTouch=true;gesture=null;const [a,b]=[...pointers.values()];
       pinch={distance:Math.hypot(a.x-b.x,a.y-b.y),center:{x:(a.x+b.x)/2,y:(a.y+b.y)/2}};return;}
@@ -506,6 +535,7 @@
   canvas.addEventListener('pointermove',event=>{
     const p=local(event), position=world(p);$('cursor-coordinates').textContent=`X ${position.x.toFixed(2)} · Y ${position.y.toFixed(2)}`;
     if(!pointers.has(event.pointerId))return;pointers.set(event.pointerId,p);
+    requestDraw();
     if(multiTouch&&pointers.size>=2){const [a,b]=[...pointers.values()],center={x:(a.x+b.x)/2,y:(a.y+b.y)/2},distance=Math.hypot(a.x-b.x,a.y-b.y);
       if(pinch?.distance>0){zoom(distance/pinch.distance,pinch.center);camera.x-=(center.x-pinch.center.x)/camera.scale;camera.y+=(center.y-pinch.center.y)/camera.scale;}
       pinch={distance,center};return;}
@@ -515,12 +545,13 @@
     else if(Math.hypot(p.x-gesture.start.x,p.y-gesture.start.y)>8)gesture.pose.yaw=G.heading(gesture.pose,world(p));
   });
   canvas.addEventListener('pointerup',event=>{
+    requestDraw();
     pointers.delete(event.pointerId);stage.classList.remove('dragging');
     if(multiTouch){if(!pointers.size){multiTouch=false;pinch=null;}gesture=null;return;}
     const current=gesture;gesture=null;
     if(current?.kind==='pose'){setSelected(current.pose);command(mode==='initialpose'?'initialpose':'goal',current.pose);}
   });
-  canvas.addEventListener('pointercancel',event=>{pointers.delete(event.pointerId);gesture=null;pinch=null;multiTouch=pointers.size>0;stage.classList.remove('dragging');});
+  canvas.addEventListener('pointercancel',event=>{requestDraw();pointers.delete(event.pointerId);gesture=null;pinch=null;multiTouch=pointers.size>0;stage.classList.remove('dragging');});
   canvas.addEventListener('wheel',event=>{event.preventDefault();zoom(Math.exp(-event.deltaY*.001),local(event));},{passive:false});
   canvas.addEventListener('keydown',event=>{
     if(event.key==='Escape'){gesture=null;setMode('pan');return;}
@@ -530,8 +561,8 @@
       setSelected({...p,x:p.x+dx*.25,y:p.y+dy*.25,map_version:activeMap().info.version,room:undefined});}
   });
   document.querySelectorAll('[data-mode]').forEach(e=>e.addEventListener('click',()=>setMode(e.dataset.mode)));
-  document.querySelectorAll('[data-layer]').forEach(e=>e.addEventListener('change',()=>{layers[e.dataset.layer]=e.checked;}));
-  $('heading').addEventListener('input',()=>{headingOverride=true;if(selected)selected.yaw=Number($('heading').value)*Math.PI/180;});
+  document.querySelectorAll('[data-layer]').forEach(e=>e.addEventListener('change',()=>{layers[e.dataset.layer]=e.checked;requestDraw();}));
+  $('heading').addEventListener('input',()=>{requestDraw();headingOverride=true;if(selected)selected.yaw=Number($('heading').value)*Math.PI/180;});
   $('send').addEventListener('click',()=>{if(selected)command(mode==='initialpose'?'initialpose':'goal',selected);});
   $('cancel').addEventListener('click',()=>command('cancel'));
   $('relocalize').addEventListener('click',()=>command('relocalize'));
@@ -540,7 +571,7 @@
     if(!last||!info)return;setMode('initialpose');setSelected({x:last.x,y:last.y,yaw:last.yaw,map_version:info.version});
     activity('마지막으로 확인된 위치를 표시했습니다. 지도에서 로봇 위치와 맞으면 ‘초기 위치 적용’을 누르세요.');});
   $('fit').addEventListener('click',fit);$('zoom-in').addEventListener('click',()=>zoom(1.3));$('zoom-out').addEventListener('click',()=>zoom(1/1.3));
-  $('follow').addEventListener('click',()=>{follow=!follow;$('follow').classList.toggle('active',follow);$('follow').setAttribute('aria-pressed',String(follow));});
+  $('follow').addEventListener('click',()=>{requestDraw();follow=!follow;$('follow').classList.toggle('active',follow);$('follow').setAttribute('aria-pressed',String(follow));});
   $('select-goal')?.addEventListener('click',()=>{setMode('goal');canvas.focus();});
   $('room-select').addEventListener('change',event=>{
     const room=(floorInfo(viewFloor)?.rooms||[]).find(r=>r.id===event.target.value);event.target.value='';
@@ -548,5 +579,17 @@
     setMode('goal');const pose={x:room.x,y:room.y,yaw:room.yaw,map_version:info.version,floor:viewFloor,room:room.id};
     setSelected(pose);command('goal',pose);
   });
-  requestAnimationFrame(draw);poll();
+  new ResizeObserver(requestDraw).observe(canvas);
+  window.addEventListener('resize', requestDraw);
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(pollTimer);
+    if (document.hidden) {
+      if (drawFrame !== null) cancelAnimationFrame(drawFrame);
+      drawFrame = null;
+    } else {
+      requestDraw();
+      poll();
+    }
+  });
+  requestDraw();poll();
 })();

@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@ public:
     min_height_(declare_parameter("min_height", .06)),
     max_height_(declare_parameter("max_height", 1.)),
     max_range_(declare_parameter("max_range", 3.)),
+    max_range_squared_(max_range_ * max_range_),
     max_gap_(declare_parameter("max_gap", .5)),
     filter_(declare_parameter("cell_size", .05), declare_parameter("frames", 3),
       declare_parameter("neighbor_cells", 1)),
@@ -61,6 +63,12 @@ private:
 
   void on_cloud(sensor_msgs::msg::PointCloud2::UniquePtr cloud)
   {
+    if (publisher_->get_subscription_count() == 0) {
+      // A later subscriber starts with a full warm-up, even across clock gaps.
+      filter_.reset();
+      last_stamp_.reset();
+      return;
+    }
     const int ox = offset(*cloud, "x"), oy = offset(*cloud, "y"), oz = offset(*cloud, "z");
     tf2::Transform to_base, to_fixed;
     try {
@@ -68,8 +76,14 @@ private:
         throw std::runtime_error("cloud needs little-endian FLOAT32 x, y, z");
       }
       const rclcpp::Time stamp(cloud->header.stamp);
-      to_base = to_tf(buffer_.lookupTransform(base_frame_, cloud->header.frame_id, stamp,
-        rclcpp::Duration::from_seconds(.1)).transform);
+      auto cached = to_base_cache_.find(cloud->header.frame_id);
+      if (cached == to_base_cache_.end()) {
+        const auto transform = to_tf(buffer_.lookupTransform(
+            base_frame_, cloud->header.frame_id, stamp,
+            rclcpp::Duration::from_seconds(.1)).transform);
+        cached = to_base_cache_.emplace(cloud->header.frame_id, transform).first;
+      }
+      to_base = cached->second;
       to_fixed = to_tf(buffer_.lookupTransform(fixed_frame_, cloud->header.frame_id, stamp,
         rclcpp::Duration::from_seconds(.1)).transform);
     } catch (const std::exception & error) {
@@ -90,9 +104,13 @@ private:
 
     const size_t count = static_cast<size_t>(cloud->width) * cloud->height;
     const size_t step = cloud->point_step;
-    std::vector<size_t> candidates;
-    std::vector<std::pair<double, double>> xy;
-    std::vector<bool> keep(count, true);
+    candidates_.clear();
+    candidates_.reserve(count);
+    xy_.clear();
+    xy_.reserve(count);
+    keep_.clear();
+    keep_.reserve(count);
+    keep_.resize(count, true);
     for (size_t i = 0; i < count; ++i) {
       const uint8_t * point = cloud->data.data() + i * step;
       float x, y, z;
@@ -102,44 +120,57 @@ private:
       if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {continue;}
       const tf2::Vector3 p(x, y, z), base = to_base * p;
       if (base.z() < min_height_ || base.z() > max_height_ ||
-        std::hypot(base.x(), base.y()) > max_range_)
+        beyond_range(base.x(), base.y()))
       {
         continue;
       }
       const tf2::Vector3 fixed = to_fixed * p;
-      candidates.push_back(i);
-      xy.emplace_back(fixed.x(), fixed.y());
+      candidates_.push_back(i);
+      xy_.emplace_back(fixed.x(), fixed.y());
     }
-    const auto persistent = filter_.apply(xy);
-    for (size_t k = 0; k < candidates.size(); ++k) {
-      keep[candidates[k]] = persistent[k];
+    filter_.apply(xy_, persistent_);
+    for (size_t k = 0; k < candidates_.size(); ++k) {
+      keep_[candidates_[k]] = persistent_[k];
     }
 
-    auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    out->header = cloud->header;
-    out->fields = cloud->fields;
-    out->is_bigendian = cloud->is_bigendian;
-    out->point_step = cloud->point_step;
-    out->is_dense = cloud->is_dense;
-    out->height = 1;
-    out->data.reserve(cloud->data.size());
+    size_t kept = 0;
     for (size_t i = 0; i < count; ++i) {
-      if (keep[i]) {
-        const uint8_t * point = cloud->data.data() + i * step;
-        out->data.insert(out->data.end(), point, point + step);
+      if (keep_[i]) {
+        if (kept != i) {
+          std::memmove(cloud->data.data() + kept * step,
+            cloud->data.data() + i * step, step);
+        }
+        ++kept;
       }
     }
-    out->width = static_cast<uint32_t>(out->data.size() / step);
-    out->row_step = static_cast<uint32_t>(out->data.size());
-    publisher_->publish(std::move(out));
+    cloud->data.resize(kept * step);
+    cloud->height = 1;
+    cloud->width = static_cast<uint32_t>(kept);
+    cloud->row_step = static_cast<uint32_t>(cloud->data.size());
+    publisher_->publish(std::move(cloud));
+  }
+
+  bool beyond_range(double x, double y) const
+  {
+    const double squared = x * x + y * y;
+    // Keep hypot's overflow/underflow, NaN and negative-parameter behaviour
+    // outside the ordinary finite range. At the boundary, rounding can differ.
+    if (max_range_ < 0. || !std::isnormal(max_range_squared_) || !std::isnormal(squared)) {
+      return std::hypot(x, y) > max_range_;
+    }
+    return squared > max_range_squared_;
   }
 
   std::string fixed_frame_, base_frame_;
-  double min_height_, max_height_, max_range_, max_gap_;
+  double min_height_, max_height_, max_range_, max_range_squared_, max_gap_;
   PersistenceFilter filter_;
   tf2_ros::Buffer buffer_;
   tf2_ros::TransformListener listener_;
   std::optional<rclcpp::Time> last_stamp_;
+  std::unordered_map<std::string, tf2::Transform> to_base_cache_;
+  std::vector<size_t> candidates_;
+  std::vector<std::pair<double, double>> xy_;
+  std::vector<uint8_t> keep_, persistent_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
 };

@@ -55,7 +55,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 from amr_control.time_guard import HealthLease
 from amr_elevator.geometry import depth_beyond, wrap
-from amr_elevator.maneuver import DONE, TURN, LineManeuver, ManeuverLimits, travel_clearance
+from amr_elevator.maneuver import DONE, TURN, LineManeuver, ManeuverLimits, travel_clearances
 
 ACTIVE = ('NAV_TO_HALL', 'CALL_ELEVATOR', 'WAIT_DOOR_OPEN', 'BOARDING', 'BACKING_OUT',
           'IN_CAR_ALIGN', 'SELECT_FLOOR', 'RIDING', 'SWITCH_MAP', 'ALIGHTING', 'RETURN_TO_CAR',
@@ -142,6 +142,7 @@ class FloorMissionManager(Node):
         self.p = p
         self.building = building or load_floor_config(p['floors_config'] or None)
         self.elevator_id = p['elevator_id']
+        self._geometry_cache = {}
         self.group = ReentrantCallbackGroup()
         self.mission = None
         self.floor_state = None
@@ -149,6 +150,8 @@ class FloorMissionManager(Node):
         self.door = ElevatorDoorState()
         self.pose = None
         self.scan = None
+        self._clearance_scan = None
+        self._clearances = (math.inf, math.inf)
         self.laser_pose = None     # laser (x, y, yaw) in base_frame, from TF once
         self.tf = Buffer()
         self.tf_listener = TransformListener(self.tf, self, spin_thread=False)
@@ -164,6 +167,7 @@ class FloorMissionManager(Node):
         self.nav = None            # {'future', 'handle', 'status'}
         self.calls = {}            # name -> Future
         self.last_status = None
+        self.last_feedback_time = -math.inf
         self.seed_after_resume = False
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = self.create_publisher(String, 'floor_mission/status', latched)
@@ -202,7 +206,10 @@ class FloorMissionManager(Node):
         return self.building.floor(floor).elevators[self.elevator_id]
 
     def geometry(self, floor):
-        return self.building.elevator_geometry(floor, self.elevator_id)
+        key = (floor, self.elevator_id)
+        if key not in self._geometry_cache:
+            self._geometry_cache[key] = self.building.elevator_geometry(*key)
+        return self._geometry_cache[key]
 
     def current_floor(self):
         s = self.floor_state
@@ -334,8 +341,14 @@ class FloorMissionManager(Node):
             # Without the laser frame the scan direction is unknown: hold rather than drive blind.
             self.get_logger().warning('laser transform unknown; maneuver held', throttle_duration_sec=5.)
             return 0.
-        return travel_clearance(self.scan.ranges, self.scan.angle_min, self.scan.angle_increment,
-                                reverse, HALF_LENGTH, laser_pose=self.laser_pose)
+        scan = self.scan
+        if scan is not self._clearance_scan:
+            # Cache both directions so a phase change never reprojects the same scan.
+            self._clearances = travel_clearances(
+                scan.ranges, scan.angle_min, scan.angle_increment,
+                HALF_LENGTH, laser_pose=self.laser_pose)
+            self._clearance_scan = scan
+        return self._clearances[bool(reverse)]
 
     def drive(self):
         """Advance the current maneuver; True once done."""
@@ -457,6 +470,8 @@ class FloorMissionManager(Node):
             except TransformException:
                 return
             self.laser_pose = (t.translation.x, t.translation.y, yaw_of(t.rotation))
+            self.destroy_subscription(self.tf_listener.tf_sub)
+            del self.tf_listener.tf_sub  # TransformListener.unregister must not destroy it twice.
 
     def on_mode(self, message):
         self.mode = 'AUTO' if message.data == 'AUTO' else 'MANUAL'
@@ -637,13 +652,16 @@ class FloorMissionManager(Node):
             'elapsed': 0. if m is None else self.now() - m.started,
         }
         key = {k: v for k, v in status.items() if k != 'elapsed'}
-        if force or key != self.last_status:
+        changed = key != self.last_status
+        if force or changed:
             self.status_pub.publish(String(data=json.dumps(status, ensure_ascii=False)))
             self.last_status = key
-        if m is not None and not m.finished:
+        now = self.now()
+        if m is not None and not m.finished and (changed or now - self.last_feedback_time >= 1.):
             feedback = NavigateToFloorPose.Feedback(phase=m.phase, current_floor=status['current_floor'],
                                                     zone=status['zone'], detail=m.detail)
             m.handle.publish_feedback(feedback)
+            self.last_feedback_time = now
 
     # State machine ------------------------------------------------------------------
 

@@ -10,6 +10,8 @@ current heading (used to retreat from a closing door).
 from dataclasses import dataclass
 import math
 
+import numpy as np
+
 from amr_elevator.geometry import wrap
 
 ALIGN, DRIVE, TURN, DONE = 'ALIGN', 'DRIVE', 'TURN', 'DONE'
@@ -99,15 +101,40 @@ def travel_clearance(ranges, angle_min, angle_increment, reverse, half_length=.3
     The scan is in the laser frame; ``laser_pose`` is the laser's (x, y, yaw) in
     the base frame (the real S2 is mounted turned 180 deg, yaw = pi).
     """
+    return travel_clearances(ranges, angle_min, angle_increment, half_length, half_width,
+                             laser_pose)[bool(reverse)]
+
+
+def travel_clearances(ranges, angle_min, angle_increment, half_length=.32, half_width=.3,
+                      laser_pose=(0., 0., 0.)):
+    """(forward, reverse) bumper clearances from a single scan projection."""
     lx, ly, lyaw = laser_pose
-    best = math.inf
-    for index, value in enumerate(ranges):
-        if not math.isfinite(value) or value <= 0.:
+    values = np.asarray(ranges, dtype=float)
+    indices = np.flatnonzero(np.isfinite(values) & (values > 0.))
+    values = values[indices]
+    angles = lyaw + angle_min + indices * angle_increment
+    x, y = lx + values * np.cos(angles), ly + values * np.sin(angles)
+    # Preserve scalar inclusion at the bumper centreline and body-width edges.
+    boundary = (np.isclose(x, 0., rtol=0., atol=1e-15)
+                | np.isclose(np.abs(y), half_width, rtol=1e-12, atol=1e-15))
+    for index in np.flatnonzero(boundary):
+        angle = lyaw + angle_min + int(indices[index]) * angle_increment
+        x[index] = lx + values[index] * math.cos(angle)
+        y[index] = ly + values[index] * math.sin(angle)
+    within_width = np.abs(y) <= half_width
+    result = []
+    for direction in (1., -1.):
+        along = direction * x
+        qualifies = (along > 0.) & within_width
+        best = np.min(along[qualifies], initial=np.inf)
+        if not math.isfinite(best):
+            result.append(math.inf)
             continue
-        angle = lyaw + angle_min + index * angle_increment
-        x, y = lx + value * math.cos(angle), ly + value * math.sin(angle)
-        if reverse:
-            x = -x
-        if x > 0 and abs(y) <= half_width:
-            best = min(best, x - half_length)
-    return best
+        # Re-evaluate only the minimum (including ties) with libm, preserving
+        # the scalar return value even at the maneuver's strict stop threshold.
+        candidates = np.flatnonzero(qualifies & np.isclose(along, best, rtol=1e-12, atol=1e-15))
+        result.append(min(
+            direction * (lx + float(values[i]) * math.cos(
+                lyaw + angle_min + int(indices[i]) * angle_increment)) - half_length
+            for i in candidates))
+    return tuple(result)

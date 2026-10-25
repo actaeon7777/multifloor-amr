@@ -397,7 +397,14 @@ class Registry:
             if type(payload['map_version']) is not int:
                 raise ApiError(400, '유효한 지도 버전이 필요합니다.')
         floor, room = payload.get('floor'), payload.get('room', '')
-        if floor is not None or room:
+        if kind == 'set_floor':
+            try:
+                identifier(floor)
+            except ValueError:
+                raise ApiError(400, '유효한 층 정보가 필요합니다.') from None
+            if any(key in payload for key in ('room', 'x', 'y', 'yaw', 'pose')):
+                raise ApiError(400, '층 설정에는 호실이나 위치를 지정할 수 없습니다.')
+        elif floor is not None or room:
             if kind != 'goal' or not isinstance(floor, str) or not isinstance(room, str) or len(room) > 32:
                 raise ApiError(400, '층과 호실 정보가 올바르지 않습니다.')
             try:
@@ -431,7 +438,7 @@ class Registry:
                     raise ApiError(409, '지도가 갱신되었습니다. 목적지를 다시 선택해 주세요.')
                 forwarded['map_version'] = image['source_version']
                 digest = image['digest']
-            elif kind != 'cancel':
+            elif kind not in ('cancel', 'set_floor'):
                 info = state['layers'].get('map')
                 # Relocalization has no pose and can be requested before a map
                 # arrives. When one exists it must use the displayed revision.
@@ -631,7 +638,8 @@ def create_server(registry, assets, token, host='127.0.0.1', port=8081, default_
                     self.respond(200, registry.exchange(message))
                 else:
                     robot_id, path = self.route()
-                    if path not in ('/api/goal', '/api/initialpose', '/api/cancel', '/api/relocalize'):
+                    if path not in ('/api/goal', '/api/initialpose', '/api/cancel', '/api/relocalize',
+                                    '/api/set_floor'):
                         raise ApiError(404, 'Not found')
                     command = registry.queue(robot_id, path.rsplit('/', 1)[1], message)
                     result = registry.wait_result(robot_id, command)

@@ -41,12 +41,14 @@ from amr_vehicle_interfaces.msg import VehicleStatus
 
 try:  # Multi-floor support is optional: the web UI still runs without the elevator packages.
     from amr_elevator_interfaces.action import NavigateToFloorPose
+    from amr_elevator_interfaces.srv import SetCurrentFloor
     from amr_elevator_interfaces.msg import (
         ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorEvent, FloorState)
     from amr_stack.floor_config import load_floor_config
 except ImportError:  # pragma: no cover - depends on the installed workspace
     NavigateToFloorPose = ElevatorCommandStatus = FloorState = load_floor_config = None
     ElevatorBeacon = ElevatorCommand = ElevatorDoorState = FloorEvent = None
+    SetCurrentFloor = None
 
 from .geometry import Grid, transform_xy, yaw
 from .vehicle_status import display_snapshot, seconds
@@ -77,6 +79,12 @@ class WebBridge(Node):
                 self.get_logger().warning(f'Multi-floor goals disabled: {error}')
         self.relocalize_client = self.create_client(Trigger, '/localization/relocalize')
         self.pending_relocalize = None
+        # Match the absolute /floor/state topic used by this bridge; the monitor
+        # exposes floor/set_current in the same root namespace.
+        self.set_floor_client = (self.create_client(SetCurrentFloor, '/floor/set_current')
+                                 if SetCurrentFloor is not None else None)
+        self.waiting_set_floor = None
+        self.pending_set_floor = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
         self.goal_handle = None
         self.goal_id = None
@@ -170,6 +178,11 @@ class WebBridge(Node):
         if self.pending_relocalize:
             self.pending_relocalize[0].cancel()
             self.pending_relocalize = None
+        self.waiting_set_floor = None
+        if self.pending_set_floor:
+            future = self.pending_set_floor[0]
+            self.pending_set_floor = None
+            future.cancel()
         self.seen_epoch = self.shared.connection_epoch
         self.reset_requested = False
 
@@ -371,6 +384,10 @@ class WebBridge(Node):
         if kind == 'floor_goal':
             self.send_floor_goal(command)
             return
+        if kind == 'set_floor':
+            self.waiting_set_floor = (command, time.monotonic())
+            self.poll_set_floor()
+            return
         if pose is not None or kind == 'relocalize':
             with self.shared.lock:
                 grid = self.shared.grids.get('map')
@@ -389,7 +406,9 @@ class WebBridge(Node):
             self.goal_id = request_id
             self.goal_handle = None
             self.set_state(goal=dict(x=pose[0], y=pose[1], yaw=pose[2], request_id=request_id,
-                                     kind=kind, status='SENDING'))
+                                     kind=kind, status='SENDING',
+                                     **({key: command[key] for key in ('floor', 'room')}
+                                        if command.get('room') else {})))
             with self.shared.lock:
                 self.shared.telemetry.begin_journey(request_id)
             goal = NavigateToPose.Goal()
@@ -433,6 +452,42 @@ class WebBridge(Node):
             self.goal_state(goal_id, status='CANCELING')
             self.goal_handle.cancel_goal_async().add_done_callback(
                 lambda f: self.on_cancel_response(request_id, goal_id, f))
+
+    def poll_set_floor(self):
+        """Discover the service on steady ticks, without blocking the executor."""
+        if self.waiting_set_floor:
+            command, started = self.waiting_set_floor
+            request_id = command['request_id']
+            error = self.shared.readiness_error('set_floor', request_id)
+            if error:
+                self.waiting_set_floor = None
+                self.shared.complete(request_id, 'FAILED', error)
+            elif self.set_floor_client is not None and self.set_floor_client.service_is_ready():
+                self.waiting_set_floor = None
+                try:
+                    future = self.set_floor_client.call_async(SetCurrentFloor.Request(floor=command['floor']))
+                    self.pending_set_floor = (future, request_id, time.monotonic())
+                    future.add_done_callback(lambda f: self.on_set_floor_response(request_id, f))
+                except Exception as error:
+                    self.shared.complete(request_id, 'FAILED', f'층 설정 요청을 보내지 못했습니다: {error}')
+            elif time.monotonic()-started >= 1:
+                self.waiting_set_floor = None
+                self.shared.complete(request_id, 'FAILED', '층 관리 노드에 연결되지 않았습니다.')
+        if self.pending_set_floor and time.monotonic()-self.pending_set_floor[2] > 5:
+            future, request_id, _started = self.pending_set_floor
+            self.pending_set_floor = None
+            future.cancel()
+            self.shared.complete(request_id, 'FAILED', '층 설정 응답이 지연됩니다. 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
+
+    def on_set_floor_response(self, request_id, future):
+        if self.pending_set_floor is None or self.pending_set_floor[0] is not future:
+            return
+        self.pending_set_floor = None
+        try:
+            result = future.result()
+            self.shared.complete(request_id, 'SUCCEEDED' if result.success else 'FAILED', result.message)
+        except Exception as error:
+            self.shared.complete(request_id, 'FAILED', f'층 설정 응답을 확인하지 못했습니다: {error}')
 
     def send_floor_goal(self, command):
         request_id, pose, floor, room = command['request_id'], command['pose'], command['floor'], command['room']
@@ -561,6 +616,7 @@ class WebBridge(Node):
         self.update_vectors()
         self.update_scan()
         self.update_grid_origins()
+        self.poll_set_floor()
         if self.pending_relocalize and time.monotonic()-self.pending_relocalize[2] > 5:
             future, request_id, _received = self.pending_relocalize
             self.pending_relocalize = None

@@ -6,9 +6,11 @@ from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import threading
 import time
 from urllib.parse import urlsplit
@@ -24,6 +26,12 @@ FLOOR_MISSION_ACTIVE = {'NAV_TO_HALL', 'CALL_ELEVATOR', 'WAIT_DOOR_OPEN', 'BOARD
                         'IN_CAR_ALIGN', 'SELECT_FLOOR', 'RIDING', 'SWITCH_MAP', 'ALIGHTING',
                         'RETURN_TO_CAR', 'RELOCALIZE', 'NAV_TO_GOAL'}
 ACTIVE_GOALS = {'SENDING', 'ACCEPTED', 'CANCELING'}
+TERMINAL_GOALS = {'SUCCEEDED', 'FAILED', 'REJECTED', 'CANCELED'}
+KIOSK_STATE_KEYS = frozenset((
+    'preview', 'connection_epoch', 'mode', 'navigation', 'action_ready', 'floor_action_ready',
+    'floor', 'floor_mission', 'goal', 'notice', 'pending_request', 'localization',
+    'localization_reset_pending', 'robot', 'global_path', 'tf_error', 'estop', 'telemetry',
+    'acknowledged_request', 'kiosk', 'map_version'))
 ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'ARMING', 'READY', 'BYPASS'}
 ESTOP_STM32_KEYS = ('raw', 'debounced', 'latched', 'inhibit', 'odrv_idle', 'bus_off', 'odrv_hb_ok',
                     'drive_enabled', 'stopped', 'trip_count', 'release_count', 'reset_rejected', 'sequence')
@@ -136,12 +144,16 @@ def encode_snapshot(snapshot):
 
 
 class SharedState:
-    def __init__(self, preview=False):
+    def __init__(self, preview=False, kiosk_pin=''):
         self.lock = threading.RLock()
         self.commands = queue.Queue(maxsize=32)
         self.grids = {}
         self.grid_versions = {}
         self.requests = OrderedDict()
+        self.kiosk_pin = kiosk_pin
+        self.kiosk_tokens = OrderedDict()
+        self.kiosk_failures = deque()
+        self.kiosk_blocked_until = -math.inf
         self.localization_reset_baseline = None
         self.localization_generation = -1
         self.localization_stamp = -math.inf
@@ -180,7 +192,73 @@ class SharedState:
                           action_ready=False, robot=None, amcl=None, scan=None,
                           global_path=None, local_path=None, footprint=None,
                           goal=None, notice=None, velocity=None, tf_error=None, pending_request=None,
-                          localization=None, localization_reset_pending=False)
+                          localization=None, localization_reset_pending=False, acknowledged_request=None)
+
+    def unlock_kiosk(self, payload):
+        with self.lock:
+            now = time.monotonic()
+            if now < self.kiosk_blocked_until:
+                raise ApiError(429, '잠시 후 다시 시도해 주세요.')
+            while self.kiosk_failures and now-self.kiosk_failures[0] >= 60:
+                self.kiosk_failures.popleft()
+            pin = payload.get('pin')
+            if self.kiosk_pin and (not isinstance(pin, str) or not secrets.compare_digest(
+                    pin.encode('utf-8'), self.kiosk_pin.encode('utf-8'))):
+                self.kiosk_failures.append(now)
+                if len(self.kiosk_failures) >= 5:
+                    self.kiosk_blocked_until = now + 30
+                    self.kiosk_failures.clear()
+                    raise ApiError(429, '잠시 후 다시 시도해 주세요.')
+                raise ApiError(403, 'PIN이 맞지 않습니다.')
+            self._prune_kiosk_tokens(now)
+            token = secrets.token_hex(16)
+            self.kiosk_tokens[token] = now + 600
+            while len(self.kiosk_tokens) > 8:
+                self.kiosk_tokens.popitem(last=False)
+            return dict(token=token, expires_in=600)
+
+    def _prune_kiosk_tokens(self, now):
+        for token, expires in list(self.kiosk_tokens.items()):
+            if now >= expires:
+                del self.kiosk_tokens[token]
+
+    def check_kiosk_request(self, kind, payload, token):
+        # UX guard, not authentication: kiosk access is local (localhost), and
+        # remote access is token-checked by the central server. The client header
+        # is self-declared; deployments must restrict direct network access.
+        with self.lock:
+            if kind == 'goal':
+                if self.mission_active():
+                    raise ApiError(409, '진행 중인 층간 이동이 있습니다.')
+                floor, room = payload.get('floor'), payload.get('room')
+                configured = (self.building.floors.get(floor) if self.building is not None
+                              and isinstance(floor, str) else None)
+                destination = configured.rooms.get(room) if configured and isinstance(room, str) else None
+                try:
+                    valid = destination is not None and all(
+                        type(payload.get(key)) in (int, float) and math.isfinite(payload[key])
+                        and abs(payload[key]-expected) <= 1e-6
+                        for key, expected in zip(('x', 'y', 'yaw'), destination.goal))
+                except OverflowError:
+                    valid = False
+                if not valid:
+                    raise ApiError(403, '키오스크에서는 등록된 호실로만 보낼 수 있습니다.')
+            elif kind in ('initialpose', 'relocalize', 'set_floor'):
+                self._prune_kiosk_tokens(time.monotonic())
+                if self.kiosk_pin and token not in self.kiosk_tokens:
+                    raise ApiError(403, '관리 모드 잠금을 먼저 해제하세요.')
+            elif kind not in ('cancel', 'acknowledge', 'kiosk/unlock'):
+                raise ApiError(403, '키오스크에서 허용하지 않는 명령입니다.')
+
+    def acknowledge(self, payload):
+        with self.lock:
+            request_id = payload.get('request_id')
+            goal = self.state.get('goal') or {}
+            if (not isinstance(request_id, str) or not request_id
+                    or request_id != goal.get('request_id') or goal.get('status') not in TERMINAL_GOALS):
+                raise ApiError(409, '현재 완료된 배송만 확인할 수 있습니다.')
+            self.state['acknowledged_request'] = request_id
+            return dict(acknowledged=request_id)
 
     def update_camera(self, data, fmt=''):
         """Store one camera JPEG; other encodings and truncated frames are dropped."""
@@ -667,7 +745,9 @@ class SharedState:
                     return '현재 층이 확인되지 않았습니다. 엘리베이터 밖에서 층 확인을 기다려 주세요.'
                 if (self.state.get('floor_mission') or {}).get('phase') in FLOOR_MISSION_ACTIVE:
                     return '진행 중인 층간 이동이 있습니다.'
-            elif kind in ('initialpose', 'relocalize'):
+            elif kind in ('initialpose', 'relocalize', 'set_floor'):
+                if kind == 'set_floor' and self.mission_active():
+                    return '진행 중인 층간 이동이 있습니다.'
                 if (self.state['navigation'] in ACTIVE_NAVIGATION
                         or (self.state.get('goal') or {}).get('status') in ACTIVE_GOALS):
                     return '진행 중인 목표를 취소한 뒤 위치를 다시 설정해 주세요.'
@@ -682,16 +762,20 @@ class SharedState:
                     return '이 웹에서 실행한 취소 가능한 목표가 없습니다.'
             return None
 
-    def snapshot(self):
+    def snapshot(self, kiosk=False):
         with self.lock:
             # Writers replace whole entries (set_state), never mutate them, so
             # one level of copying is enough for the per-call edits below. A
             # deepcopy of the 3,240-point scan at 5 Hz per client was 30 % of
             # this process's CPU on the Jetson (py-spy, 2026-10-23).
             result = {key: (dict(value) if isinstance(value, dict) else value)
-                      for key, value in self.state.items()}
+                      for key, value in self.state.items() if not kiosk or key in KIOSK_STATE_KEYS}
             result['connection_epoch'] = self.connection_epoch
-            result['layers'] = {name: grid.metadata() for name, grid in self.grids.items()}
+            result['kiosk'] = dict(pin_required=bool(self.kiosk_pin))
+            live_map = self.grids.get('map')
+            result['map_version'] = live_map.version if live_map is not None else None
+            if not kiosk:
+                result['layers'] = {name: grid.metadata() for name, grid in self.grids.items()}
             result['telemetry'] = self.telemetry.snapshot()
         now = time.monotonic()
         if result.get('goal') and 'feedback_received_at' in result['goal']:
@@ -708,9 +792,10 @@ class SharedState:
                       else self.time_health.status.get('detail', '로봇 응답 대기'))
             result['tf_error'] = '시간·센서 상태 확인 필요: ' + detail
         result['estop'] = self.estop_snapshot(now)
-        result['elevator'] = self.elevator_snapshot(now)
-        result['transit'] = self.transit_snapshot(now)
-        result['camera'] = self.camera_snapshot(now)
+        if not kiosk:
+            result['elevator'] = self.elevator_snapshot(now)
+            result['transit'] = self.transit_snapshot(now)
+            result['camera'] = self.camera_snapshot(now)
         for name in ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization'):
             item = result.get(name)
             if item:
@@ -722,7 +807,7 @@ class SharedState:
                                      and localization['age'] < 2
                                      and not result['localization_reset_pending']
                                      and (not self.require_time_health or self.time_health.healthy(now)))
-        return result
+        return {key: value for key, value in result.items() if key in KIOSK_STATE_KEYS} if kiosk else result
 
     def estop_snapshot(self, now):
         with self.lock:
@@ -745,11 +830,19 @@ class SharedState:
         request_id = payload.get('request_id', '')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ApiError(400, '요청 ID가 필요합니다.')
-        if kind not in ('goal', 'initialpose', 'cancel', 'relocalize'):
+        if kind not in ('goal', 'initialpose', 'cancel', 'relocalize', 'set_floor'):
             raise ApiError(400, '지원하지 않는 명령입니다.')
         pose = validate_pose(payload) if kind in ('goal', 'initialpose') else None
         floor_name, room = payload.get('floor'), payload.get('room', '')
-        if floor_name is not None or room:
+        if kind == 'set_floor':
+            if not isinstance(floor_name, str) or not floor_name:
+                raise ApiError(400, '층 정보가 필요합니다.')
+            with self.lock:
+                if self.building is None:
+                    raise ApiError(404, '층 설정이 없습니다.')
+                if floor_name not in self.building.floors:
+                    raise ApiError(404, '알 수 없는 층입니다.')
+        elif floor_name is not None or room:
             if kind != 'goal' or not isinstance(floor_name, str) or not isinstance(room, str) or len(room) > 32:
                 raise ApiError(400, '층과 호실 정보가 올바르지 않습니다.')
             with self.lock:
@@ -876,6 +969,8 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
             path = urlsplit(self.path).path
             if path == '/api/state':
                 self.respond(200, encode_snapshot(shared.snapshot()))
+            elif path == '/api/kiosk/state':
+                self.respond(200, shared.snapshot(kiosk=True))
             elif path == '/api/floors':
                 self.respond(200, shared.floors_info())
             elif path.startswith('/api/floors/') and path.endswith('/map.png'):
@@ -904,11 +999,17 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 else:
                     self.respond(200, frame[0], 'image/jpeg', {'X-Camera-Age': f'{frame[1]:.2f}'})
             elif path in ('/', '/index.html', '/app.js', '/geometry.js', '/dashboard.js', '/transit.js',
-                          '/battery-profile.js', '/style.css', '/favicon.svg'):
-                name = 'index.html' if path == '/' else path[1:]
+                          '/battery-profile.js', '/style.css', '/favicon.svg',
+                          '/kiosk', '/kiosk.js', '/kiosk.css'):
+                name = {'/': 'index.html', '/kiosk': 'kiosk.html'}.get(path, path[1:])
                 mime = {'html': 'text/html; charset=utf-8', 'js': 'text/javascript; charset=utf-8',
                         'css': 'text/css; charset=utf-8', 'svg': 'image/svg+xml'}[name.rsplit('.', 1)[1]]
-                self.respond(200, (assets/name).read_bytes(), mime)
+                try:
+                    data = (assets/name).read_bytes()
+                except FileNotFoundError:
+                    self.respond(404, dict(error='Not found'))
+                else:
+                    self.respond(200, data, mime)
             else:
                 self.respond(404, dict(error='Not found'))
 
@@ -933,11 +1034,20 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 if not isinstance(payload, dict):
                     raise ValueError('JSON object required')
                 kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
-                         '/api/cancel': 'cancel', '/api/relocalize': 'relocalize'}
+                         '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
+                         '/api/set_floor': 'set_floor', '/api/acknowledge': 'acknowledge',
+                         '/api/kiosk/unlock': 'kiosk/unlock'}
+                kind = kinds.get(self.path)
+                if self.headers.get('X-AMR-Client') == 'kiosk':
+                    shared.check_kiosk_request(kind, payload, self.headers.get('X-AMR-Kiosk-Token'))
                 if self.path not in kinds:
                     raise ApiError(404, 'Not found')
-                result = shared.request(kinds[self.path], payload)
-                self.respond(202, result)
+                if kind == 'kiosk/unlock':
+                    self.respond(200, shared.unlock_kiosk(payload))
+                elif kind == 'acknowledge':
+                    self.respond(202, shared.acknowledge(payload))
+                else:
+                    self.respond(202, shared.request(kind, payload))
             except ApiError as error:
                 self.close_connection = self.close_connection or not consumed
                 self.respond(error.status, dict(error=str(error)))
@@ -964,7 +1074,8 @@ def main(args=None):
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--preview-map', help='Map YAML; preview only, never starts ROS')
     options, ros_args = parser.parse_known_args(args)
-    shared = SharedState(preview=bool(options.preview_map))
+    shared = SharedState(preview=bool(options.preview_map),
+                         kiosk_pin=os.environ.get('AMR_KIOSK_PIN', ''))
     if options.preview_map:
         load_preview(shared, options.preview_map)
         try:

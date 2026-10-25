@@ -96,7 +96,10 @@
     if (kind === 'initialpose' && viewingOther()) return '초기 위치는 현재 층 지도에서만 지정할 수 있습니다.';
     if (kind === 'goal' && ['SENDING','CANCELING'].includes(state?.goal?.status))
       return '이전 목표 요청을 처리 중입니다. 잠시 기다려 주세요.';
-    if (['initialpose','relocalize'].includes(kind) && !canResetLocation())
+    if (kind === 'set_floor' && ['NAV_TO_HALL','CALL_ELEVATOR','WAIT_DOOR_OPEN','BOARDING','BACKING_OUT','IN_CAR_ALIGN',
+      'SELECT_FLOOR','RIDING','SWITCH_MAP','ALIGHTING','RETURN_TO_CAR','RELOCALIZE','NAV_TO_GOAL'].includes(state?.floor_mission?.phase))
+      return '진행 중인 층간 이동이 있습니다.';
+    if (['initialpose','relocalize','set_floor'].includes(kind) && !canResetLocation())
       return '목표를 취소하고 로봇이 정지한 뒤 위치를 다시 설정해 주세요. 속도 데이터도 수신되어야 합니다.';
     return null;
   }
@@ -151,6 +154,8 @@
     const last = state?.localization?.last_pose;
     $('last-pose').hidden = !connected || Boolean(state?.preview) || !last || localized() || viewingOther();
     $('last-pose').disabled = Boolean(commandError('initialpose')) || pending || !activeMap().info;
+    $('set-floor').hidden = !connected || Boolean(state?.preview) || !floorsEnabled();
+    $('set-floor').disabled = Boolean(commandError('set_floor')) || pending;
   }
   function updateSidebar() {
     const s = state, goal = s.goal;
@@ -261,6 +266,7 @@
     }));
     const rooms = floorInfo(viewFloor)?.rooms || [];
     select.replaceChildren(new Option('호실 선택', ''), ...rooms.map(r => new Option(`${viewFloor} ${roomLabel(r.id)}`, r.id)));
+    $('set-floor').replaceChildren(new Option('현재 층 변경', ''), ...floors.map(f => new Option(f.name, f.name)));
     if (state) updateFloorUi();
   }
   async function fetchFloors() {
@@ -382,7 +388,8 @@
     if (!state.preview && ['initialpose','relocalize'].includes(kind)) localizationRequest = request_id;
     busy = true; updateControls();
     activity(kind === 'cancel' ? '목표 취소를 요청하고 있습니다.' : kind === 'relocalize' ?
-      '자동 위치 찾기를 요청하고 있습니다.' : '선택한 위치를 전송하고 있습니다.');
+      '자동 위치 찾기를 요청하고 있습니다.' : kind === 'set_floor' ? '현재 층 변경을 요청하고 있습니다.' :
+      '선택한 위치를 전송하고 있습니다.');
     try {
       const response = await fetch(`/api/${kind}`, {method:'POST',
         headers:{'Content-Type':'application/json', 'X-AMR-Request':'1'},
@@ -399,7 +406,8 @@
       activity(result.status === 'PREVIEW' ? '목표 미리보기입니다. 실제 주행 명령은 전송하지 않았습니다.' :
         kind === 'initialpose' ? '초기 위치 전송을 요청했습니다.' :
         kind === 'relocalize' ? '자동 위치 찾기를 요청했습니다. 위치 확인 완료를 기다려 주세요.' :
-        kind === 'cancel' ? '취소 요청을 접수했습니다. 완료 응답을 기다립니다.' : '목표를 전송했습니다. 로봇의 접수 응답을 기다립니다.');
+        kind === 'cancel' ? '취소 요청을 접수했습니다. 완료 응답을 기다립니다.' :
+        kind === 'set_floor' ? '현재 층 변경을 요청했습니다. 층 표시가 바뀌는지 확인하세요.' : '목표를 전송했습니다. 로봇의 접수 응답을 기다립니다.');
       if (kind === 'initialpose' || (kind === 'cancel' && state.preview)) {
         selected=null; $('goal-x').textContent='—'; $('goal-y').textContent='—';
         $('goal-label').textContent='선택 전'; setMode('goal');
@@ -566,6 +574,9 @@
   $('send').addEventListener('click',()=>{if(selected)command(mode==='initialpose'?'initialpose':'goal',selected);});
   $('cancel').addEventListener('click',()=>command('cancel'));
   $('relocalize').addEventListener('click',()=>command('relocalize'));
+  // Operator override when the floor is wrong (e.g. after a mission ended inside the car).
+  $('set-floor').addEventListener('change',event=>{const floor=event.target.value;event.target.value='';
+    if(floor&&confirm(`현재 층을 ${floor}(으)로 바꿀까요? 실제 층과 다를 때만 바꾸세요.`))command('set_floor',{floor});});
   // Only previews the saved pose; the operator still confirms with '초기 위치 적용'.
   $('last-pose').addEventListener('click',()=>{const last=state?.localization?.last_pose,info=activeMap().info;
     if(!last||!info)return;setMode('initialpose');setSelected({x:last.x,y:last.y,yaw:last.yaw,map_version:info.version});

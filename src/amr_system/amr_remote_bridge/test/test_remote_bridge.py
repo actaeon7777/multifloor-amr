@@ -579,6 +579,35 @@ def test_single_floor_robot_has_an_empty_floor_list(system):
     assert not system['calls']
 
 
+def test_set_floor_is_relayed_without_pose_or_map_and_deduplicated(system):
+    shared = system['shared']
+    enable_floors(shared)
+    shared.kiosk_pin = 'operator-access-still-works'
+    system['start']()
+    command = dict(request_id='remote_set_floor_001', floor='3F')
+    status, _, body = system['request']('/api/set_floor', command)
+    assert status == 202 and loads(body)['kind'] == 'set_floor' and loads(body)['status'] == 'PREVIEW'
+    assert system['calls'] == [('set_floor', command)]
+    assert system['request']('/api/set_floor', command)[0] == 202
+    assert len(system['calls']) == 1
+    assert system['request']('/api/set_floor', dict(command, floor='4F'))[0] == 409
+    for kind in ('acknowledge', 'kiosk/unlock'):
+        assert system['request']('/api/'+kind, command)[0] == 404
+
+
+@pytest.mark.parametrize('fields', [dict(), dict(floor=None), dict(floor=3), dict(floor='../3F'),
+                                   dict(floor=''), dict(floor='a'*65), dict(floor='3F', room=''),
+                                   dict(floor='3F', room=None), dict(floor='3F', x=0),
+                                   dict(floor='3F', y=0), dict(floor='3F', yaw=0),
+                                   dict(floor='3F', pose={})])
+def test_remote_set_floor_validation(fields):
+    # Validation precedes robot lookup, so it also works before an agent connects.
+    registry = Registry()
+    with pytest.raises(ApiError) as error:
+        registry.queue('amr-01', 'set_floor', dict(request_id='invalid_floor_001', **fields))
+    assert error.value.status == 400
+
+
 def small_jpeg(color=(40, 50, 60)):
     buffer = io.BytesIO()
     Image.new('RGB', (16, 9), color).save(buffer, 'JPEG')

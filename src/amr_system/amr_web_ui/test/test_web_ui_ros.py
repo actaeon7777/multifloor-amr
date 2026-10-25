@@ -219,6 +219,77 @@ def test_http_touch_goal_manual_takeover_result_cancel_and_initialpose():
         rclpy.shutdown()
 
 
+def test_set_floor_service_success_rejection_unavailable_and_executor_readiness():
+    from types import SimpleNamespace
+    from amr_elevator_interfaces.srv import SetCurrentFloor
+
+    assert os.environ.get('ROS_DOMAIN_ID') == '193'
+    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    rclpy.init()
+    shared = SharedState()
+    bridge = WebBridge(shared)
+    shared.building = SimpleNamespace(floors={'3F': None, '4F': None})
+    source = Node('web_ui_set_floor_test')
+    executor = SingleThreadedExecutor()
+    executor.add_node(bridge)
+    executor.add_node(source)
+    server = create_http_server(shared, '/nonexistent', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    calls = []
+
+    def stationary():
+        shared.state['velocity'] = dict(linear=0., angular=0., received_at=time.monotonic())
+
+    def post(request_id, floor='3F'):
+        stationary()
+        req = Request(f'http://127.0.0.1:{server.server_port}/api/set_floor',
+                      data=json.dumps(dict(request_id=request_id, floor=floor)).encode(),
+                      headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
+        with urlopen(req, timeout=2) as response:
+            assert response.status == 202
+            return json.load(response)
+
+    def until(predicate):
+        deadline = time.monotonic()+8
+        while not predicate():
+            assert time.monotonic() < deadline, shared.requests
+            stationary()
+            executor.spin_once(timeout_sec=.01)
+
+    def set_floor(request, response):
+        calls.append(request.floor)
+        response.success = request.floor == '3F'
+        response.message = 'confirmed' if response.success else 'operator override refused'
+        return response
+
+    try:
+        assert post('floor_unavailable')['status'] == 'QUEUED'
+        until(lambda: shared.requests['floor_unavailable']['status'] == 'FAILED')
+        assert shared.state['notice']['detail'] == '층 관리 노드에 연결되지 않았습니다.'
+        source.create_service(SetCurrentFloor, 'floor/set_current', set_floor)
+        until(lambda: bridge.set_floor_client.service_is_ready())
+        assert post('floor_success_01')['status'] == 'QUEUED'
+        until(lambda: shared.requests['floor_success_01']['status'] == 'SUCCEEDED')
+        assert post('floor_success_01')['status'] == 'SUCCEEDED'
+        assert shared.state['pending_request'] is None and calls == ['3F']
+        post('floor_rejected_01', '4F')
+        until(lambda: shared.requests['floor_rejected_01']['status'] == 'FAILED')
+        assert shared.state['notice']['detail'] == 'operator override refused'
+        post('floor_changed_01')
+        shared.state['navigation'] = 'RUNNING'
+        until(lambda: shared.requests['floor_changed_01']['status'] == 'FAILED')
+        assert calls == ['3F', '4F']  # Admission was repeated on the executor.
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        executor.shutdown()
+        bridge.destroy_node()
+        source.destroy_node()
+        rclpy.shutdown()
+
+
 def test_passive_vehicle_subscriptions_and_restart():
     rclpy.init()
     shared = SharedState()

@@ -16,7 +16,7 @@ LAYERS = frozenset(('map', 'local_costmap', 'global_costmap'))
 # Static maps of other floors travel as layers named 'floor/<floor>' (see /api/floors).
 FLOOR_LAYER = 'floor/'
 MAX_FLOORS = 16
-COMMANDS = frozenset(('goal', 'initialpose', 'cancel', 'relocalize'))
+COMMANDS = frozenset(('goal', 'initialpose', 'cancel', 'relocalize', 'set_floor'))
 AGED_FIELDS = ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization',
                'camera')
 # Depth camera color snapshot (JPEG from the AMR's /api/camera.jpg), relayed at most

@@ -7,6 +7,33 @@
 > `diagnostics/`는 Jetson 작업공간, 나머지는 시뮬레이션 PC 작업공간에 있다. 아래 경로는 그 기준이다.
 > 시뮬레이션 수치는 실물 보정 전 모델(`calibration_status: uncalibrated`)의 결과이며 실차 성능으로 확정하지 않는다.
 
+## 2026-10-25 · 파이썬 노드 CPU 최적화 1차 (동작 불변)
+
+- 계기: 실차 187 s 주행 기준 측정에서 파이썬 노드 합계가 코어 하나 이상(약 115 %)을 썼다. navigation_startup 24 %,
+  cmd_vel_to_can 16 %, can_telemetry 13 %, web_ui 13 %(p95 32 %), time_health 12 %, elevator_monitor 12 %, floor_mission 12 %.
+  원자료 `reports/profile/20261025_144835_before_opt.csv`(`scripts/profile_nodes.py`), py-spy 결과 같은 폴더.
+- 변경(토픽·QoS·임계값·주행 판단은 그대로): 빔 단위 파이썬 루프를 numpy로(위치 품질 점수·광선 자세 보간, 엘리베이터 문 감지·여유 거리,
+  scan_body_filter), 고정 값 캐시(빔 각도·정적 TF·엘리베이터 지오메트리), 웹 스캔 JSON을 요청 시 스캔당 1회 인코딩,
+  costmap PNG P 모드·압축 1, joint_states 10 Hz, Nav2 피드백 중계 10 Hz, 쓰지 않는 /tf 구독 해제, time_health 헤더만 읽는 raw 구독,
+  깊이 필터 프레임별 할당 제거, sllidar_ros2·amr_nav2_plugins Release 빌드.
+- 녹화 재생 A/B: `bags/2026-10-25/023737_depth_box`를 1배속으로 재생하고 두 코드 버전에서 150 s 평균 CPU를 비교했다(도메인 151, localhost).
+  scan_body_filter 10.1→4.9 %, elevator_monitor 16.9→10.8 %, floor_mission 8.6→5.6 %, time_health 14.0→10.9 %,
+  web_ui(5 Hz 조회) 25.8→22.3 %, depth_persistence_filter 7.0→6.0 %, 합계 82.4→60.5 %.
+  첫 재생에서 web_ui가 32.8 %로 나빠졌다. 스캔마다(10 Hz) JSON을 미리 인코딩한 탓이라 요청 시 1회 인코딩으로 고친 뒤 다시 쟀다.
+- 같은 bag의 실제 지도·스캔 584개로 `MapQuality.score` 2.85→1.01 ms(결과 584개 동일), 360빔 광선 자세 보간 4.45→0.07 ms(동일).
+- 명령: `scripts/replay_cpu_ab.py`, `scripts/bench_map_quality_ab.py`(비교 기준은 `git worktree`로 꺼낸 1192cb4).
+  CAN이 필요한 노드(can_telemetry, cmd_vel_to_can)와 Nav2·AMCL이 떠야 하는 navigation_startup 전체는 재생 범위 밖이다.
+- 실차 재측정(20:12, 같은 경로 220 s, 카메라 켬, 노트북 VS Code 연결 유지): 파이썬 노드 합계 135→96 %.
+  navigation_startup 24.1→16.1, floor_mission 11.5→4.2, navigation_manager 16.7→10.9, scan_body_filter 6.2→1.8,
+  elevator_monitor 11.7→7.4, web_ui 12.8→9.4, can_telemetry 12.8→9.7, time_health 12.0→9.5 %.
+  C++ 합계 108→98 %(robot_state_publisher 3.5→0.8). cmd_vel_to_can 16.7 %, control_mux 7.0 %는 이번 범위가 아니라 그대로다.
+  6코어 전체는 51.8→49.6 %로, 측정 중 데스크톱(gnome-shell) 순간 부하(최대 80 %)가 섞였다.
+  py-spy: navigation_startup의 실제 작업 비율 45→30 %, 그중 `pose_evidence` 46→약 10 %.
+  주행 경로·속도, 웹 스캔·costmap·남은 거리 표시, LB 인계, E-stop 반응 이상 없음(사용자 확인).
+  원자료 `reports/profile/20261025_201213_after_opt.csv`, `pyspy_*_after.txt`.
+- 다음(동작 변경, 실차 시험 필요): control_mux 중복 /cmd_vel 발행, cmd_vel_to_can·elevator_can_link `spin_once` 루프,
+  web_ui 20 Hz 틱의 `server_is_ready`, READY 증거 평가 주기, 라이다 빔 수.
+
 ## 2026-10-25 · 깊이 장애물의 전역 우회 경로 연결
 
 - 후속 관찰: 같은 10 cm 박스의 양옆에 우회 공간이 충분했지만 차체 약 20 cm 앞에서 정지. 당시 스택은 `mark_threshold=0` 적용 후 실행됐다.

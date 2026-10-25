@@ -137,6 +137,10 @@ class NavigationStartup(Node):
         self.state, self.detail, self.source = 'WAITING_DATA', '지도·스캔·오도메트리·AMCL을 기다립니다.', 'unknown'
         self.last_logged_detail = ''
         self.last_state_log = -math.inf
+        self._in_tick = False
+        self._status_dirty = False
+        self._covariance_cache = None
+        self._tf_availability_cache = None
         self.map_quality = None
         self.map_key = None
         self.map_snapshot = None
@@ -149,7 +153,9 @@ class NavigationStartup(Node):
         # Keep actual callback history separate from the transformable scan
         # selected by data_problem(). Recovery cannot erase an inference gap.
         self.sensor_history = {}
-        self.odom_samples = deque(maxlen=3000)
+        # Only request_tim reads history, from the fresh scan onward (<= 1.5 s
+        # at the default timeout). 150 samples cover 5 s at 30 Hz.
+        self.odom_samples = deque(maxlen=150)
         self.nav_status = 'IDLE'
         self.last_motion = time.monotonic()
         self.last_motion_stamp = self.get_clock().now().nanoseconds
@@ -404,6 +410,28 @@ class NavigationStartup(Node):
                 or not valid_planar_pose(t.translation, t.rotation)):
             raise ValueError('Invalid planar transform or frame')
         return (t.translation.x, t.translation.y, yaw(t.rotation))
+
+    def transform_available(self, target, source, when):
+        """Reuse identical availability queries only within the current tick."""
+        cache = self._tf_availability_cache
+        if cache is None:
+            return self.tf_buffer.can_transform(target, source, when)
+        key = (target, source, when.nanoseconds, when.clock_type)
+        if key not in cache:
+            cache[key] = self.tf_buffer.can_transform(target, source, when)
+        return cache[key]
+
+    def pose_covariance_is_bounded(self, pose, max_xy_std, max_yaw_std):
+        """Memoize an immutable received pose's check for this tick and limits."""
+        cache = self._covariance_cache
+        if cache is None:
+            return covariance_is_bounded(pose.pose.covariance, max_xy_std, max_yaw_std)
+        key = (id(pose), max_xy_std, max_yaw_std)
+        if key not in cache:
+            # Retain the object as well, so its id cannot be reused this tick.
+            cache[key] = (pose, covariance_is_bounded(
+                pose.pose.covariance, max_xy_std, max_yaw_std))
+        return cache[key][1]
 
     def on_map(self, message):
         if message.header.frame_id != self.cfg['global_frame']:
@@ -949,18 +977,18 @@ class NavigationStartup(Node):
                     or not self.valid_scan(sample)):
                 continue
             when = Time.from_msg(sample.header.stamp)
-            if (self.tf_buffer.can_transform(self.cfg['odom_frame'], self.cfg['base_frame'], when)
-                    and self.tf_buffer.can_transform(self.cfg['base_frame'], sample.header.frame_id, when)):
+            if (self.transform_available(self.cfg['odom_frame'], self.cfg['base_frame'], when)
+                    and self.transform_available(self.cfg['base_frame'], sample.header.frame_id, when)):
                 if self.prior_verified and sample.time_increment > 0:
                     end = Time(nanoseconds=stamp_ns(sample.header.stamp) + round(
                         (len(sample.ranges)-1)*sample.time_increment*1e9))
                     # Rolling measurements need TF through the final beam, not
                     # just the first. DDS may deliver this scan before that TF.
-                    if not self.tf_buffer.can_transform(self.cfg['odom_frame'], sample.header.frame_id, end):
+                    if not self.transform_available(self.cfg['odom_frame'], sample.header.frame_id, end):
                         continue
                 if fallback is None:
                     fallback = (sample, received)
-                if (not self.initialized or self.tf_buffer.can_transform(
+                if (not self.initialized or self.transform_available(
                         self.cfg['global_frame'], sample.header.frame_id, when)):
                     fallback = (sample, received)
                     break
@@ -975,7 +1003,7 @@ class NavigationStartup(Node):
             if pose is not None and (pose.header.frame_id != self.cfg['global_frame']
                     or not valid_planar_pose(pose.pose.pose.position, pose.pose.pose.orientation)
                     or not np.isfinite(pose.pose.covariance).all()
-                    or not covariance_is_bounded(pose.pose.covariance, math.inf, math.inf)):
+                    or not self.pose_covariance_is_bounded(pose, math.inf, math.inf)):
                 return 'AMCL 위치 또는 공분산이 유효하지 않습니다.'
         for pose, received in reversed(self.pose_samples):
             pose_stamp = stamp_ns(pose.header.stamp)
@@ -983,7 +1011,7 @@ class NavigationStartup(Node):
             if (pose_stamp < self.attempt_stamp or not -.1 <= age <= self.cfg['pose_timeout']
                     or time.monotonic()-received > self.cfg['pose_timeout']):
                 continue
-            if self.tf_buffer.can_transform(self.cfg['global_frame'], self.cfg['base_frame'],
+            if self.transform_available(self.cfg['global_frame'], self.cfg['base_frame'],
                                             Time.from_msg(pose.header.stamp)):
                 self.pose, self.received['pose'] = pose, received
                 break
@@ -1026,7 +1054,7 @@ class NavigationStartup(Node):
                 if math.isfinite(variance) and variance >= 0:
                     self.metrics[key] = math.sqrt(variance)
         if (not np.isfinite(covariance).all()
-                or not covariance_is_bounded(self.pose.pose.covariance, math.inf, math.inf)):
+                or not self.pose_covariance_is_bounded(self.pose, math.inf, math.inf)):
             return None, 'AMCL 공분산이 유효하지 않습니다.'
         confidence_problem = None
         # Admission limits apply while initializing. Along a long corridor AMCL
@@ -1036,7 +1064,7 @@ class NavigationStartup(Node):
         phase = 'tracking' if self.prior_verified else 'initial'
         max_xy = self.cfg['tracking_max_xy_std'] if self.prior_verified else self.cfg['max_xy_std']
         max_yaw = self.cfg['tracking_max_yaw_std'] if self.prior_verified else self.cfg['max_yaw_std']
-        if not covariance_is_bounded(self.pose.pose.covariance, max_xy, max_yaw):
+        if not self.pose_covariance_is_bounded(self.pose, max_xy, max_yaw):
             xy, heading = self.metrics.get('xy_std'), self.metrics.get('yaw_std')
             xy_text = '알 수 없음' if xy is None else f'{xy:.3f}m/{max_xy:.3f}m'
             yaw_text = ('알 수 없음' if heading is None else
@@ -1152,7 +1180,6 @@ class NavigationStartup(Node):
         start = self.checked_transform(self.cfg['odom_frame'], scan.header.frame_id,
                                        Time.from_msg(scan.header.stamp))
         correction = compose_se2(laser_pose, inverse_se2(start))
-        poses = []
         duration = (len(scan.ranges)-1)*scan.time_increment
         # Check even an invalid/no-return final beam's time. Completeness must
         # not depend on which ranges happened to survive subsampling.
@@ -1178,14 +1205,16 @@ class NavigationStartup(Node):
         knots = np.asarray(knots, dtype=float)
         unwrapped = np.unwrap(knots[:, 2])
         ray_times = np.asarray(indices, dtype=float)*scan.time_increment
-        for ray_time in ray_times:
-            odom_laser = (float(np.interp(ray_time, knot_times, knots[:, 0])),
-                          float(np.interp(ray_time, knot_times, knots[:, 1])),
-                          float(np.interp(ray_time, knot_times, unwrapped)))
-            poses.append(compose_se2(correction, odom_laser))
+        x = np.interp(ray_times, knot_times, knots[:, 0])
+        y = np.interp(ray_times, knot_times, knots[:, 1])
+        heading = correction[2] + np.interp(ray_times, knot_times, unwrapped)
+        c, s = math.cos(correction[2]), math.sin(correction[2])
+        poses = np.column_stack((correction[0] + c*x - s*y,
+                                 correction[1] + s*x + c*y,
+                                 np.arctan2(np.sin(heading), np.cos(heading))))
         self.metrics.update(scan_motion_compensated=True, scan_duration=duration,
                             scan_motion_translation=translation, scan_motion_yaw=rotation)
-        return np.asarray(poses, dtype=float).reshape(-1, 3)
+        return poses
 
     def record_tracking_warning(self, problem, now):
         """Report confidence changes without undoing completed initialization."""
@@ -1203,7 +1232,11 @@ class NavigationStartup(Node):
 
     def scan_args(self):
         s = self.scan
-        return dict(ranges=list(s.ranges), angle_min=s.angle_min, angle_increment=s.angle_increment,
+        # LaserScan owns an array('f'); the read-only view retains its buffer
+        # while rival/refinement workers finish, even after self.scan changes.
+        ranges = np.asarray(s.ranges).view()
+        ranges.setflags(write=False)
+        return dict(ranges=ranges, angle_min=s.angle_min, angle_increment=s.angle_increment,
                     range_min=s.range_min, range_max=s.range_max,
                     max_beams=self.cfg['quality_max_beams'], max_range=self.quality_range())
 
@@ -1290,6 +1323,9 @@ class NavigationStartup(Node):
                 self.cfg[prefix+'verification_samples'])
 
     def publish_status(self):
+        if self._in_tick:
+            self._status_dirty = True
+            return
         duration, samples = self.verification_requirements()
         self.status_pub.publish(String(data=json.dumps(dict(
             state=self.state, ready=self.state == 'READY', detail=self.detail,
@@ -1308,16 +1344,27 @@ class NavigationStartup(Node):
                                   else max(0.0, time.monotonic()-self.good_since)),
             verification_required_duration=duration,
             **self.tim_metrics, **self.refinement_metrics, **self.metrics), ensure_ascii=False, allow_nan=False)))
+        self._status_dirty = False
 
     def tick(self):
+        self._in_tick = True
+        self._status_dirty = True  # Keep the periodic heartbeat even without a state change.
+        self._covariance_cache = {}
+        self._tf_availability_cache = {}
         try:
-            self.advance()
-        except Exception as exc:
-            self.good_since, self.good_count = None, 0
-            self.set_state('FAILED', f'시작 상태 확인 오류: {type(exc).__name__}. navigation을 재시작하세요.')
-            self.get_logger().error(str(exc))
-        self.remember_pose()
-        self.publish_status()
+            try:
+                self.advance()
+            except Exception as exc:
+                self.good_since, self.good_count = None, 0
+                self.set_state('FAILED', f'시작 상태 확인 오류: {type(exc).__name__}. navigation을 재시작하세요.')
+                self.get_logger().error(str(exc))
+            self.remember_pose()
+        finally:
+            self._in_tick = False
+            self._covariance_cache = None
+            self._tf_availability_cache = None
+        if self._status_dirty:
+            self.publish_status()
 
     def load_saved_poses(self):
         if not self.last_pose_file:
@@ -1419,7 +1466,7 @@ class NavigationStartup(Node):
             if (self.cfg['automatic_localization'] and not self.auto_attempted
                     and self.stationary() and not self.goal_in_progress()
                     and self.pose is not None
-                    and self.tf_buffer.can_transform(self.cfg['global_frame'], self.cfg['base_frame'],
+                    and self.transform_available(self.cfg['global_frame'], self.cfg['base_frame'],
                                                      Time.from_msg(self.scan.header.stamp))):
                 # Navigation can start after a human has already initialized
                 # AMCL. Preserve that estimate rather than blindly replacing

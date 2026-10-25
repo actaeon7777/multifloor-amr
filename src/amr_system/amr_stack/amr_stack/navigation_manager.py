@@ -121,6 +121,7 @@ class NavigationManager(Node):
         self.requests = {}
         self.last_command = None
         self.command_time = 0.0
+        self.feedback_time = 0.0
         self.quiet_until = 0.0
         self.terminal_status = 'IDLE'
         self.last_status = None
@@ -350,7 +351,7 @@ class NavigationManager(Node):
     def on_maneuver_command(self, message):
         if self.lease_active() and valid_command(
                 message, self.settings['max_linear_speed'], self.settings['max_angular_speed']):
-            self.maneuver_command = deepcopy(message)
+            self.maneuver_command = message  # fresh object per callback; no copy needed
             self.maneuver_time = monotonic()
         else:
             self.maneuver_command = None
@@ -443,7 +444,7 @@ class NavigationManager(Node):
     def on_command(self, message):
         if (self.permitted() and valid_command(
                 message, self.settings['max_linear_speed'], self.settings['max_angular_speed'])):
-            self.last_command = deepcopy(message)
+            self.last_command = message  # fresh object per callback; no copy needed
             self.command_time = monotonic()
         else:
             self.stop_output()
@@ -490,7 +491,13 @@ class NavigationManager(Node):
         future.add_done_callback(lambda f: self.on_response(run, f))
 
     def on_feedback(self, run, message):
+        # bt_navigator feeds back on every BT loop (~100 Hz); the web only
+        # reads distance_remaining and the feedback age, so relay at 10 Hz.
+        now = monotonic()
+        if now - self.feedback_time < 0.1:
+            return
         if self.run is run and self.permitted() and run.request.handle.is_active:
+            self.feedback_time = now
             run.request.handle.publish_feedback(message.feedback)
 
     def on_response(self, run, future):

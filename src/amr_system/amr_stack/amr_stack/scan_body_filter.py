@@ -78,6 +78,31 @@ def shadow_mask(ranges, angle_min, angle_increment, pose, sectors, max_range):
     return finite & (r <= max_range) & (offset <= sectors[:, 1]).any(axis=1)
 
 
+def hidden_mask(cache, key, ranges, angle_min, angle_increment, pose, boxes, sectors, max_range):
+    """body_mask | shadow_mask with the per-beam geometry cached under ``key``.
+
+    Beam angles, their cos/sin and the shadow-sector membership depend only
+    on the scan layout (frame, angle_min, angle_increment, beam count);
+    recomputing them for 3240 beams at 10 Hz was most of this node's work.
+    """
+    r = np.asarray(ranges, dtype=float)
+    cached = cache.get(key)
+    if cached is None:
+        angle = angle_min + angle_increment * np.arange(r.size) + pose[2]
+        offset = np.abs(np.angle(np.exp(1j * (angle[:, None] - sectors[:, 0]))))
+        cached = cache[key] = (np.cos(angle), np.sin(angle), (offset <= sectors[:, 1]).any(axis=1))
+        if len(cache) > 4:
+            cache.pop(next(iter(cache)))
+    cosine, sine, in_shadow = cached
+    finite = np.isfinite(r)
+    distance = np.where(finite, r, 0.0)
+    x = (pose[0] + distance * cosine)[:, None]
+    y = (pose[1] + distance * sine)[:, None]
+    inside = ((x >= boxes[:, 0]) & (x <= boxes[:, 1])
+              & (y >= boxes[:, 2]) & (y <= boxes[:, 3])).any(axis=1)
+    return finite & (inside | ((r <= max_range) & in_shadow))
+
+
 def laser_pose(transform):
     """Planar (x, y, yaw) of a level laser from a base_link <- laser transform."""
     t, q = transform.translation, transform.rotation
@@ -115,6 +140,7 @@ class ScanBodyFilter(Node):
                 and math.isfinite(self.shadow_range) and self.shadow_range >= 0):
             raise ValueError('shadow_margin_deg must be in [0, 45) and shadow_range >= 0')
         self.poses = {}
+        self.beam_cache = {}
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         # Same reliable depth-10 profile as sllidar_node, so both best-effort
@@ -136,13 +162,22 @@ class ScanBodyFilter(Node):
             entry = self.poses[frame] = (pose, shadow_sectors(self.parts, pose, self.shadow_margin))
             self.get_logger().info(f'{frame} at x={pose[0]:.3f} y={pose[1]:.3f} yaw={pose[2]:.3f}; '
                                    f'{len(self.boxes)} body boxes, shadows to {self.shadow_range:.2f} m')
+            # The laser sits on a fixed joint and its pose is cached for good,
+            # so stop deserializing /tf (EKF 30 Hz + AMCL) into an unread buffer.
+            # The static transform stays in the buffer for a later frame lookup.
+            if self.tf_listener is not None:
+                self.tf_listener.unregister()
+                self.tf_listener = None
         pose, sectors = entry
         ranges = np.array(msg.ranges, dtype=np.float32)
-        hidden = body_mask(ranges, msg.angle_min, msg.angle_increment, pose, self.boxes)
-        hidden |= shadow_mask(ranges, msg.angle_min, msg.angle_increment, pose, sectors, self.shadow_range)
+        hidden = self.hidden_mask(frame, msg.angle_min, msg.angle_increment, ranges, pose, sectors)
         ranges[hidden] = np.nan
         msg.ranges = array.array('f', ranges.tobytes())
         self.publisher.publish(msg)
+
+    def hidden_mask(self, frame, angle_min, angle_increment, ranges, pose, sectors):
+        return hidden_mask(self.beam_cache, (frame, angle_min, angle_increment, ranges.size),
+                           ranges, angle_min, angle_increment, pose, self.boxes, sectors, self.shadow_range)
 
 
 def main():

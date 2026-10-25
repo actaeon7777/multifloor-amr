@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 import yaml
 
-from amr_stack.scan_body_filter import body_boxes, body_mask, laser_pose, shadow_mask, shadow_sectors
+from amr_stack.scan_body_filter import (body_boxes, body_mask, hidden_mask, laser_pose, shadow_mask,
+                                        shadow_sectors)
 
 CONFIG = Path(__file__).resolve().parents[1] / 'config'
 PARAMETERS = yaml.safe_load((CONFIG / 'scan_body_filter.yaml').read_text())['scan_body_filter']['ros__parameters']
@@ -90,6 +91,28 @@ def test_shadow_sectors_span_each_upright_plus_the_margin():
     assert shadow_mask([0.29], math.pi, 0.0, (0.0, 0.0, 0.0), behind, 0.7).tolist() == [True]
     with pytest.raises(ValueError):
         shadow_sectors(np.array([[-0.1, 0.1, -0.1, 0.1]]), (0.0, 0.0, 0.0), 0.0)
+
+
+def test_cached_hidden_mask_equals_the_reference_masks():
+    """The node's cached per-beam geometry must not change what is hidden."""
+    rng = np.random.default_rng(1)
+    angles = np.linspace(-math.pi, math.pi, 3240, endpoint=False)
+    increment = angles[1] - angles[0]
+    cache = {}
+    for _ in range(5):
+        ranges = rng.uniform(0.05, 6.0, angles.size)
+        ranges[rng.random(angles.size) < 0.1] = np.nan
+        ranges[rng.random(angles.size) < 0.05] = np.inf
+        ranges[rng.random(angles.size) < 0.2] = rng.uniform(0.2, 0.6)
+        got = hidden_mask(cache, ('laser', angles[0], increment, angles.size), ranges,
+                          angles[0], increment, LASER, BOXES, SECTORS, SHADOW_RANGE)
+        assert got.tolist() == hidden(ranges, angles[0], increment).tolist()
+    assert len(cache) == 1
+    # Another layout gets its own entry; the cache stays small.
+    for count in (1080, 720, 360, 180, 90):
+        hidden_mask(cache, ('laser', -math.pi, 2 * math.pi / count, count), np.full(count, 1.0),
+                    -math.pi, 2 * math.pi / count, LASER, BOXES, SECTORS, SHADOW_RANGE)
+    assert len(cache) <= 4
 
 
 def test_non_returns_stay_untouched():

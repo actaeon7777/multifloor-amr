@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.8)
 project(amr_nav2_plugins)
+# The workspace builds without a build type (-O0); this critic runs inside
+# the 20 Hz DWB loop.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
 find_package(ament_cmake REQUIRED)
 find_package(dwb_core REQUIRED)
 find_package(pluginlib REQUIRED)

@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.5)
 project(sllidar_ros2)
 
+# The workspace builds without a build type (-O0); the SDK unpacks 32k
+# samples/s and sorts ~3200 nodes per scan on the Jetson.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
 if(NOT CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_STANDARD 14)
 endif()

@@ -61,7 +61,7 @@
 source /opt/ros/jazzy/setup.bash
 CMAKE_BUILD_PARALLEL_LEVEL=2 MAKEFLAGS=-j2 \
   colcon build --base-paths src --symlink-install --executor sequential \
-  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 -DCMAKE_BUILD_TYPE=Release
 source scripts/env.sh
 ```
 

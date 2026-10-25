@@ -11,7 +11,8 @@ source /opt/ros/jazzy/setup.bash
 cd "$workspace_dir"
 rosdep update --rosdistro jazzy
 rosdep install --from-paths src --ignore-src -r -y --rosdistro jazzy
-colcon build --base-paths src --symlink-install --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+colcon build --base-paths src --symlink-install \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 -DCMAKE_BUILD_TYPE=Release
 source install/local_setup.bash
 colcon test --base-paths src --event-handlers console_direct+
 colcon test-result --verbose

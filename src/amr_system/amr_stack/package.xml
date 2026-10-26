@@ -14,6 +14,7 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>amr_control</exec_depend>
   <exec_depend>amr_depth_filter</exec_depend>
+  <exec_depend>spatio_temporal_voxel_layer</exec_depend>
   <exec_depend>amr_vehicle_status</exec_depend>
   <exec_depend>amr_can_bridge</exec_depend>
   <exec_depend>sllidar_ros2</exec_depend>

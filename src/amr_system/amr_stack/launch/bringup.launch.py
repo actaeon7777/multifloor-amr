@@ -57,7 +57,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'start_camera', default_value='false',
             description='Gemini 2 depth camera (camera.launch.py): depth points for global/local costmaps '
-                        'VoxelLayer, JPEG color for the web, and a depth watch in time_health.'),
+                        '(STVL), JPEG color for the web, and a depth watch in time_health.'),
         DeclareLaunchArgument('ekf_config', default_value=str(config_dir / 'ekf.yaml')),
         DeclareLaunchArgument('predict_to_current_time', default_value=LaunchConfiguration('use_sim_time'),
                               description='Predict EKF output between sensor samples; enabled for simulation.'),

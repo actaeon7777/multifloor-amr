@@ -201,18 +201,28 @@ global_costmap:
       # Depth-only low obstacles must invalidate the global path as well as
       # constrain local motion. Keep height/clearing rules aligned with local.
       depth_layer:
-        plugin: nav2_costmap_2d::VoxelLayer
+        # STVL instead of VoxelLayer (2026-10-27): VoxelLayer forgot a mark only
+        # when its own rays crossed it, so marks in the blind band (bumper to
+        # 0.70 m ahead, the sides, behind) stayed forever. On 10-26 a false mark
+        # beside the robot after the 4F elevator exit, and a removed object at
+        # 401, kept every trajectory illegal and recovery kept them (2 m keep zone).
+        # Marks now expire voxel_decay s after their last observation, faster
+        # inside the camera frustum when no return re-marks them.
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
         enabled: true
-        publish_voxel_map: false
-        footprint_clearing_enabled: true
-        origin_z: 0.0
-        z_resolution: 0.10
-        z_voxels: 10
-        unknown_threshold: 10
-        # Nav2 marks a column only when occupied voxel count > mark_threshold.
-        # With 10 cm bins, 1 misses low boxes / flat tops confined to one bin.
-        # The 6 cm height filter below rejects floor returns before marking.
+        voxel_decay: 10.0
+        decay_model: 0
+        voxel_size: 0.05
+        track_unknown_space: true
+        # Any occupied voxel marks its column: a low box top fills one voxel.
         mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1
+        origin_z: 0.0
+        publish_voxel_map: false
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
         observation_sources: depth_mark depth_clear
         depth_mark:
           # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
@@ -228,20 +238,30 @@ global_costmap:
           # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
           min_obstacle_height: 0.06
           max_obstacle_height: 1.0
-          obstacle_min_range: 0.0
-          obstacle_max_range: 3.0
+          obstacle_range: 3.0
+          inf_is_valid: false
+          voxel_min_points: 0
+          clear_after_reading: true
         depth_clear:
+          # Frustum model: a voxel inside the measured view that no return
+          # re-marks expires ~1.4 s after its last mark (decay_acceleration 15
+          # against voxel_decay 10). Gemini 2 depth FOV 92.4 x 66.2 deg.
+          # STVL puts min_z/max_z on the corner rays, so on the axis they are
+          # x0.58: near 0.20 m (past the sensor's 0.15 m dead zone), far 3.0 m
+          # (= obstacle_range; a frame cannot re-mark what lies beyond it).
           topic: /camera/depth/points
           data_type: PointCloud2
           marking: false
           clearing: true
+          model_type: 0
+          min_z: 0.35
+          max_z: 5.1
+          horizontal_fov_angle: 1.613
+          vertical_fov_angle: 1.155
+          decay_acceleration: 15.0
           observation_persistence: 0.0
           expected_update_rate: 0.0
-          # Floor returns (z ~ 0) stay in the clearing cloud so their rays free cells.
-          min_obstacle_height: -0.10
-          max_obstacle_height: 1.0
-          raytrace_min_range: 0.0
-          raytrace_max_range: 3.5
+          clear_after_reading: true
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         # 1.0 (was 1.6, 2026-10-25 bag 023737): with 1.6 every cell of the 2.7 m
@@ -299,22 +319,32 @@ local_costmap:
       # 0.195 m above the floor; this layer adds what it misses: low boxes, table
       # tops, chair seats, up to the robot top (0.84 m). The lower FOV edge first
       # meets the floor 0.70 m ahead of base_link (raised surfaces can remain
-      # visible closer); marks persist until this layer's own rays clear them.
+      # visible closer); marks there are kept only for voxel_decay (see below).
       # expected_update_rate 0 keeps the costmap current without the camera
       # (simulation, start_camera:=false); time_health gates AUTO on a dead camera.
       depth_layer:
-        plugin: nav2_costmap_2d::VoxelLayer
+        # STVL instead of VoxelLayer (2026-10-27): VoxelLayer forgot a mark only
+        # when its own rays crossed it, so marks in the blind band (bumper to
+        # 0.70 m ahead, the sides, behind) stayed forever. On 10-26 a false mark
+        # beside the robot after the 4F elevator exit, and a removed object at
+        # 401, kept every trajectory illegal and recovery kept them (2 m keep zone).
+        # Marks now expire voxel_decay s after their last observation, faster
+        # inside the camera frustum when no return re-marks them.
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
         enabled: true
-        publish_voxel_map: false
-        footprint_clearing_enabled: true
-        origin_z: 0.0
-        z_resolution: 0.10
-        z_voxels: 10
-        unknown_threshold: 10
-        # Nav2 marks a column only when occupied voxel count > mark_threshold.
-        # With 10 cm bins, 1 misses low boxes / flat tops confined to one bin.
-        # The 6 cm height filter below rejects floor returns before marking.
+        voxel_decay: 10.0
+        decay_model: 0
+        voxel_size: 0.05
+        track_unknown_space: true
+        # Any occupied voxel marks its column: a low box top fills one voxel.
         mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1
+        origin_z: 0.0
+        publish_voxel_map: false
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
         observation_sources: depth_mark depth_clear
         depth_mark:
           # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
@@ -330,20 +360,30 @@ local_costmap:
           # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
           min_obstacle_height: 0.06
           max_obstacle_height: 1.0
-          obstacle_min_range: 0.0
-          obstacle_max_range: 3.0
+          obstacle_range: 3.0
+          inf_is_valid: false
+          voxel_min_points: 0
+          clear_after_reading: true
         depth_clear:
+          # Frustum model: a voxel inside the measured view that no return
+          # re-marks expires ~1.4 s after its last mark (decay_acceleration 15
+          # against voxel_decay 10). Gemini 2 depth FOV 92.4 x 66.2 deg.
+          # STVL puts min_z/max_z on the corner rays, so on the axis they are
+          # x0.58: near 0.20 m (past the sensor's 0.15 m dead zone), far 3.0 m
+          # (= obstacle_range; a frame cannot re-mark what lies beyond it).
           topic: /camera/depth/points
           data_type: PointCloud2
           marking: false
           clearing: true
+          model_type: 0
+          min_z: 0.35
+          max_z: 5.1
+          horizontal_fov_angle: 1.613
+          vertical_fov_angle: 1.155
+          decay_acceleration: 15.0
           observation_persistence: 0.0
           expected_update_rate: 0.0
-          # Floor returns (z ~ 0) stay in the clearing cloud so their rays free cells.
-          min_obstacle_height: -0.10
-          max_obstacle_height: 1.0
-          raytrace_min_range: 0.0
-          raytrace_max_range: 3.5
+          clear_after_reading: true
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         inflation_radius: 1.6

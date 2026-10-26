@@ -13,8 +13,8 @@ Nav2 → navigation_manager → /cmd_vel_auto ──────┘   (바퀴 �
 
 CAN 피드백 → can_telemetry → /wheel/odometry, /joint_states, /imu/data_raw → EKF → odom → base_footprint
 S2 LiDAR → /scan_raw → scan_body_filter → /scan → AMCL → map → odom
-Gemini 2 (start_camera:=true) → /camera/depth/points → depth_persistence_filter(같은 odom 5 cm 칸에 3프레임 연속일 때만 장애물 점 통과) → /camera/depth/points_filtered → 전역·지역 costmap depth_layer 표시(지우기는 원본 점군), time_health depth 감시(필터 출력)
-                              (Nav2 복구는 behavior_trees/navigate_to_pose_keep_nearby.xml: 로봇 주변 2 m 정사각형은 지우지 않음 — 카메라 사각지대 낮은 물체 보존)
+Gemini 2 (start_camera:=true) → /camera/depth/points → depth_persistence_filter(같은 odom 5 cm 칸에 3프레임 연속일 때만 장애물 점 통과) → /camera/depth/points_filtered → 전역·지역 costmap depth_layer(STVL) 표시(지우기는 원본 점군의 시야 frustum, 시야 밖 표시는 10초 뒤 만료), time_health depth 감시(필터 출력)
+                              (Nav2 복구는 behavior_trees/navigate_to_pose_keep_nearby.xml: 로봇 주변 2 m 정사각형은 지우지 않음 — 카메라 사각지대 낮은 물체 보존, 보존된 깊이 표시도 10초 뒤 만료)
                               → /camera/color/image_raw/compressed → web_ui /api/camera.jpg → 중앙 관제 중계
 ```
 
@@ -331,7 +331,7 @@ base_footprint
 | DWB critic | `BaseObstacle 0.12`, `PathAlign 32`(전방 0.50 m), `GoalAlign 8`, `PathDist 32`, `GoalDist 32`, `PreferForward`(미세 명령 비용 0.5) |
 | costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.656×0.574 m 직사각형 + padding 0.02 m |
 | 장애물 | `/scan` 반영 5 m, ray tracing 6 m, inflation 1.60 m·감소 계수 2.0, LiDAR 0.5초 지연 시 오래된 것으로 처리 |
-| 깊이 장애물 (전역·지역) | 두 costmap의 `depth_layer`(VoxelLayer)가 `/camera/depth/points`를 받음: 표시 높이 0.05~1.0 m·3 m, 지움은 바닥 포함(-0.10 m)·3.5 m, 복셀 0.10 m×10·`mark_threshold 0`. 전역 경로 무효화·우회 계획과 지역 충돌 검사에 함께 사용. `expected_update_rate 0`이라 카메라가 없어도 costmap은 유효(감시는 `time_health`). inflation·footprint는 유지 |
+| 깊이 장애물 (전역·지역) | 두 costmap의 `depth_layer`(STVL `spatio_temporal_voxel_layer`): 표시는 `/camera/depth/points_filtered` 높이 0.06~1.0 m·3 m, 복셀 0.05 m·`mark_threshold 0`. 지움은 원본 점군의 시야 frustum(축 방향 0.2~3.0 m, 92.4°×66.2°) 안에서 다시 보이지 않으면 약 1.4초, 시야 밖(사각대·옆·뒤)은 마지막 관측 10초 뒤 만료(`voxel_decay`). 전역 경로 무효화·우회 계획과 지역 충돌 검사에 함께 사용. `expected_update_rate 0`이라 카메라가 없어도 costmap은 유효(감시는 `time_health`). inflation·footprint는 유지 |
 | 전역 계획 | Smac 2D, 미확인 공간 통과 안 함, smoother(`w_smooth 0.95`, `w_data 0.02`), 2 Hz 유효성 확인·10초 만료 재계획 |
 | 도착 | 위치 0.15 m·방향 0.15 rad + `StoppedGoalChecker` |
 | 복구 | costmap 갱신, 90° 회전(0.40 rad/s), 5초 대기, 0.30 m 후진(0.05 m/s), 6회 소진 시 실패 |
@@ -372,7 +372,7 @@ base_footprint
 
 - 장치에서 읽은 intrinsic: 깊이 FOV 92.4°×66.2°(상하 각 33.1°)는 1280×800·640×400·320×200 모두 같다(비닝). 컬러 85.9°×55.2°(640×480만 63.6°×49.9° 크롭).
   렌즈 높이 0.147 m·12° 위 장착이라 깊이 하단 광선은 렌즈 앞 0.38 m(base_link 앞 0.70 m)에서 바닥에 닿고, 2 m 앞에서 바닥~1.83 m, 3 m 앞에서 ~2.84 m가 보인다.
-  차체 앞면(0.33 m)~0.70 m 바닥은 LiDAR도 카메라도 못 보는 사각이라 `depth_layer` 표시가 코스트맵에 남아 메운다.
+  차체 앞면(0.33 m)~0.70 m 바닥은 LiDAR도 카메라도 못 보는 사각이라 `depth_layer` 표시가 코스트맵에 남아 메운다. 2026-10-27부터 이 기억은 마지막 관측 뒤 10초까지다(아래 STVL 항목).
 - `camera.launch.py` 설정: 깊이 320×200·10 Hz를 드라이버 decimation 2배로 줄여 점군 160×100(약 14k점·230 KB/프레임), 컬러 640×360·5 fps 요청(실측 2.7 Hz, JPEG 약 68 KB),
   IR·IMU·D2C·컬러 점군 끔. 클라우드 시각 지연 0.3~0.45초.
 - CPU 실측(2026-10-24, 실차 스택 정지 상태·`can_dry_run`, 코어 1개 기준): 드라이버 컨테이너 12~14 %. 지역 costmap을 같은 설정으로 따로 띄워 비교하면 scan만 6.4 %,
@@ -390,6 +390,14 @@ base_footprint
   전역 costmap에는 depth가 빠져 있었다. 전역에도 같은 VoxelLayer 설정을 추가해 박스가 기존 경로를 무효화하고 우회 계획에 반영되도록 했다.
   실제 Smac planner 격리 시험에서 깊이 점군만 추가해 기존 직선 경로 무효화·유효한 우회 경로 생성을 확인했다. 실제 카메라 감지거리·우회 주행·정지거리와
   추가 전역 레이어의 CPU 부하는 현장에서 확인해야 한다. `record_trial.sh`는 이제 깊이 점군도 함께 기록한다.
+- 2026-10-27 깊이 층을 VoxelLayer → STVL(`ros-jazzy-spatio-temporal-voxel-layer` 2.5.5)로 교체했다. 10-26 실차 엘리베이터 시험(3F→4F 405, 401)에서
+  하차 뒤·도착 직전에 `No valid trajectories` → 복구(회전 `Collision Ahead`·후진) 반복으로 3.6 m에 156초가 걸렸다. 차체 0.2~0.5 m 옆에 LiDAR로 설명되지 않는
+  깊이 표시가 있었고(현장에 물체 없음), 401에서는 치운 물체의 표시가 남았다. VoxelLayer는 자기 광선이 지나가야만 지우므로 사각대(앞 0.33~0.70 m·옆·뒤)에
+  들어간 표시는 영원히 남았고, 복구의 2 m 보존이 이를 지켰다. STVL은 시야 frustum 안에서 다시 안 보이면 약 1.4초, 시야 밖은 마지막 관측 10초 뒤 지운다.
+  STVL `min_z`/`max_z`는 frustum 모서리 광선 기준이라 축 방향은 ×0.58이다(처음 3.0을 넣었을 때 축 방향 1.74 m만 지워졌다).
+  bag 023737 재생(같은 필터, 지역 costmap 단독): 차체 0.35 m 안 LiDAR로 설명 안 되는 깊이 칸의 최장 수명 17.2 → 12.0초, 0.35~1.5 m 깊이 칸이
+  사라지는 시간도 짧아졌고(예: 180초 구간 130 → 0칸), 박스 표시 구간(100·220초)은 유지됐다. costmap CPU는 16.3 → 13.7 %(코어 1개). 잘못 찍힌 점의 출처는 미확인이고,
+  사각대의 진짜 낮은 물체도 10초 뒤 잊으므로 실차에서 슬리퍼·엘리베이터 하차 시험으로 `voxel_decay`를 확인해야 한다.
 - 카메라 IMU는 쓰지 않는다(광축 대비 피치 1.5°·롤 1° 틀어짐, `CHECK_V130_CAMERA.md`). 컬러는 `/camera/color/image_raw/compressed`로 드라이버가 JPEG 인코딩하고
   `web_ui`는 바이트만 저장해 `/api/camera.jpg`로 낸다(3초 넘으면 404). 층간 이동 화면 카드가 0.5초마다 갱신하고 `remote_client`가 1초마다 중앙 관제에 중계한다(≤300 KiB).
 - 2026-10-25 첫 실차 기동: 초기 위치 지정 직후 TIM 전역 위치 추정(ICP 2스레드, 약 23초)이 돌며 부하 평균 8까지 올랐고, 그사이 AMCL의 bond heartbeat가

@@ -1,4 +1,4 @@
-"""Exercise low-obstacle marking with real Nav2 and synthetic clouds, without IO."""
+"""Exercise low-obstacle marking with real Nav2 + STVL and synthetic clouds, without IO."""
 import copy
 import json
 import math
@@ -29,9 +29,43 @@ from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from tf2_ros import StaticTransformBroadcaster
 
 
-@pytest.mark.parametrize('legacy_threshold', [True, False], ids=['previous-setting', 'configured'])
+# The real mount (URDF camera_joint): optical axis pitched 11.25 deg up, so the
+# lower FOV edge passes 21.85 deg below horizontal. STVL's frustum is built in
+# the cloud's optical frame (z forward, x right, y down), as the driver publishes.
+SENSOR_ORIGIN = (.320488, .025, .147017)
+_C, _S = math.cos(math.radians(11.25)), math.sin(math.radians(11.25))
+SENSOR_AXES = ((0., -1., 0.), (_S, 0., -_C), (_C, 0., _S))  # optical x, y, z in base
+
+
+def sensor_transform(node, parent):
+    (xx, xy, xz), (yx, yy, yz), (zx, zy, zz) = SENSOR_AXES
+    w = math.sqrt(max(0., 1.+xx+yy+zz))/2
+    t = TransformStamped()
+    t.header.frame_id, t.child_frame_id = parent, 'depth_test_sensor'
+    t.header.stamp = node.get_clock().now().to_msg()
+    t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = SENSOR_ORIGIN
+    r = t.transform.rotation
+    r.w, r.x, r.y, r.z = w, (yz-zy)/(4*w), (zx-xz)/(4*w), (xy-yx)/(4*w)
+    return t
+
+
+def sensor_cloud(world_points, stamp):
+    """Base-frame points (base at the parent origin) as an optical-frame cloud."""
+    payload = b''.join(
+        struct.pack('<fff', *(sum((v-o)*a for v, o, a in zip(point, SENSOR_ORIGIN, axis))
+                              for axis in SENSOR_AXES))
+        for point in world_points)
+    cloud = PointCloud2(height=1, width=len(world_points), point_step=12,
+                        row_step=len(payload), data=payload, is_dense=True,
+                        fields=[PointField(name=name, offset=i*4,
+                                           datatype=PointField.FLOAT32, count=1)
+                                for i, name in enumerate(('x', 'y', 'z'))])
+    cloud.header.frame_id, cloud.header.stamp = 'depth_test_sensor', stamp
+    return cloud
+
+
 @pytest.mark.parametrize('height', [.10, .12], ids=['10cm', '12cm'])
-def test_low_box_marking_floor_rejection_and_clearing(tmp_path, legacy_threshold, height):
+def test_low_box_marking_floor_rejection_and_decay(tmp_path, height):
     assert os.environ['ROS_DOMAIN_ID'] == '197'
     assert os.environ['ROS_LOCALHOST_ONLY'] == '1'
     assert os.environ['ROS_AUTOMATIC_DISCOVERY_RANGE'] == 'LOCALHOST'
@@ -42,8 +76,7 @@ def test_low_box_marking_floor_rejection_and_clearing(tmp_path, legacy_threshold
                   always_send_full_costmap=True, publish_frequency=10.0)
     # The layer itself is under test: mark from the raw cloud, not the filter output.
     params['depth_layer']['depth_mark']['topic'] = '/camera/depth/points'
-    if legacy_threshold:
-        params['depth_layer']['mark_threshold'] = 1
+    decay = params['depth_layer']['voxel_decay']
     config_path = tmp_path / 'costmap.yaml'
     config_path.write_text(yaml.safe_dump({'/**': {'ros__parameters': params}}))
     env = dict(os.environ, ROS_LOG_DIR=str(tmp_path / 'ros_logs'))
@@ -58,17 +91,11 @@ def test_low_box_marking_floor_rejection_and_clearing(tmp_path, legacy_threshold
             '-r', '__node:=depth_costmap_test', '--params-file', str(config_path),
         ], env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         tf = StaticTransformBroadcaster(node)
-        transforms = []
-        sensor_origin = (.320488, .025, .147017)
-        for child, position in [('base_footprint', (0., 0., 0.)),
-                                ('depth_test_sensor', sensor_origin)]:
-            t = TransformStamped()
-            t.header.frame_id, t.child_frame_id = 'odom', child
-            t.header.stamp = node.get_clock().now().to_msg()
-            t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = position
-            t.transform.rotation.w = 1.
-            transforms.append(t)
-        tf.sendTransform(transforms)
+        base = TransformStamped()
+        base.header.frame_id, base.child_frame_id = 'odom', 'base_footprint'
+        base.header.stamp = node.get_clock().now().to_msg()
+        base.transform.rotation.w = 1.
+        tf.sendTransform([base, sensor_transform(node, 'odom')])
         publisher = node.create_publisher(PointCloud2, '/camera/depth/points', qos_profile_sensor_data)
         grids = []
         node.create_subscription(OccupancyGrid, '/costmap', grids.append,
@@ -89,21 +116,16 @@ def test_low_box_marking_floor_rejection_and_clearing(tmp_path, legacy_threshold
             assert future.result().success, log_path.read_text()
         spin_until(lambda: publisher.get_subscription_count() == 2 and bool(grids))
 
+        # A frame without obstacles still returns the floor in view.
+        bare_floor = [(x/10, y/10, 0.) for x in range(8, 29) for y in range(-6, 7)]
+
         def feed(world_points, seconds=1.2):
-            payload = b''.join(struct.pack('<fff', *(v-o for v, o in zip(point, sensor_origin)))
-                               for point in world_points)
-            cloud = PointCloud2(height=1, width=len(world_points), point_step=12,
-                                row_step=len(payload), data=payload, is_dense=True,
-                                fields=[PointField(name=name, offset=i*4,
-                                                   datatype=PointField.FLOAT32, count=1)
-                                        for i, name in enumerate(('x', 'y', 'z'))])
-            cloud.header.frame_id = 'depth_test_sensor'
+            """Publish at the camera's 10 Hz."""
             count = len(grids)
             deadline, next_send = time.monotonic()+seconds, 0.
             while time.monotonic() < deadline:
                 if time.monotonic() >= next_send:
-                    cloud.header.stamp = node.get_clock().now().to_msg()
-                    publisher.publish(cloud)
+                    publisher.publish(sensor_cloud(world_points, node.get_clock().now().to_msg()))
                     next_send = time.monotonic()+.1
                 rclpy.spin_once(node, timeout_sec=.01)
             assert len(grids) > count, 'Costmap stopped publishing'
@@ -116,49 +138,57 @@ def test_low_box_marking_floor_rejection_and_clearing(tmp_path, legacy_threshold
 
         # Floor noise below 6 cm must not become a lethal obstacle.
         floor = [(2.425, y, .04) for y in [-.125, .025, .175]]
-        grid = feed(floor)
+        grid = feed(bare_floor + floor)
         assert 100 not in grid.data
 
         # A low box top surface occupies only one vertical voxel per XY cell.
-        # Repeating observations cannot satisfy the former two-voxel requirement.
         box = [(x, y, height) for x in [2.375, 2.425, 2.475]
                for y in [-.125, -.075, -.025, .025, .075, .125, .175]]
-        grid = feed(box)
-        assert (cost(grid, 2.425, .025) == 100) is (not legacy_threshold)
+        grid = feed(bare_floor + box)
+        assert cost(grid, 2.425, .025) == 100
 
-        if not legacy_threshold:
-            # Empty camera frames alone must not erase a remembered obstacle.
-            grid = feed([])
-            assert cost(grid, 2.425, .025) == 100
-            # Floor and farther surface returns clear both possible height bins.
-            grid = feed([(2.825, .025, z) for z in [0., .12]])
-            # The farther return may inflate this cell, but the old box is gone.
-            assert cost(grid, 2.425, .025) < 100
+        # A few frames without box returns (dropout) keep the obstacle; a box that is
+        # gone from the camera's view is forgotten within ~2 s, not voxel_decay.
+        grid = feed(bare_floor, .3)
+        assert cost(grid, 2.425, .025) == 100
+        grid = feed(bare_floor, 3.)
+        assert cost(grid, 2.425, .025) < 100
 
-            # Recovery clearing (navigate_to_pose_keep_nearby.xml): an obstacle in
-            # the camera's blind zone just ahead of the robot must survive, a far
-            # one is refreshed. The blind zone is modelled by publishing nothing.
-            near = [(x, y, height) for x in [.625, .675] for y in [-.075, -.025, .025, .075]]
-            far = [(x, y, height) for x in [2.375, 2.425] for y in [-.075, -.025, .025, .075]]
-            feed(near + far)
-            grid = feed([])
-            assert cost(grid, .65, .025) == 100 and cost(grid, 2.4, .025) == 100
+        # 8 cm slipper 0.40 m ahead of base_link: the lower FOV edge passes above
+        # it, so only its earlier observation holds it. It must survive empty
+        # frames and the recovery's 2 m keep zone, then expire after voxel_decay
+        # (the 2026-10-26 failure: such marks never expired). A far box seen
+        # alongside is cleared by the frustum meanwhile.
+        near = [(x, y, .08) for x in [.375, .425] for y in [-.075, -.025, .025, .075]]
+        far = [(x, y, height) for x in [2.375, 2.425] for y in [-.075, -.025, .025, .075]]
+        grid = feed(bare_floor + near + far)
+        assert cost(grid, .40, .025) == 100 and cost(grid, 2.4, .025) == 100
+        last_seen = time.monotonic()
+        grid = feed(bare_floor, 3.)
+        assert cost(grid, .40, .025) == 100, 'Blind-zone obstacle was forgotten early'
+        assert cost(grid, 2.4, .025) < 100, 'Far obstacle in view was not cleared'
 
-            def call(kind, request):
-                name = f'/clear_{kind}_costmap'  # standalone Costmap2DROS is named 'costmap'
-                client = node.create_client(
-                    ClearCostmapExceptRegion if kind == 'except' else ClearEntireCostmap, name)
-                spin_until(client.service_is_ready)
-                future = client.call_async(request)
-                spin_until(future.done)
-                return feed([])
+        def call(kind, request):
+            name = f'/clear_{kind}_costmap'  # standalone Costmap2DROS is named 'costmap'
+            client = node.create_client(
+                ClearCostmapExceptRegion if kind == 'except' else ClearEntireCostmap, name)
+            spin_until(client.service_is_ready)
+            future = client.call_async(request)
+            spin_until(future.done)
+            return feed(bare_floor, .5)
 
-            grid = call('except', ClearCostmapExceptRegion.Request(reset_distance=2.))
-            assert cost(grid, .65, .025) == 100, 'Blind-zone obstacle was forgotten'
-            assert cost(grid, 2.4, .025) < 100, 'Far obstacle outside the kept square was not cleared'
-            # The stock recovery (clear entirely) is what forgot the 2026-10-25 slipper.
-            grid = call('entirely', ClearEntireCostmap.Request())
-            assert cost(grid, .65, .025) < 100
+        grid = call('except', ClearCostmapExceptRegion.Request(reset_distance=2.))
+        assert cost(grid, .40, .025) == 100, 'Recovery dropped the kept blind-zone obstacle'
+        while cost(grid, .40, .025) == 100:
+            assert time.monotonic()-last_seen < decay+3., 'Blind-zone mark never expired'
+            grid = feed(bare_floor, .3)
+        assert time.monotonic()-last_seen > decay-1.5
+
+        # The stock recovery (clear entirely) still drops everything at once.
+        grid = feed(bare_floor + near)
+        assert cost(grid, .40, .025) == 100
+        grid = call('entirely', ClearEntireCostmap.Request())
+        assert cost(grid, .40, .025) < 100
     finally:
         if process is not None and process.poll() is None:
             for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]:
@@ -206,16 +236,14 @@ def test_depth_only_box_invalidates_straight_path_and_gets_detour(tmp_path):
         node.create_subscription(OccupancyGrid, '/global_costmap/costmap', grids.append, latched)
         tf = StaticTransformBroadcaster(node)
         transforms = []
-        sensor_origin = (.320488, .025, .147017)
-        for child, origin in [('base_footprint', (0., 0., 0.)), ('laser', (0., 0., .195)),
-                              ('depth_test_sensor', sensor_origin)]:
+        for child, origin in [('base_footprint', (0., 0., 0.)), ('laser', (0., 0., .195))]:
             t = TransformStamped()
             t.header.frame_id, t.child_frame_id = 'map', child
             t.header.stamp = node.get_clock().now().to_msg()
             t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = origin
             t.transform.rotation.w = 1.
             transforms.append(t)
-        tf.sendTransform(transforms)
+        tf.sendTransform(transforms + [sensor_transform(node, 'map')])
         grid = OccupancyGrid()
         grid.header.frame_id = 'map'
         grid.header.stamp = node.get_clock().now().to_msg()
@@ -237,16 +265,7 @@ def test_depth_only_box_invalidates_straight_path_and_gets_detour(tmp_path):
             scan.range_min, scan.range_max, scan.scan_time = .05, 8., .1
             scan.ranges = [float('inf')]*360  # The low box is invisible to LiDAR.
             scan_pub.publish(scan)
-            payload = b''.join(struct.pack('<fff', *(v-o for v, o in zip(p, sensor_origin)))
-                               for p in points)
-            cloud = PointCloud2(height=1, width=len(points), point_step=12,
-                                row_step=len(payload), data=payload, is_dense=True,
-                                fields=[PointField(name=name, offset=i*4,
-                                                   datatype=PointField.FLOAT32, count=1)
-                                        for i, name in enumerate(('x', 'y', 'z'))])
-            cloud.header.frame_id = 'depth_test_sensor'
-            cloud.header.stamp = scan.header.stamp
-            cloud_pub.publish(cloud)
+            cloud_pub.publish(sensor_cloud(points, scan.header.stamp))
 
         node.create_timer(.1, publish_inputs)
 

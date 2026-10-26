@@ -122,7 +122,7 @@ def generate_launch_description():
                               description='true: no CAN socket (0x210 preview only, no beacon RX); '
                                           'false: receive beacons and press real buttons.'),
         DeclareLaunchArgument('start_camera', default_value='false', choices=['true', 'false'],
-                              description='mode:=real only: Gemini 2 depth -> global/local costmap VoxelLayers, '
+                              description='mode:=real only: Gemini 2 depth -> global/local costmap STVL layers, '
                                           'JPEG color -> web snapshot, depth watch in time_health.'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
         DeclareLaunchArgument('map', default_value=''),

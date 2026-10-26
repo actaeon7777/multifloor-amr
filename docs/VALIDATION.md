@@ -29,7 +29,7 @@
 | LiDAR 최대 검증 거리 | `30.0 m` | `localization.yaml`, `localization_startup.yaml` |
 | 공용 차량 상태 발행 주기 / 수신 만료 | `10 Hz` / `0.5 s` | `amr_vehicle_status` |
 | 깊이 카메라 깊이 / 컬러 프로파일 | `320×200 10 Hz`(decimation 2 → 점군 160×100) / `640×360 5 fps` | `camera.launch.py` |
-| 깊이 장애물 표시 높이 / 거리, 감시 허용 지연 | `0.05~1.0 m` / `3.0 m`, `1.0 s` | `navigation.yaml` `depth_layer`, `time_health` `depth_max_age` |
+| 깊이 장애물 표시 높이 / 거리, 시야 밖 기억, 감시 허용 지연 | `0.06~1.0 m` / `3.0 m`, `10 s`, `1.0 s` | `navigation.yaml` `depth_layer`, `time_health` `depth_max_age` |
 | 카메라 스냅숏 만료 / 중계 크기 상한 | `3 s` / `300 KiB` | `amr_web_ui/server.py`, `amr_remote_bridge/common.py` |
 
 ## 3. ROS 도메인 배정
@@ -107,7 +107,7 @@ python3 scripts/test_ros_integration.py
 | vehicle_status | `amr_vehicle_status/test/test_node_ros.py` | `AMR_RUN_VEHICLE_STATUS_TESTS` | 195 | 미연동 플래그, 만료, 시계 불연속, 명령 publisher 부재 |
 | navigation_startup | `amr_stack/test/test_navigation_startup_ros.py` | `AMR_RUN_STARTUP_TESTS` | 194 | 초기 위치 검증, 빔 전환, suspend |
 | tim_localization | `amr_stack/test/test_tim_integration_ros.py` | `AMR_RUN_TIM_TESTS` | 196 | TIM → AMCL 합성 센서 연동 |
-| depth_costmap | `amr_stack/test/test_depth_costmap_ros.py` | `AMR_RUN_DEPTH_COSTMAP_TESTS` | 197 | 실제 VoxelLayer: 8·10 cm 박스·바닥 제외·유지·제거. 실제 Smac: 깊이 점군만으로 기존 경로 무효화·우회 경로 생성; `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`도 지정 |
+| depth_costmap | `amr_stack/test/test_depth_costmap_ros.py` | `AMR_RUN_DEPTH_COSTMAP_TESTS` | 197 | 실제 STVL: 10·12 cm 박스·바닥 제외, 시야 안 사라진 박스 ~1.4초 만료·짧은 누락은 유지, 사각대 8 cm 물체는 복구(2 m 보존) 뒤에도 남았다가 10초 뒤 만료, 전체 지우기. 실제 Smac: 깊이 점군만으로 기존 경로 무효화·우회 경로 생성; `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`도 지정 |
 
 러너에 없는 시험:
 

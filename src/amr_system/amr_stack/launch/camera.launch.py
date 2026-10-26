@@ -1,7 +1,7 @@
 """Orbbec Gemini 2 depth camera (ros-jazzy-orbbec-camera); off unless start_camera:=true.
 
-Depth 320x200 at 10 Hz feeds global/local costmap VoxelLayers: marking from
-/camera/depth/points_filtered (depth_persistence_filter), clearing from the raw cloud;
+Depth 320x200 at 10 Hz feeds global/local costmap STVL layers: marking from
+/camera/depth/points_filtered (depth_persistence_filter), frustum clearing from the raw cloud;
 color 640x360 is published JPEG-compressed for the web snapshot card
 (/camera/color/image_raw/compressed, encoded by the driver's image_transport
 plugin). The camera IMU stays off: it is pitched about 1.5 deg off the optical
@@ -32,8 +32,8 @@ DRIVER_ARGUMENTS = {
     'enable_depth': 'true', 'depth_width': '320', 'depth_height': '200', 'depth_fps': '10',
     'enable_ir': 'false',
     'enable_point_cloud': 'true', 'enable_colored_point_cloud': 'false',
-    # Decimate 2x before the cloud (160x100, ~14k points): the costmap VoxelLayer's
-    # raytracing cost scales with the point count (2026-10-24: 36 % of a core at 57k).
+    # Decimate 2x before the cloud (160x100, ~14k points): the costmap depth layers'
+    # cost scales with the point count (VoxelLayer 2026-10-24: 36 % of a core at 57k).
     'enable_decimation_filter': 'true', 'decimation_filter_scale': '2',
     'depth_registration': 'false', 'enable_d2c_viewer': 'false',
     'enable_accel': 'false', 'enable_gyro': 'false',

@@ -89,7 +89,7 @@ floors:
   "5F":
     level: 5
     beacon_floor_code: 5
-    real_enabled: false              # 엘리베이터 실차 시험 전까지 실차 층간 이동 금지
+    real_enabled: true               # 2026-10-27 사용자 요청으로 켬. 5F 실차 층간 이동은 아직 미시험(3F와 같은 홀·카 절차). 호실 좌표는 4F 값이라 문 앞 위치 현장 확인 필요
     # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_5_floor/MAP_SOURCE.md)
     map: maps/G_5_floor/5_floor_1006.yaml
     annotations: maps/G_5_floor/5_floor_tmp_from_4F(영역지정).png

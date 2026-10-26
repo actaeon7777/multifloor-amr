@@ -58,6 +58,7 @@ def startup_unit():
                     tracking_quality_max_range=12., global_localization_backend='tim')
     node.metrics = {}
     node.prior_verified = True
+    node.ride_prior = False
     node.get_logger = lambda: SimpleNamespace(info=Mock(), error=Mock())
     return node, namespace
 

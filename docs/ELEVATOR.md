@@ -15,7 +15,7 @@
 | 안/밖 판별 | 신호 + 위치 추정을 함께 사용 |
 | 버튼 호출 | AMR이 엘리베이터 앞에서 RF로 장치에 버튼 누름 명령 송신 |
 | 통신 경로 | 장치 ↔ **RF** ↔ STM32(RF 모듈) ↔ **CAN** ↔ Jetson. Jetson은 비콘을 직접 제어하지 않는다 |
-| 카 내부 "열림" 버튼 | 카 비콘이 누른다. 한 명령으로 약 1초 간격 최대 15회 반복(`repeat`, RF 1.1). 카 비콘 펌웨어 전에도 동작해야 한다 |
+| 카 내부 "열림" 버튼 | **2026-10-26부터 누르지 않는다**(`use_door_open_button` 기본 `false`). 켜면 카 비콘이 누른다. 한 명령으로 약 1초 간격 최대 15회 반복(`repeat`, RF 1.1). 버튼 없이도 동작해야 한다 |
 | 치수 | 카 내부 1.87 × 2.23 m, 출입구 1.10 m(카 왼쪽 벽에서 0.385 m), 층 벽 ~ 카 안쪽 벽 **0.66 m** ([`images/Elevator_size.jpg`](images/Elevator_size.jpg)) |
 | 문 열림 유지 | 약 6~10초 |
 
@@ -137,21 +137,21 @@ IDLE ─(같은 층)────────────────────
 |---|---|---|---|
 | NAV_TO_HALL | Nav2로 `hall_wait_pose` | Nav2 성공 | `NAV_TO_HALL_FAILED`, 위치 추정 45초 미복구 `LOCALIZATION_LOST` |
 | CALL_ELEVATOR | `HALL_CALL(위/아래)`. 문이 이미 열려 있으면 건너뜀 | 홀 장치 ACK | 3초마다 재송신, 3회 → `NO_HALL_ACK`. 0x311 `DEVICE_REJECTED`·`NO_ROUTE`·`BAD_FRAME` → 즉시 `HALL_REJECTED` |
-| WAIT_DOOR_OPEN | 문 감시. OPEN이면 위치 추정 정지 + 기동 임대 + "열림" 버튼(repeat 6) | 준비 완료 | 120초 → 재호출 1회 → `DOOR_NOT_OPENED`; `PREPARE_FAILED` |
+| WAIT_DOOR_OPEN | 문 감시. OPEN이면 위치 추정 정지 + 기동 임대 (+ 버튼 켰을 때 "열림" repeat 6) | 준비 완료 | 120초 → 재호출 1회 → `DOOR_NOT_OPENED`; `PREPARE_FAILED` |
 | BOARDING | 직선 기동으로 카 중앙까지 | 카 안 판정 + 기동 완료 | 문턱 전 문 닫힘 → BACKING_OUT; 30초 `BOARDING_TIMEOUT` |
 | BACKING_OUT | 홀 대기 위치로 후진 → 재위치 → 재호출 | — | 3회 → `BOARDING_FAILED` |
 | IN_CAR_ALIGN | 카 중앙 정렬 + 문 쪽 180° 회전 | 기동 완료 | 20초 `ALIGN_TIMEOUT` |
 | SELECT_FLOOR | `CAR_FLOOR(목표 층)` | 카 장치 ACK | 3초 × 3회 → `NO_CAR_ACK`. 거절 → 즉시 `CAR_REJECTED` |
-| RIDING | 정지 유지, 문·층 감시. 도착하면 "열림" repeat 10을 **한 번** 보냄 | 목표 층 + 문 OPEN + `BEACON`/`CONFIRMED` | 아래 표 |
+| RIDING | 정지 유지, 문·층 감시. 버튼 켰을 때 도착하면 "열림" repeat 10을 **한 번** 보냄 | 목표 층 + 문 OPEN + `BEACON`/`CONFIRMED` | 아래 표 |
 | SWITCH_MAP | `/map_server/load_map` | 로드 성공 | `MAP_SWITCH_FAILED` (카 안 정지) |
-| ALIGHTING | 직선 기동으로 `hall_exit_pose`. 후단이 문턱 안이고 마지막 열림 ACK 8초 뒤면 repeat 10을 다시 1회(최대 2회) | 기동 완료 + `OUTSIDE` | 문턱 전 문 닫힘 → 열림 repeat 10 + RETURN_TO_CAR(2회 초과 `ALIGHTING_FAILED`); 30초 `ALIGHTING_TIMEOUT` |
-| RETURN_TO_CAR | 카 중앙으로 후진 | 문 OPEN | 15초마다 열림 repeat 10, 초과 시 `DOOR_NOT_REOPENED` |
-| RELOCALIZE | 위치 추정 재개 → 현재 자세로 `/initialpose` | READY | 30초 → TIM 1회 → `RELOCALIZE_FAILED` |
+| ALIGHTING | 직선 기동으로 `hall_exit_pose`. 버튼 켰을 때: 후단이 문턱 안이고 마지막 열림 ACK 8초 뒤면 repeat 10을 다시 1회(최대 2회) | 기동 완료 + `OUTSIDE` | 문턱 전 문 닫힘 → RETURN_TO_CAR(버튼 켰을 때 열림 repeat 10, 2회 초과 `ALIGHTING_FAILED`); 30초 `ALIGHTING_TIMEOUT` |
+| RETURN_TO_CAR | 카 중앙으로 후진 | 문 OPEN | 버튼 꺼짐: 15초 안에 안 열리면 `DOOR_NOT_REOPENED`. 켰을 때: 15초마다 열림 repeat 10, 2회 초과 시 `DOOR_NOT_REOPENED` |
+| RELOCALIZE | 위치 추정 재개 → 현재 자세로 `/initialpose`(분산 0.3 m; 감독기가 정지 후 ±1 m 보정, 일치율 50 % 기준 [위치 추정 §3](LOCALIZATION.md#3-초기-위치-검증과-빔-수-전환)) | READY | 30초 → TIM 1회 → `RELOCALIZE_FAILED` |
 | NAV_TO_GOAL | Nav2로 호실 | 성공 | `NAV_TO_GOAL_FAILED` |
 
 | RIDING 중 상황 | 처리 |
 |---|---|
-| 목표 층에서 문 열림, 비콘 없음(`ASSUMED`) | 하차 금지, "열림" repeat 10 1회, 6초 안에 확인 안 되면 `ARRIVAL_UNCONFIRMED`(카 안 정지) |
+| 목표 층에서 문 열림, 비콘 없음(`ASSUMED`) | 하차 금지(버튼 켰을 때 "열림" repeat 10 1회), 6초 안에 확인 안 되면 `ARRIVAL_UNCONFIRMED`(카 안 정지) |
 | 다른 층에서 문 열림 (다른 승객) | 하차하지 않음. 카가 20초 넘게 멈추면 목표 층 버튼 재송신, 3회 초과 `RIDE_STALLED`. 통과층 정차도 같다 |
 | 180초 안에 도착 못 함 | `RIDE_TIMEOUT` |
 
@@ -163,20 +163,23 @@ IDLE ─(같은 층)────────────────────
 - 실차(`require_estop`)에서 E-stop이 나거나 `/estop/status`가 끊기면 미션을 `ESTOP`으로 중단한다. 해제 뒤에도 이어 가지 않으며
   새 미션은 E-stop 인터록이 READY일 때만 받는다. RF 중계는 E-stop과 독립이라 래치 중에도 버튼 명령이 전달된다.
 - BOARDING·BACKING_OUT·ALIGHTING·RETURN_TO_CAR에서 미션이 끝나면(E-stop·LB·취소·실패) 차체가 문턱에 걸려 있으면
-  "열림" repeat 15(약 15초)를 한 번 보낸다. 그 뒤의 탈출은 운영자가 수동으로 한다.
-- "열림" 버튼 명령의 BUTTON_ACK는 "반복을 시작했다"는 뜻이다. 문 상태는 계속 LiDAR로 판단한다. ACK가 없으면 3초마다 새 번호로 최대 3회
+  버튼을 켰을 때만 "열림" repeat 15(약 15초)를 한 번 보낸다. 그 뒤의 탈출은 운영자가 수동으로 한다.
+- "열림" 버튼은 2026-10-26부터 기본으로 누르지 않는다(`use_door_open_button: false`). 이때 `DOOR_OPEN`은 한 번도 송신되지 않고, 문 열림 유지는 엘리베이터 자체 시간(6~10초)과 후퇴 규칙에만 기댄다.
+- 버튼을 켰을 때 "열림" 버튼 명령의 BUTTON_ACK는 "반복을 시작했다"는 뜻이다. 문 상태는 계속 LiDAR로 판단한다. ACK가 없으면 3초마다 새 번호로 최대 3회
   다시 보내고, 끝내 없으면 `door_open_unacked`만 세고 미션은 계속한다(버튼 없이도 후퇴 규칙으로 동작).
 - `FAILED_SAFE`에서는 정지를 유지하고 운영자 조치(MANUAL 수동 이동 또는 `/floor/set_current`)를 기다린다.
 - 실제 엘리베이터의 문 끼임 방지 센서에 의존하지 않는다.
 
 **문 열림 시간 예산**: 홀 대기 위치 → 문 평면 0.6 m + 문턱 0.66 m + 로봇 후단 0.32 m ≈ 1.58 m. 0.35~0.4 m/s 기동과 문 감지 지연을 더해
-약 4.5~5초로, 최소 6초 안에 들어오지만 여유가 작다. 그래서 "열림" 버튼과 문턱 전 닫힘 시 후퇴 규칙을 함께 둔다.
+약 4.5~5초로, 최소 6초 안에 들어오지만 여유가 작다. 그래서 문턱 전 닫힘 시 후퇴 규칙을 둔다("열림" 버튼은 기본 꺼짐).
 하차는 카 중앙에서 후단이 홀 문 평면을 지나기까지 약 2.1 m, 0.35 m/s로 약 6.5초(시뮬레이션 평균 8.1초)다. 열림 repeat 10은
 첫 누름(명령 후 0.3~1.5초)부터 약 9초 동안 누르고 마지막 누름 뒤 6~10초 문이 열려 있으므로, 명령 뒤 약 14초 안에 끝나는 하차를 덮는다.
-그보다 느리면 ALIGHTING의 재무장이 연장한다.
+그보다 느리면 ALIGHTING의 재무장이 연장한다. 버튼을 끄면(기본) 하차 약 6.5초가 문 열림 유지 6~10초보다 길 수 있어,
+문턱 전에 닫히면 카로 돌아가 다시 열리기를 기다린다(15초, `DOOR_NOT_REOPENED`).
 
 | 파라미터 (`floor_mission_manager`) | 기본값 |
 |---|---|
+| `use_door_open_button` | `false` (2026-10-26. 켜야 아래 반복 값이 쓰인다) |
 | `door_open_repeat_board` / `door_open_repeat_exit` / `door_open_repeat_hold` | 6 / 10 / 15 |
 | `door_open_rearm_s` / `door_open_rearm_max` | 8.0 s / 2 |
 
@@ -190,7 +193,7 @@ IDLE ─(같은 층)────────────────────
 |---|---|
 | `elevators.<id>` | 카 치수, 출입구 폭·위치, 문턱 깊이, 문 열림 시간 |
 | `floors.<층>.level`, `beacon_floor_code` | 층 순서, 비콘 층 코드 |
-| `real_enabled` | 실차 층간 이동 허용. 4F·3F `true`(3F는 2026-10-24 실차 시험 후), 5F `false` |
+| `real_enabled` | 실차 층간 이동 허용. 3F·4F·5F `true`(3F는 2026-10-24 실차 시험 후, 5F는 2026-10-27 사용자 요청으로 실차 층간 이동 시험 전에 켬) |
 | `provisional_copy_of` | 다른 층 지도를 복사한 임시본이면 원본 층. 현재 없음 (3F·5F는 2026-10-23 실측 지도로 교체) |
 | `map`, `annotations`, `sim_map` | 실차 지도, 영역 주석 PNG, 시뮬레이션 지도 (`amr_stack` 패키지 기준 경로) |
 | `sim_layer`, `spawn` | 시뮬레이션 층 USD, 시작 자세 |
@@ -352,7 +355,7 @@ python3 scripts/run_floor_suite.py --output logs/elevator/<새 폴더> [--scenar
 | 문 | 카 문과 홀 문이 함께 열리고 닫힌다 — 가정 |
 | 기동 | 전진 진입 → 카 안 180° 회전 → 전진 하차 (회전 지름 약 0.84 m < 카 폭 1.87 m) |
 | 지도 | 3F·5F 실차 지도는 실측(2026-10-06 SLAM)을 4F 좌표계로 정렬해 넣었다(`scripts/align_floor_map.py`, 엘리베이터 문 위치 차 3F 6.5 cm·5F 4.5 cm). 층 전환이 자세 값을 그대로 쓰므로 모든 층 지도는 같은 좌표계여야 한다. 시뮬레이션 3F·5F 장면·영역지정과 호실 좌표는 아직 4F 복사본 (`maps/G_3_floor/MAP_SOURCE.md`) |
-| 실차 | 3F `real_enabled: true`(2026-10-24 홀 호출~카 안 정렬 실차 2회 통과 후). 카 비콘이 없어 카 안 `SELECT_FLOOR`에서 `NO_CAR_ACK`로 안전 정지하며, LB로 수동 회수한다. 5F `false` |
+| 실차 | 3F `real_enabled: true`(2026-10-24 홀 호출~카 안 정렬 실차 2회 통과 후). 카 비콘이 없어 카 안 `SELECT_FLOOR`에서 `NO_CAR_ACK`로 안전 정지하며, LB로 수동 회수한다. 2026-10-26 3F→4F 탑승·이동·하차·도착까지 실차 통과. 5F `true`(2026-10-27, 미시험) |
 | CAN·RF | 프로토콜 v1.1([RF](ELEVATOR_RF_PROTOCOL.md), [CAN](ELEVATOR_CAN_PROTOCOL.md)). 하위제어기 구현·단독 검증, Jetson 반영. 실차에서 4F 홀 호출 → 실제 버튼 눌림(램프 점등) → ACK 확인(2026-10-24). 현장 채널·RPD 보정, 카 비콘 남음 |
 | 카 "열림" 버튼 | `repeat` 정의(1.1), 카 비콘 펌웨어 미구현. 없어도 후퇴·재호출 규칙으로 동작 |
 | 통과층 | 1·2·6·7F는 지도 없이 비콘만 쓴다. 시뮬레이션 장면에는 없다 |

@@ -1,4 +1,5 @@
 """Opt-in ROS test: floor_mission_manager admission and failure handling with fake peers (no Isaac)."""
+import dataclasses
 import json
 import os
 import time
@@ -117,8 +118,8 @@ def send(ros, floor, room='302'):
     return future.result()
 
 
-def manager(ros, simulation=True, **overrides):
-    node = FloorMissionManager(building=load_floor_config(), parameter_overrides=[
+def manager(ros, simulation=True, building=None, **overrides):
+    node = FloorMissionManager(building=building or load_floor_config(), parameter_overrides=[
         Parameter('simulation', value=simulation), Parameter('ack_timeout', value=.4),
         *[Parameter(k, value=v) for k, v in overrides.items()]])
     ros.executor.add_node(node)
@@ -126,7 +127,11 @@ def manager(ros, simulation=True, **overrides):
 
 
 def test_goal_admission(ros):
-    manager(ros, simulation=False)
+    building = load_floor_config()
+    # Every mapped floor is enabled now; disable one to keep the refusal covered.
+    building = dataclasses.replace(building, floors={
+        **building.floors, '5F': dataclasses.replace(building.floors['5F'], real_enabled=False)})
+    manager(ros, simulation=False, building=building)
     ros.floor_state(confidence='ASSUMED')
     ros.spin(.3)
     assert not send(ros, '4F').accepted          # current floor not confirmed
@@ -172,7 +177,7 @@ def test_acknowledged_call_waits_for_the_door_then_prepares_boarding(ros):
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(3., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
     assert ros.calls['localization/suspend'] == [True] and ros.calls['navigation/maneuver_lease'][0] is True
-    assert any(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands)  # hold the door
+    assert not any(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands)  # button off by default
     cancel = handle.cancel_goal_async()
     assert ros.spin(2., cancel.done)
     result = handle.get_result_async()
@@ -211,8 +216,9 @@ def test_manual_takeover_aborts_boarding_and_blocks_new_missions(ros):
     assert ros.spin(3., lambda: len(ros.navigation_goals) > goals)
 
 
-def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
-    node = manager(ros, require_estop=True)
+@pytest.mark.parametrize('button', [False, True])
+def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros, button):
+    node = manager(ros, require_estop=True, use_door_open_button=button)
     publisher = ros.peer.create_publisher(String, 'estop/status', LATCHED)
     estop = {'state': 'ARMING', 'epoch': 0, 'sequence': 0}
 
@@ -238,12 +244,13 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
                                            ack_sequence=ros.commands[0].sequence))
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(4., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
-    door = [c for c in ros.commands if c.command == ElevatorCommand.CMD_DOOR_OPEN]
-    assert [c.repeat for c in door] == [6]  # One command holds the door while boarding.
-    # Unacknowledged: pressed again with a new sequence and the same repeat count.
-    assert ros.spin(2., lambda: sum(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands) == 2)
-    door = [c for c in ros.commands if c.command == ElevatorCommand.CMD_DOOR_OPEN]
-    assert door[1].repeat == 6 and door[1].sequence != door[0].sequence
+    if button:
+        door = [c for c in ros.commands if c.command == ElevatorCommand.CMD_DOOR_OPEN]
+        assert [c.repeat for c in door] == [6]  # One command holds the door while boarding.
+        # Unacknowledged: pressed again with a new sequence and the same repeat count.
+        assert ros.spin(2., lambda: sum(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands) == 2)
+        door = [c for c in ros.commands if c.command == ElevatorCommand.CMD_DOOR_OPEN]
+        assert door[1].repeat == 6 and door[1].sequence != door[0].sequence
     sent = len(ros.commands)
     estop.update(state='ESTOP', epoch=1)
     result = handle.get_result_async()
@@ -251,9 +258,13 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
     keep_alive.cancel()
     assert result.result().status == GoalStatus.STATUS_ABORTED
     assert result.result().result.error_code == 'ESTOP'
-    # Stopped in the doorway (pose unknown): the car beacon holds the door for ~15 s.
-    assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_DOOR_OPEN and c.repeat == 15
-                                    for c in ros.commands[sent:]))
+    if button:
+        # Stopped in the doorway (pose unknown): the car beacon holds the door for ~15 s.
+        assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_DOOR_OPEN and c.repeat == 15
+                                        for c in ros.commands[sent:]))
+    else:
+        ros.spin(1.)
+        assert not any(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands)
     assert ros.calls['navigation/maneuver_lease'][-1] is False
     assert ros.statuses[-1]['phase'] == 'FAILED_SAFE'
     estop['state'] = 'ARMING'  # Released: the bridge re-arms by itself.
@@ -336,7 +347,7 @@ def test_slow_exit_rearms_the_door_open_repeats(ros):
     from rclpy.task import Future
     from amr_elevator.mission_node import Mission, PendingAck
 
-    node = manager(ros, door_open_rearm_s=1., door_open_rearm_max=1)
+    node = manager(ros, use_door_open_button=True, door_open_rearm_s=1., door_open_rearm_max=1)
     building = load_floor_config()
     geometry = building.elevator_geometry('3F', 'E1')
     # finished keeps the node's own tick away; only the re-arm rule runs here.

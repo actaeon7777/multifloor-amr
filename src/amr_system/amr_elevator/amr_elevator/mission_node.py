@@ -126,10 +126,12 @@ class FloorMissionManager(Node):
         from amr_stack.floor_config import load_floor_config
         p = {k: self.declare_parameter(k, v).value for k, v in {
             'floors_config': '', 'elevator_id': 'E1', 'simulation': False,
-            'use_door_open_button': True, 'ack_timeout': 3., 'ack_attempts': 3,
+            'use_door_open_button': False, 'ack_timeout': 3., 'ack_attempts': 3,
             'door_wait_timeout': 120., 'ride_timeout': 180., 'relocalize_timeout': 30.,
             'boarding_timeout': 30., 'max_boarding_attempts': 3, 'lease_renew_period': 10.,
-            'initial_pose_xy_variance': .0225, 'initial_pose_yaw_variance': .0076,
+            # 0.3 m: the hall pose was 0.37 m off after a ride (2026-10-26); AMCL
+            # must be able to reach the true pose when refinement is skipped.
+            'initial_pose_xy_variance': .09, 'initial_pose_yaw_variance': .0076,
             'maneuver_speed': .35, 'tick_period': .05, 'floor_state_timeout': 3.,
             'localization_recovery_timeout': 45., 'require_estop': False, 'base_frame': 'base_footprint',
             # Door-open presses about 1 s apart, repeated by the car beacon itself.

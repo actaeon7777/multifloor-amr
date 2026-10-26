@@ -51,8 +51,9 @@ def test_floors_without_a_map_are_pass_floors(config):
 
 
 def test_only_the_elevator_tested_floors_are_enabled_on_the_real_vehicle(config):
-    # 3F: hall call to in-car alignment passed on the real vehicle (2026-10-24). 5F is not tested yet.
-    assert {n for n, f in config.floors.items() if f.real_enabled} == {'3F', '4F'}
+    # 3F: hall call to in-car alignment passed on the real vehicle (2026-10-24); 3F->4F ride
+    # 2026-10-26. 5F enabled on request 2026-10-27 before its first real ride.
+    assert {n for n, f in config.floors.items() if f.real_enabled} == {'3F', '4F', '5F'}
     assert all(f.provisional_copy_of is None for f in config.floors.values())
 
 

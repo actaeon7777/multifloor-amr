@@ -75,6 +75,14 @@ def delivery_announcement(goal, before):
     return None
 
 
+# A stop requested while the robot crosses the elevator door, rides, or has not yet
+# relocalised on the new floor would leave it in the doorway or the car; the hold is
+# recorded as pending and engages once the mission is back in a corridor (NAV_TO_GOAL
+# or finished). Hall phases before boarding stop at once.
+HOLD_DEFER_PHASES = frozenset(('BOARDING', 'BACKING_OUT', 'IN_CAR_ALIGN', 'SELECT_FLOOR', 'RIDING',
+                               'SWITCH_MAP', 'ALIGHTING', 'RETURN_TO_CAR', 'RELOCALIZE'))
+
+
 def task_summary(state):
     """One Korean task line, shared by the console and kiosk snapshots."""
     estop = state.get('estop') or {}
@@ -99,6 +107,8 @@ def task_summary(state):
             'RELOCALIZE': '하차', 'NAV_TO_GOAL': '목적지 이동'}
         if phase in labels:
             text += ' · ' + labels[phase]
+        if (state.get('hold') or {}).get('pending'):
+            text += ' · 하차 후 정지 예정'
         return text + (' (취소 중)' if status == 'CANCELING' else '')
     if (room and status in TERMINAL_GOALS and goal.get('origin') != 'return_home'
             and (not state.get('acknowledged_request')
@@ -250,7 +260,7 @@ class SharedState:
         # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
         # Encoded by the camera driver; this process never decodes or re-encodes images.
         self.camera = None
-        self.state = dict(hold=dict(held=False, since=None, reason=''), preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
+        self.state = dict(hold=dict(held=False, since=None, reason='', pending=False), preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
                           action_ready=False, robot=None, amcl=None, scan=None,
                           global_path=None, local_path=None, footprint=None,
                           goal=None, notice=None, velocity=None, tf_error=None, pending_request=None,
@@ -1020,11 +1030,29 @@ class SharedState:
             self.complete(request_id, 'CANCELED', detail)
 
     def set_hold(self, held):
+        """Change the published hold; returns the /operator/hold message or None if unchanged."""
+        self.state['hold']['pending'] = False
         if self.state['hold']['held'] == held:
             return None
-        self.state['hold'] = dict(held=held, since=time.time() if held else None, reason='central')
+        self.state['hold'] = dict(held=held, since=time.time() if held else None, reason='central',
+                                  pending=False)
         self.hold_sequence += 1
         return dict(held=held, reason='central', stamp=time.time(), sequence=self.hold_sequence)
+
+    def hold_deferred(self):
+        goal = self.state.get('goal') or {}
+        phase = (self.state.get('floor_mission') or {}).get('phase')
+        return goal.get('status') in ACTIVE_GOALS and phase in HOLD_DEFER_PHASES
+
+    def next_hold_event(self):
+        """Poll on the executor: engage a pending hold once the elevator segment is over."""
+        with self.lock:
+            if not self.state['hold'].get('pending') or self.hold_deferred():
+                return None
+            goal = self.state.get('goal') or {}
+            if goal.get('status') in ACTIVE_GOALS:
+                self.cancel_goal_ids.add(goal['request_id'])
+            return self.set_hold(True)
 
     def operator_request(self, kind, request_id):
         with self.lock:
@@ -1038,6 +1066,7 @@ class SharedState:
             if kind == 'return_home' and home is None:
                 raise ApiError(404, '복귀 지점이 설정되지 않았습니다.')
             response = dict(request_id=request_id)
+            deferred = False
             if kind in ('stop', 'return_home'):
                 self.cancel_pending_return('새 관리자 명령으로 복귀를 취소했습니다.')
                 # Drop goals not yet sent, including a stop followed quickly by resume.
@@ -1052,16 +1081,23 @@ class SharedState:
                     self.commands.put_nowait(command)
                 goal = self.state.get('goal') or {}
                 canceled = goal.get('request_id') if goal.get('status') in ACTIVE_GOALS else None
-                if canceled:
+                deferred = kind == 'stop' and not self.state['hold']['held'] and self.hold_deferred()
+                if canceled and not deferred:
                     self.cancel_goal_ids.add(canceled)
                 if kind == 'stop':
-                    response['canceled'] = canceled
-            event = self.set_hold(kind == 'stop')
+                    response['canceled'] = None if deferred else canceled
+                    response['pending'] = deferred
+            if kind == 'stop' and deferred:
+                # The ride continues; next_hold_event() engages the hold back in a corridor.
+                self.state['hold'] = dict(held=False, since=time.time(), reason='central', pending=True)
+                event = None
+            else:
+                event = self.set_hold(kind == 'stop')
             if kind == 'return_home':
                 response['home'] = dict(floor=home.floor, room=home.room)
                 self.pending_return = dict(request_id=request_id, home=home, started=time.monotonic())
             else:
-                response['held'] = kind == 'stop'
+                response['held'] = kind == 'stop' and not deferred
             self.requests[request_id] = dict(request_id=request_id, kind=kind, status='QUEUED',
                                              signature=signature, response=response)
             while len(self.requests) > 256:

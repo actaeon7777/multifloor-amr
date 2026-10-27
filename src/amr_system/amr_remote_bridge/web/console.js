@@ -49,7 +49,7 @@ function update(card, robot) {
   const b = s.battery;
   card.values.battery.textContent = b ? (b.valid && typeof b.soc === 'number' ? `${numeric(b.soc, 0)} %` : `${numeric(b.voltage)} V`) + (b.fresh === false ? ' (지연)' : '') : '—';
   card.values.mode.textContent = s.mode || '—';
-  card.values.hold.textContent = !robot.online ? '—' : s.hold?.held ? '정지 중' : '해제됨';
+  card.values.hold.textContent = !robot.online ? '—' : s.hold?.held ? '정지 중' : s.hold?.pending ? '하차 후 정지 예정' : '해제됨';
   card.badges.replaceChildren();
   if (robot.online) {
     if (s.estop?.state === 'ESTOP' || s.estop?.healthy === false || s.estop?.error) {
@@ -61,10 +61,11 @@ function update(card, robot) {
     }
     if (s.mode === 'MANUAL') card.badges.append(element('span', '수동', 'badge'));
     if (s.hold?.held) card.badges.append(element('span', '관리자 정지', 'badge danger'));
+    else if (s.hold?.pending) card.badges.append(element('span', '하차 후 정지 예정', 'badge danger'));
     if (s.localization?.ready !== true) card.badges.append(element('span', '위치 확인 필요', 'badge'));
   }
   for (const [kind, button] of Object.entries(card.buttons)) {
-    button.disabled = !robot.online || busy.has(robot.robot_id) || (kind === 'resume' && s.hold?.held !== true);
+    button.disabled = !robot.online || busy.has(robot.robot_id) || (kind === 'resume' && s.hold?.held !== true && s.hold?.pending !== true);
   }
 }
 // AbortSignal.timeout is missing in older browsers; without it every fetch would throw.

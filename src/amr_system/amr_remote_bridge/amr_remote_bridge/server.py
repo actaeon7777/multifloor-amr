@@ -37,7 +37,7 @@ SUMMARY_SCHEMA = {
     'floor': str, 'zone': (str, int), 'task': str, 'mode': str, 'navigation': str,
     'robot': dict.fromkeys(('x', 'y', 'yaw', 'age'), 'number'),
     'estop': {'state': str, 'healthy': bool, 'detail': str, 'error': str},
-    'hold': {'held': bool, 'since': 'number', 'reason': str},
+    'hold': {'held': bool, 'since': 'number', 'reason': str, 'pending': bool},
     'goal': dict.fromkeys(('request_id', 'kind', 'status', 'floor', 'room', 'origin', 'error_message', 'phase'), str),
     'floor_mission': {'phase': str, 'detail': str},
     'battery': {'soc': 'number', 'voltage': 'number', 'valid': bool, 'fresh': bool, 'charge_state': (int, str)},

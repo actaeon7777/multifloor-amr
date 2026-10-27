@@ -672,6 +672,9 @@ class WebBridge(Node):
                     self.hold_pub.publish(String(data=json.dumps(command['hold'])))
                 if command['kind'] != 'return_home':
                     self.shared.complete(command['request_id'], 'SUCCEEDED')
+            event = self.shared.next_hold_event()
+            if event is not None:
+                self.hold_pub.publish(String(data=json.dumps(event)))
             self.cancel_operator_goal()
             command = self.shared.next_return_command()
             if command:

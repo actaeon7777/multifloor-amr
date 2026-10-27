@@ -359,7 +359,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       setHTML('steps', steps.map((t, i) => `<div class="step ${i+1 < step ? 'done' : i+1 === step ? 'now' : ''}"><span class="n">${i+1 < step ? '✓' : i+1}</span>${esc(t)}</div>`).join(''));
       setText('step-number', `${step} / 6`); setText('phase-title', phaseHeadline(phase));
       setText('phase-detail', step === 3 ? '탑승이 끝날 때까지 출입문 앞을 비워 주세요.' : '통로를 비워 주세요');
-      setText('transit-label', returning ? '관리자 호출로 복귀 중' : '배송지');
+      setText('transit-label', state.hold?.pending ? '하차 후 정지 예정' : returning ? '관리자 호출로 복귀 중' : '배송지');
       setText('transit-destination', destination); setText('lift-floor', floorLabel(cf));
       const elapsed = Math.max(0, Math.floor(Number.isFinite(state.floor_mission?.elapsed) ? state.floor_mission.elapsed : (now()-(started.get(goal.request_id) ?? now()))/1000));
       setText('elapsed', `${Math.floor(elapsed/60)}:${String(elapsed%60).padStart(2,'0')}`);

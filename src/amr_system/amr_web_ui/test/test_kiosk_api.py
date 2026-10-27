@@ -485,7 +485,7 @@ def test_operator_hold_http_idempotency_and_local_persistence(shared, http, prev
             assert request('/api/'+kind, {'request_id': 'central_001'})[0] == 403
             assert request('/api/'+kind, {'request_id': 'bad'}, kiosk=False)[0] == 400
         status, body, _ = request('/api/stop', {'request_id': 'central_stop'}, kiosk=False)
-        assert (status, body) == (202, dict(request_id='central_stop', held=True, canceled='old_goal_001'))
+        assert (status, body) == (202, dict(request_id='central_stop', held=True, canceled='old_goal_001', pending=False))
         held = dict(shared.state['hold'])
         assert held['held'] and held['since'] > 0 and held['reason'] == 'central'
         assert request('/api/stop', {'request_id': 'central_stop'}, kiosk=False)[1] == body
@@ -500,7 +500,7 @@ def test_operator_hold_http_idempotency_and_local_persistence(shared, http, prev
         status, body, _ = request('/api/resume', {'request_id': 'central_resume'}, kiosk=False)
         assert (status, body) == (202, dict(request_id='central_resume', held=False))
         assert request('/api/resume', {'request_id': 'central_resume'}, kiosk=False)[1] == body
-        assert shared.state['hold'] == dict(held=False, since=None, reason='central')
+        assert shared.state['hold'] == dict(held=False, since=None, reason='central', pending=False)
         assert shared.state['goal'] is None and shared.commands.empty()
 
 
@@ -748,3 +748,36 @@ def test_preview_hold_also_blocks_new_goal_without_ros(shared):
         shared.request('goal', pose(shared))
     shared.request('resume', dict(request_id='preview_release'))
     assert shared.request('goal', pose(shared))['status'] == 'PREVIEW'
+
+
+def test_stop_during_elevator_segment_is_deferred_until_the_corridor(shared):
+    from amr_web_ui.server import task_summary
+    shared.state['preview'] = False
+    shared.state['goal'] = dict(request_id='ride_goal_01', kind='floor_goal', status='ACCEPTED',
+                                floor='3F', room='302')
+    shared.state['floor_mission'] = dict(phase='RIDING')
+    response = shared.request('stop', dict(request_id='stop_in_ride'))
+    assert response['pending'] is True and response['canceled'] is None and response['held'] is False
+    assert shared.state['hold']['pending'] and not shared.state['hold']['held']
+    assert 'ride_goal_01' not in shared.cancel_goal_ids
+    assert shared.operator_commands[-1]['hold'] is None  # nothing published yet
+    assert '하차 후 정지 예정' in task_summary(shared.snapshot())
+    assert shared.next_hold_event() is None
+    for phase in ('SWITCH_MAP', 'ALIGHTING', 'RELOCALIZE'):
+        shared.state['floor_mission'] = dict(phase=phase)
+        assert shared.next_hold_event() is None
+    shared.state['floor_mission'] = dict(phase='NAV_TO_GOAL')
+    event = shared.next_hold_event()
+    assert event['held'] is True and shared.state['hold'] == dict(
+        held=True, since=shared.state['hold']['since'], reason='central', pending=False)
+    assert 'ride_goal_01' in shared.cancel_goal_ids
+    assert shared.next_hold_event() is None
+    # Resume while a hold is still pending simply drops it.
+    shared.state['hold'] = dict(held=False, since=1., reason='central', pending=True)
+    shared.request('resume', dict(request_id='resume_pending'))
+    assert shared.state['hold']['pending'] is False and shared.next_hold_event() is None
+    # Hall phases and plain corridor goals stop at once.
+    shared.state['floor_mission'] = dict(phase='WAIT_DOOR_OPEN')
+    response = shared.request('stop', dict(request_id='stop_at_hall'))
+    assert response['pending'] is False and response['canceled'] == 'ride_goal_01'
+    assert shared.state['hold']['held']

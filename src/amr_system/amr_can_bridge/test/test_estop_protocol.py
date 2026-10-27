@@ -5,7 +5,7 @@ import struct
 import pytest
 
 from amr_can_bridge.estop_protocol import (
-    ARMING, DISARMED, ESTOP, READY, SEND_COMMAND, SEND_NOTHING, SEND_ZERO, UNKNOWN,
+    ARMING, ESTOP, READY, SEND_COMMAND, SEND_NOTHING, SEND_ZERO, UNKNOWN,
     EstopSupervisor, InvalidStatus, decode_estop_status,
 )
 
@@ -46,8 +46,7 @@ def test_decode_ignores_other_traffic_and_rejects_malformed_status():
 
 def ready(supervisor, now=0.0):
     supervisor.receive(status(), now)
-    assert supervisor.state == DISARMED
-    assert supervisor.approve(now) == (True, 'approved')
+    assert supervisor.state == ARMING
     assert supervisor.output(now) == SEND_ZERO
     supervisor.zero_sent(now)
     supervisor.receive(status(flags=0x80), now + 0.05)
@@ -55,23 +54,19 @@ def ready(supervisor, now=0.0):
     return now + 0.05
 
 
-def test_boot_requires_status_and_operator_approval():
+def test_boot_waits_for_status_then_arms_by_itself():
     supervisor = EstopSupervisor()
     assert supervisor.state == UNKNOWN
     assert supervisor.output(0.0) == SEND_NOTHING
-    assert supervisor.approve(0.0) == (False, 'state_unknown')
     supervisor.receive(status(), 0.1)
-    assert supervisor.state == DISARMED
-    assert supervisor.output(0.1) == SEND_NOTHING  # A clear STM32 is not a restart.
-    assert supervisor.approve(0.2)[0]
-    assert supervisor.output(0.2) == SEND_ZERO
+    assert supervisor.state == ARMING and supervisor.reason == 'released'
+    assert supervisor.output(0.1) == SEND_ZERO
 
 
 def test_drive_enabled_before_first_zero_does_not_skip_arming():
     supervisor = EstopSupervisor()
     supervisor.receive(status(), 0.0)
-    supervisor.approve(0.0)
-    supervisor.receive(status(flags=0x80), 0.05)  # Stale gate state from before approval.
+    supervisor.receive(status(flags=0x80), 0.05)  # Stale gate state before the first zero.
     assert supervisor.state == ARMING
     supervisor.zero_sent(0.06)
     supervisor.receive(status(flags=0x80), 0.1)
@@ -79,19 +74,18 @@ def test_drive_enabled_before_first_zero_does_not_skip_arming():
     assert supervisor.output(0.1) == SEND_COMMAND
 
 
-def test_press_latches_until_release_and_new_approval():
+def test_press_blocks_until_release_then_rearms():
     supervisor = EstopSupervisor()
     now = ready(supervisor)
     supervisor.receive(status(flags=0x0F, trip=1), now + 0.1)
     assert supervisor.state == ESTOP and supervisor.epoch == 1
-    assert supervisor.approve(now + 0.1) == (False, 'state_estop')
+    assert supervisor.output(now + 0.1) == SEND_NOTHING
     supervisor.receive(status(flags=0x0F, trip=1), now + 0.2)  # Doubled frame while latched.
     supervisor.receive(status(flags=0x0E, trip=1), now + 0.3)  # Release not yet confirmed.
     assert supervisor.state == ESTOP and supervisor.epoch == 1
     supervisor.receive(status(trip=1, release=1), now + 0.6)
-    assert supervisor.state == DISARMED
-    assert supervisor.output(now + 0.6) == SEND_NOTHING
-    assert supervisor.approve(now + 0.6)[0]
+    assert supervisor.state == ARMING and supervisor.epoch == 1
+    assert supervisor.output(now + 0.6) == SEND_ZERO
 
 
 def test_short_press_seen_only_as_trip_count_is_an_estop():
@@ -99,8 +93,9 @@ def test_short_press_seen_only_as_trip_count_is_an_estop():
     now = ready(supervisor)
     supervisor.receive(status(flags=0x80, trip=1, release=1), now + 0.1)
     assert supervisor.epoch == 1
-    assert supervisor.state == DISARMED
-    assert supervisor.output(now + 0.1) == SEND_NOTHING
+    # The open gate is from before the press: zeros must be sent again first.
+    assert supervisor.state == ARMING
+    assert supervisor.output(now + 0.1) == SEND_ZERO
 
 
 def test_status_timeout_and_invalid_frame_trip():
@@ -110,19 +105,9 @@ def test_status_timeout_and_invalid_frame_trip():
     assert supervisor.output(now + 0.5) == SEND_NOTHING
     assert supervisor.state == ESTOP and supervisor.reason == 'status_timeout'
     supervisor.receive(status(flags=0x80), now + 0.6)
-    assert supervisor.state == DISARMED  # Recovered status still needs approval.
+    assert supervisor.state == ARMING  # Recovered status re-arms with zeros first.
     supervisor.receive_invalid('invalid_status')
     assert supervisor.state == ESTOP and supervisor.epoch == 2
-
-
-def test_approval_needs_fresh_clear_status():
-    supervisor = EstopSupervisor(status_timeout=0.5)
-    supervisor.receive(status(), 0.0)
-    assert supervisor.approve(0.6) == (False, 'state_estop')
-    supervisor = EstopSupervisor()
-    supervisor.receive(status(), 0.0)
-    supervisor.status = status(flags=0x08)
-    assert supervisor.approve(0.1) == (False, 'status_not_clear')
 
 
 def test_gate_close_returns_to_arming_without_estop():
@@ -139,7 +124,6 @@ def test_gate_close_returns_to_arming_without_estop():
 def test_counter_reset_flags_reboot_and_wrap_does_not():
     supervisor = EstopSupervisor()
     supervisor.receive(status(sequence=0xfffd), 0.0)
-    supervisor.approve(0.0)
     supervisor.zero_sent(0.0)
     supervisor.receive(status(flags=0x80, sequence=0xfffe), 0.1)
     supervisor.receive(status(flags=0x80, sequence=0xffff), 0.2)
@@ -153,18 +137,17 @@ def test_counter_reset_flags_reboot_and_wrap_does_not():
     assert report['stm32']['sequence'] == 3 and report['status_fresh']
 
 
-def test_fast_reboot_inside_status_timeout_needs_new_approval():
+def test_fast_reboot_inside_status_timeout_is_an_estop():
     # IWDG reset: the stream resumes before the timeout with trip_count still 0.
     supervisor = EstopSupervisor(status_timeout=0.5)
     supervisor.receive(status(sequence=400), 0.0)
-    supervisor.approve(0.0)
     supervisor.zero_sent(0.01)
     supervisor.receive(status(flags=0x80, sequence=401), 0.05)
     assert supervisor.state == READY
     supervisor.receive(status(flags=0x02, sequence=0), 0.4)  # Boot: gate closed.
     assert supervisor.epoch == 1 and supervisor.reason != 'drive_gate_closed'
-    assert supervisor.state == DISARMED
-    assert supervisor.output(0.4) == SEND_NOTHING
+    assert supervisor.state == ARMING
+    assert supervisor.output(0.4) == SEND_ZERO
 
 
 def test_large_forward_sequence_jump_trips():
@@ -173,13 +156,12 @@ def test_large_forward_sequence_jump_trips():
     supervisor.receive(status(flags=0x80, sequence=64), now + 0.1)
     assert supervisor.state == READY
     supervisor.receive(status(flags=0x80, sequence=64 + 65), now + 0.2)
-    assert supervisor.epoch == 1 and supervisor.state == DISARMED
+    assert supervisor.epoch == 1 and supervisor.state == ARMING
 
 
 def test_slow_arming_is_reported_but_not_an_estop():
     supervisor = EstopSupervisor(arming_warn=5.0)
     supervisor.receive(status(), 0.0)
-    supervisor.approve(0.0)
     for tick in range(1, 30):
         supervisor.receive(status(), tick * 0.2)  # ODrives never become ready.
     assert supervisor.state == ARMING and supervisor.arming_slow(5.8)

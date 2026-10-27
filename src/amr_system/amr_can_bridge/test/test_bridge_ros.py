@@ -19,15 +19,14 @@ from ament_index_python.packages import get_package_prefix
 from geometry_msgs.msg import Twist
 from rclpy.parameter import Parameter
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
 
 from amr_can_bridge import cmd_vel_to_can
+from executor_test_helpers import assert_test_domain, run_main_sigterm
 
 
 @pytest.fixture
 def ros_context():
-    assert os.environ.get('ROS_DOMAIN_ID') == '174'
-    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    assert_test_domain('174')
     rclpy.init()
     yield
     rclpy.shutdown()
@@ -168,7 +167,7 @@ def test_send_failure_requires_recovery_stop_and_fresh_zero(ros_context, monkeyp
         bridge.destroy_node()
 
 
-def test_estop_interlock_blocks_until_approval_and_new_commands(ros_context, monkeypatch):
+def test_estop_interlock_blocks_until_release_and_new_commands(ros_context, monkeypatch):
     monkeypatch.setattr(cmd_vel_to_can, 'CanSender', FakeSender)
     bridge = cmd_vel_to_can.CmdVelToCan()
     sender = bridge.sender
@@ -178,9 +177,6 @@ def test_estop_interlock_blocks_until_approval_and_new_commands(ros_context, mon
     moving.linear.x = 0.2
     moving.angular.z = 0.4
     moving_hex = 'cdcc4c3ecdcccc3e'
-
-    def approve():
-        return bridge.approve_resume(Trigger.Request(), Trigger.Response())
 
     def step(*frames, command=None):
         sender.incoming.extend(frames)
@@ -192,31 +188,28 @@ def test_estop_interlock_blocks_until_approval_and_new_commands(ros_context, mon
 
     try:
         assert step(command=stop) == []  # UNKNOWN: no status yet.
-        assert step(status_frame(), command=moving) == []  # DISARMED: clear STM32 is not a restart.
-        assert bridge.state() == 'DISARMED'
-        assert approve().success
-        assert not approve().success  # Already arming.
-        assert step(status_frame(), command=moving) == [bytes(8)]  # ARMING sends zeros only.
+        # A clear STM32 arms by itself; ARMING sends zeros only.
+        assert step(status_frame(), command=moving) == [bytes(8)]
+        assert bridge.state() == 'ARMING'
+        assert step(status_frame(), command=moving) == [bytes(8)]
         assert step(status_frame(flags=0x80), command=moving) == [bytes(8)]
         assert bridge.state() == 'READY'
         assert step(status_frame(flags=0x80), command=moving) == [bytes(8)]  # Needs a fresh zero.
         bridge.on_command(stop)
         assert [p.hex() for p in step(status_frame(flags=0x80), command=moving)] == [moving_hex]
 
-        # Press: nothing is sent, and the release does not restart the robot.
+        # Press: nothing is sent. The release re-arms with zeros by itself.
         assert step(status_frame(flags=0x0F, trip=1), command=moving) == []
         assert bridge.state() == 'ESTOP'
-        assert not approve().success
-        assert step(status_frame(trip=1, release=1), command=moving) == []
-        assert bridge.state() == 'DISARMED'
-        assert approve().success
+        bridge.on_command(stop)
         assert step(status_frame(trip=1, release=1), command=moving) == [bytes(8)]
+        assert bridge.state() == 'ARMING'
         bridge.on_command(stop)
         assert step(status_frame(flags=0x80, trip=1, release=1)) == [bytes(8)]
         assert [p.hex() for p in step(status_frame(flags=0x80, trip=1, release=1),
                                       command=moving)] == [moving_hex]
 
-        # A closed STM32 gate (300 ms gap, fault) re-arms with zeros, without approval,
+        # A closed STM32 gate (300 ms gap, fault) re-arms with zeros the same way,
         # and the held non-zero command is discarded.
         assert step(status_frame(trip=1, release=1), command=moving) == [bytes(8)]
         assert bridge.state() == 'ARMING'
@@ -227,9 +220,13 @@ def test_estop_interlock_blocks_until_approval_and_new_commands(ros_context, mon
         assert [p.hex() for p in step(status_frame(flags=0x80, trip=1, release=1),
                                       command=moving)] == [moving_hex]
 
-        # A short press seen only as a trip_count change still latches.
-        assert step(status_frame(flags=0x80, trip=2, release=2), command=moving) == []
-        assert bridge.state() == 'DISARMED'
+        # A short press seen only as a trip_count change drops the held command
+        # and re-arms; motion needs a fresh zero after READY.
+        assert step(status_frame(flags=0x80, trip=2, release=2), command=moving) == [bytes(8)]
+        assert bridge.state() == 'ARMING' and bridge.estop.epoch == 2
+        assert step(status_frame(flags=0x80, trip=2, release=2), command=moving) == [bytes(8)]
+        assert bridge.state() == 'READY'
+        assert step(status_frame(flags=0x80, trip=2, release=2), command=moving) == [bytes(8)]
 
         # Losing 0x202 is an E-stop; no shutdown zeros while blocked.
         bridge.estop.received_at -= 1.0
@@ -250,6 +247,7 @@ def test_tx_rate_must_keep_the_stm32_gate_open(ros_context, monkeypatch):
 
 @pytest.mark.parametrize('flags', [None, '0x280'])
 def test_startup_interface_failure_exits_cleanly(monkeypatch, tmp_path, capfd, flags):
+    assert_test_domain('174')
     from amr_can_bridge import can_sender
     monkeypatch.setattr(can_sender, 'NET_CLASS_PATH', tmp_path)
     interface = tmp_path / 'can0'
@@ -265,3 +263,13 @@ def test_startup_interface_failure_exits_cleanly(monkeypatch, tmp_path, capfd, f
     assert 'LIVE CAN TX' not in text
     assert 'CAN TX failed' not in text
     assert 'can0' in text
+
+
+def test_main_sigterm_closes_sender_with_shutdown_stops(monkeypatch):
+    assert_test_domain('174')
+    monkeypatch.setattr(cmd_vel_to_can, 'CanSender', FakeSender)
+    node_class = cmd_vel_to_can.CmdVelToCan
+    node = run_main_sigterm(
+        monkeypatch, cmd_vel_to_can, 'CmdVelToCan',
+        lambda: node_class(parameter_overrides=[Parameter('require_estop_status', value=False)]))
+    assert node.sender.closed_with == node.stop_count == 5

@@ -1,0 +1,15 @@
+[Unit]
+Description=AMR web UI (터미널 2)
+
+[Service]
+Type=exec
+WorkingDirectory=%h/amr_ws
+ExecStart=/bin/bash -c 'source %h/amr_ws/scripts/env.sh && exec ros2 launch amr_web_ui web_ui.launch.py use_sim_time:=false host:=127.0.0.1 port:=8080'
+Environment=ROS_DOMAIN_ID=7 PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0
+# Optional AMR_KIOSK_PIN=...; kept out of the repository.
+EnvironmentFile=-%h/.config/amr/kiosk.env
+KillSignal=SIGINT
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=16384:65535

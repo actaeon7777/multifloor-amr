@@ -163,6 +163,8 @@ def main():
         wait(lambda: script("return !document.getElementById('transit-view').hidden && document.getElementById('vehicle-view').hidden"))
         wait(lambda: script("return document.querySelectorAll('#transit-steps .transit-step').length===11 && document.querySelectorAll('#transit-beacons .beacon-card').length>0"))
         assert script("return document.getElementById('transit-route').textContent.includes('없습니다') && document.getElementById('transit-door-state').textContent==='미수신'")
+        # Camera card: no frame in preview, so the image stays hidden and the placeholder shows.
+        assert script("return document.getElementById('transit-camera').hidden && !document.getElementById('transit-camera-empty').hidden && document.getElementById('transit-camera-note').textContent.includes('미리보기')")
         script("document.querySelector('[data-view=vehicle-status]').click()")
         wait(lambda: script("return !document.getElementById('vehicle-view').hidden && document.getElementById('transit-view').hidden"))
         for viewport in [(1440,1080),(1366,900),(900,900),(768,900),(390,844)]:

@@ -8,12 +8,13 @@
   const images = {}, loading = {}, pointers = new Map();
   let state = null, connected = false, connectionIssue = '', mode = 'goal', selected = null, gesture = null;
   let multiTouch = false, pinch = null, follow = false, fitted = false, busy = false;
-  let width = 1, height = 1, lastFrame = 0, lastNotice = '', lastRequest = null, headingOverride = false;
+  let width = 1, height = 1, drawFrame = null, lastNotice = '', lastRequest = null, headingOverride = false;
   let localizationRequest = null;
-  let lastStateAt = 0;
-  // Restart approval is a two-step gesture: arm, then confirm within APPROVE_CONFIRM_MS.
-  const APPROVE_CONFIRM_MS = 3000;
-  let approveArmedUntil = 0;
+  let lastStateAt = 0, pollTimer = null, polling = false;
+  const scanColors = Array.from({length:32}, (_, i) => `hsl(${(1-i/31)*240},78%,48%)`).concat('#009bb9');
+  function requestDraw() {
+    if (drawFrame === null && !document.hidden) drawFrame = requestAnimationFrame(draw);
+  }
   const rfCommandLabels = {RF_TIMEOUT:'버튼 무선 전달 지연 · 재시도', NO_RESULT:'버튼 응답 없음 · 재시도',
     DEVICE_REJECTED:'비콘이 버튼 명령을 거절', NO_ROUTE:'대상 비콘 없음', BAD_FRAME:'버튼 명령 형식 오류'};
   // Multi-floor: floorsInfo from /api/floors; viewFloor is the floor whose map is shown.
@@ -22,14 +23,14 @@
   const missionLabels = window.AMRMissionLabels || {};  // transit.js
   const terminal = new Set(['SUCCEEDED', 'CANCELED', 'FAILED', 'REJECTED']);
   const navigationLabels = {IDLE:'목적지 선택', WAITING_NAV2:'주행 준비 중',
-    RUNNING:'이동 중', STOPPING:'주행 종료 처리 중', MANUAL:'수동 조작 중', OVERRIDDEN:'수동 조작으로 중단됨', ESTOP:'E-stop으로 중단됨',
+    HELD:'관리자 정지', RUNNING:'이동 중', STOPPING:'주행 종료 처리 중', MANUAL:'수동 조작 중', OVERRIDDEN:'수동 조작으로 중단됨', ESTOP:'E-stop으로 중단됨',
     SUCCEEDED:'도착했습니다', CANCELED:'주행 취소됨', FAILED:'이동하지 못했습니다', UNKNOWN:'로봇 연결 대기'};
   const details = {IDLE:'지도에서 이동할 위치를 터치하세요.',
     WAITING_NAV2:'목표까지의 주행을 준비하고 있습니다.', RUNNING:'선택한 목적지로 이동하고 있습니다.',
     STOPPING:'진행 중인 주행을 종료하고 있습니다.',
     MANUAL:'조이스틱 LB로 수동 조작 중입니다. LB를 놓으면 목적지를 지정할 수 있습니다.',
     OVERRIDDEN:'수동 조작(LB)으로 주행을 중단했습니다. 목적지를 다시 지정하세요.',
-    ESTOP:'E-stop으로 주행을 중단했습니다. 재개 승인 후 목적지를 다시 지정하세요.',
+    ESTOP:'E-stop으로 주행을 중단했습니다. 버튼을 원위치로 돌린 뒤 목적지를 다시 지정하세요.',
     SUCCEEDED:'새 목적지를 선택할 수 있습니다.', CANCELED:'새 목적지를 선택할 수 있습니다.',
     FAILED:'위치와 경로를 확인한 후 다시 선택해 주세요.', UNKNOWN:'내비게이션 데이터를 기다리고 있습니다.'};
   const localizationLabels = {WAITING_DATA:'센서 수신 대기', SEARCHING:'자동 위치 찾는 중',
@@ -69,7 +70,7 @@
       !['SENDING','ACCEPTED','CANCELING'].includes(state?.goal?.status) &&
       stateAge(v) < 2 && Math.abs(v.linear) <= .02 && Math.abs(v.angular) <= .03;
   }
-  // The bridge lease (age + time since this poll) must be live; never approve from a stale view.
+  // The bridge lease (age + time since this poll) must be live; never trust a stale view.
   function estopLive() {
     const e = state?.estop;
     return Boolean(e?.fresh && stateAge(e) < (e.timeout ?? .6));
@@ -82,10 +83,6 @@
   function commandError(kind) {
     if (!connected || busy || state?.pending_request) return '이전 요청을 처리 중이거나 연결을 기다리고 있습니다.';
     if (state?.preview || kind === 'cancel') return null;
-    if (kind === 'estop_approve' && state?.remote)
-      return '원격 화면에서는 재개를 승인할 수 없습니다. 로봇 현장(웹 UI 또는 조이스틱)에서 승인하세요.';
-    if (kind === 'estop_approve')
-      return estopLive() && state.estop.approval_required ? null : '지금은 재개를 승인할 수 없습니다. E-stop 상태를 확인하세요.';
     if (kind === 'goal' && estopError()) return estopError();
     if (kind === 'goal' && state?.mode === 'MANUAL')
       return '수동 조작(LB) 중이라 자율주행 명령을 받을 수 없습니다. LB를 놓은 뒤 목적지를 다시 지정하세요.';
@@ -99,7 +96,10 @@
     if (kind === 'initialpose' && viewingOther()) return '초기 위치는 현재 층 지도에서만 지정할 수 있습니다.';
     if (kind === 'goal' && ['SENDING','CANCELING'].includes(state?.goal?.status))
       return '이전 목표 요청을 처리 중입니다. 잠시 기다려 주세요.';
-    if (['initialpose','relocalize'].includes(kind) && !canResetLocation())
+    if (kind === 'set_floor' && ['NAV_TO_HALL','CALL_ELEVATOR','WAIT_DOOR_OPEN','BOARDING','BACKING_OUT','IN_CAR_ALIGN',
+      'SELECT_FLOOR','RIDING','SWITCH_MAP','ALIGHTING','RETURN_TO_CAR','RELOCALIZE','NAV_TO_GOAL'].includes(state?.floor_mission?.phase))
+      return '진행 중인 층간 이동이 있습니다.';
+    if (['initialpose','relocalize','set_floor'].includes(kind) && !canResetLocation())
       return '목표를 취소하고 로봇이 정지한 뒤 위치를 다시 설정해 주세요. 속도 데이터도 수신되어야 합니다.';
     return null;
   }
@@ -115,6 +115,7 @@
     return {x:event.clientX-rect.left, y:event.clientY-rect.top};
   }
   function setMode(value) {
+    requestDraw();
     mode = value; gesture = null;
     document.querySelectorAll('[data-mode]').forEach(e => {
       e.classList.toggle('active', e.dataset.mode === value);
@@ -127,6 +128,7 @@
     updateControls();
   }
   function setSelected(pose) {
+    requestDraw();
     selected = pose;
     $('goal-x').textContent = pose.x.toFixed(2);
     $('goal-y').textContent = pose.y.toFixed(2);
@@ -146,13 +148,14 @@
     $('cancel').disabled = !connected || busy || !goal ||
       !(state.preview ? goal.status === 'PREVIEW' : goal.status === 'ACCEPTED');
     $('heading').disabled = busy;
-    $('estop-approve').disabled = Boolean(commandError('estop_approve'));
     $('relocalize').disabled = Boolean(commandError('relocalize')) || pending ||
       (!state?.preview && (localizationRequest || state?.localization_reset_pending ||
         (state?.localization?.age < 2 && ['SEARCHING','VERIFYING','STARTING_NAVIGATION'].includes(state.localization.state))));
     const last = state?.localization?.last_pose;
     $('last-pose').hidden = !connected || Boolean(state?.preview) || !last || localized() || viewingOther();
     $('last-pose').disabled = Boolean(commandError('initialpose')) || pending || !activeMap().info;
+    $('set-floor').hidden = !connected || Boolean(state?.preview) || !floorsEnabled();
+    $('set-floor').disabled = Boolean(commandError('set_floor')) || pending;
   }
   function updateSidebar() {
     const s = state, goal = s.goal;
@@ -186,6 +189,15 @@
         $('nav-detail').textContent += ` 위치 추적 경고: ${s.localization.tracking_warning}`;
       }
     }
+    if (connected && !s.estop?.error && s.estop?.state !== 'ESTOP' && s.mode !== 'MANUAL') {
+      if (s.hold?.held) {
+        $('nav-status').textContent = '관리자 정지';
+        $('nav-detail').textContent = '중앙 관제에서 해제한 뒤 목적지를 다시 지정하세요.';
+      } else if (goal?.origin === 'return_home' && ['SENDING','ACCEPTED','CANCELING'].includes(goal.status)) {
+        $('nav-status').textContent = '관리자 호출로 복귀 중';
+        $('nav-detail').textContent = `${goal.floor} ${goal.room}호`;
+      }
+    }
     $('nav-status-icon').className = 'nav-status-icon ' +
       (status === 'SUCCEEDED' ? 'success' : ['FAILED','REJECTED'].includes(status) ? 'error' : '');
     const robot = s.robot, poseValid = connected && robot && robot.age < 2 && !s.tf_error && localized();
@@ -212,36 +224,15 @@
     banner.hidden = !visible;
     if (!visible) return;
     const live = estopLive(), lost = ['status_timeout', 'invalid_status'].includes(e.reason);
-    const remote = Boolean(state?.remote);
     const [tone, title, detail] = !live ? ['warn', 'E-stop 상태 수신 없음',
         '로봇의 E-stop 상태를 받지 못했습니다. 상태가 복구될 때까지 주행할 수 없습니다.'] :
       e.state === 'ESTOP' ? ['danger', lost ? 'E-stop 상태 수신 끊김 · 정지' : 'E-stop 눌림',
-        lost ? 'STM32 상태가 끊겨 정지했습니다. CAN 연결을 확인하세요.' : '버튼을 원위치로 돌리면 재개 승인을 할 수 있습니다.'] :
-      e.state === 'DISARMED' ? ['danger', 'E-stop 해제됨 — 주변 확인 후 재개 승인 필요', remote ?
-        '재개 승인은 로봇 현장에서만 할 수 있습니다(로봇 웹 UI 또는 조이스틱 승인 버튼 2초).' :
-        '로봇 주변이 안전한지 확인하고 재개 승인을 두 번 누르세요(또는 LB를 뗀 채 조이스틱 승인 버튼을 2초). ' +
-        '승인 후에도 새 목적지나 조작으로만 움직입니다.'] :
-      e.state === 'ARMING' ? ['info', '주행 준비 중', '재개가 승인되었습니다. STM32 주행 준비를 기다리고 있습니다.'] :
+        lost ? 'STM32 상태가 끊겨 정지했습니다. CAN 연결을 확인하세요.' : '버튼을 원위치로 돌리면 자동으로 주행 준비를 합니다.'] :
+      e.state === 'ARMING' ? ['info', '주행 준비 중', 'E-stop이 해제되었습니다. STM32 주행 준비를 기다리고 있습니다. 새 목적지나 조작으로만 움직입니다.'] :
       ['warn', 'E-stop 상태 확인 중', e.detail || 'STM32 E-stop 상태를 기다리고 있습니다.'];
     banner.className = `estop-banner ${tone}`;
     $('estop-title').textContent = title;
     $('estop-detail').textContent = detail;
-    $('estop-approve').hidden = remote || !(live && ['ESTOP', 'DISARMED'].includes(e.state));
-    const armed = performance.now() < approveArmedUntil && e.state === 'DISARMED';
-    if (!armed) approveArmedUntil = 0;
-    $('estop-approve').textContent = armed ? '다시 눌러 승인' : '재개 승인';
-  }
-  function approveClicked() {
-    const blocked = commandError('estop_approve');
-    if (blocked) { approveArmedUntil = 0; activity(blocked, true); updateEstop(); return; }
-    if (performance.now() < approveArmedUntil) {
-      approveArmedUntil = 0;
-      command('estop_approve');
-    } else {
-      approveArmedUntil = performance.now() + APPROVE_CONFIRM_MS;
-      activity('로봇 주변이 안전한지 확인한 뒤 3초 안에 한 번 더 누르면 재개를 승인합니다.');
-    }
-    updateEstop();
   }
   function updateFloorUi() {
     const current = currentFloor();
@@ -284,9 +275,11 @@
     }));
     const rooms = floorInfo(viewFloor)?.rooms || [];
     select.replaceChildren(new Option('호실 선택', ''), ...rooms.map(r => new Option(`${viewFloor} ${roomLabel(r.id)}`, r.id)));
+    $('set-floor').replaceChildren(new Option('현재 층 변경', ''), ...floors.map(f => new Option(f.name, f.name)));
     if (state) updateFloorUi();
   }
   async function fetchFloors() {
+    if (document.hidden) return;
     try {
       const response = await fetch('/api/floors', {signal:AbortSignal.timeout(4000)});
       if (response.ok) {
@@ -298,6 +291,7 @@
     } catch (_error) { /* floors are optional */ }
   }
   async function fetchFloorLayer(name, info) {
+    if (document.hidden) return;
     if (floorImages[name]?.version === info.version || floorLoading[name]) return;
     floorLoading[name] = true;
     try {
@@ -306,10 +300,12 @@
       const bitmap = await createImageBitmap(await response.blob());
       floorImages[name]?.bitmap.close();
       floorImages[name] = {bitmap, version:Number(response.headers.get('X-Map-Version'))};
+      requestDraw();
     } catch (_error) { /* keep the previous image */ }
     finally { floorLoading[name] = false; }
   }
   async function fetchLayer(name, info) {
+    if (document.hidden) return;
     if (images[name]?.version === info.version || loading[name]) return;
     loading[name] = true;
     try {
@@ -320,12 +316,16 @@
       if (state?.layers[name]?.version !== version) { bitmap.close(); return; }
       images[name]?.bitmap.close();
       images[name] = {bitmap, version};
+      requestDraw();
       if (name === 'map' && !fitted && canvas.clientWidth && canvas.clientHeight) { fit(); fitted = true; }
     } catch (_error) {
       // Retain the prior image; no coordinate commands use an outdated map image.
     } finally { loading[name] = false; }
   }
   async function poll() {
+    if (document.hidden || polling) return;
+    clearTimeout(pollTimer);
+    polling = true;
     try {
       const response = await fetch('/api/state', {signal:AbortSignal.timeout(2500)});
       if (!response.ok) {
@@ -345,7 +345,13 @@
       if (info) $('map-meta').textContent = `${info.width} × ${info.height} · ${info.resolution} m/cell`;
       if (state.scan) {
         const intensities = state.scan.points.map(p=>p[2]).filter(Number.isFinite);
-        state.scan.bounds = intensities.length ? [Math.min(...intensities), Math.max(...intensities)] : null;
+        const bounds = intensities.length ? [Math.min(...intensities), Math.max(...intensities)] : null;
+        state.scan.buckets = Array.from({length:33}, () => []);
+        for (const point of state.scan.points) {
+          const value = bounds && point[2] !== null ? (point[2]-bounds[0])/(bounds[1]-bounds[0] || 1) : null;
+          const bucket = value === null ? 32 : Math.max(0, Math.min(31, Math.round(value*31)));
+          state.scan.buckets[bucket].push(point);
+        }
       }
       const notice = state.notice;
       const key = notice ? JSON.stringify(notice) : '';
@@ -372,7 +378,11 @@
         window.AMRDashboard?.update(null, false, connectionIssue);
       }
       updateControls();
-    } finally { setTimeout(poll, 200); }
+    } finally {
+      polling = false;
+      requestDraw();
+      if (!document.hidden) pollTimer = setTimeout(poll, 200);
+    }
   }
   function requestId() {
     return crypto.randomUUID ? crypto.randomUUID() : `web_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -386,9 +396,9 @@
     const request_id = requestId(); lastRequest = request_id;
     if (!state.preview && ['initialpose','relocalize'].includes(kind)) localizationRequest = request_id;
     busy = true; updateControls();
-    activity(kind === 'estop_approve' ? '재개 승인을 요청하고 있습니다.' :
-      kind === 'cancel' ? '목표 취소를 요청하고 있습니다.' : kind === 'relocalize' ?
-      '자동 위치 찾기를 요청하고 있습니다.' : '선택한 위치를 전송하고 있습니다.');
+    activity(kind === 'cancel' ? '목표 취소를 요청하고 있습니다.' : kind === 'relocalize' ?
+      '자동 위치 찾기를 요청하고 있습니다.' : kind === 'set_floor' ? '현재 층 변경을 요청하고 있습니다.' :
+      '선택한 위치를 전송하고 있습니다.');
     try {
       const response = await fetch(`/api/${kind}`, {method:'POST',
         headers:{'Content-Type':'application/json', 'X-AMR-Request':'1'},
@@ -405,17 +415,18 @@
       activity(result.status === 'PREVIEW' ? '목표 미리보기입니다. 실제 주행 명령은 전송하지 않았습니다.' :
         kind === 'initialpose' ? '초기 위치 전송을 요청했습니다.' :
         kind === 'relocalize' ? '자동 위치 찾기를 요청했습니다. 위치 확인 완료를 기다려 주세요.' :
-        kind === 'estop_approve' ? '재개 승인을 요청했습니다. 로봇 응답을 기다립니다.' :
-        kind === 'cancel' ? '취소 요청을 접수했습니다. 완료 응답을 기다립니다.' : '목표를 전송했습니다. 로봇의 접수 응답을 기다립니다.');
+        kind === 'cancel' ? '취소 요청을 접수했습니다. 완료 응답을 기다립니다.' :
+        kind === 'set_floor' ? '현재 층 변경을 요청했습니다. 층 표시가 바뀌는지 확인하세요.' : '목표를 전송했습니다. 로봇의 접수 응답을 기다립니다.');
       if (kind === 'initialpose' || (kind === 'cancel' && state.preview)) {
         selected=null; $('goal-x').textContent='—'; $('goal-y').textContent='—';
         $('goal-label').textContent='선택 전'; setMode('goal');
       }
     } catch (error) {
       activity(error.name === 'TimeoutError' ? '응답이 지연되고 있습니다. 현재 상태를 확인해 주세요.' : error.message, true);
-    } finally { busy = false; updateControls(); }
+    } finally { busy = false; updateControls(); requestDraw(); }
   }
   function fit() {
+    requestDraw();
     const info = activeMap().info;
     if (!info) return;
     const corners = [[0,0],[info.width,0],[0,info.height],[info.width,info.height]]
@@ -427,6 +438,7 @@
     follow = false; $('follow').classList.remove('active'); $('follow').setAttribute('aria-pressed','false');
   }
   function zoom(factor, anchor={x:width/2,y:height/2}) {
+    requestDraw();
     const before = world(anchor);
     camera.scale = Math.max(2, Math.min(350, camera.scale*factor));
     const after = world(anchor); camera.x += before.x-after.x; camera.y += before.y-after.y;
@@ -469,10 +481,9 @@
     ctx.ellipse(0,0,major*camera.scale,minor*camera.scale,0,0,Math.PI*2);
     ctx.fillStyle='#ffb40040';ctx.fill();ctx.strokeStyle='#ffb40090';ctx.lineWidth=1;ctx.stroke();ctx.restore();
   }
-  function draw(timestamp) {
-    requestAnimationFrame(draw);
-    if (timestamp-lastFrame < 1000/15) return;
-    lastFrame=timestamp;
+  function draw() {
+    drawFrame = null;
+    if (document.hidden) return;
     const ratio=Math.min(devicePixelRatio||1,2), rect=canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     const resized = Math.abs(width-rect.width) > 1;
@@ -500,12 +511,15 @@
       if(layers.global_path)line(state.global_path?.points,'#ff3737',2.3,false,alpha);
       if(layers.local_path)line(state.local_path?.points,'#263cff',2.5,false,alpha);
       if(layers.scan&&connected&&state.scan?.age<1){
-        const bounds=state.scan.bounds;
-        for(const [x,y,intensity] of state.scan.points){const p=screen({x,y});
-          if(p.x<0||p.x>width||p.y<0||p.y>height)continue;
-          const value=bounds&&intensity!==null?(intensity-bounds[0])/(bounds[1]-bounds[0]||1):null;
-          ctx.fillStyle=value===null?'#009bb9':`hsl(${(1-value)*240},78%,48%)`;ctx.fillRect(p.x-1.5,p.y-1.5,3,3);
-        }
+        state.scan.buckets.forEach((points, bucket) => {
+          if (!points.length) return;
+          ctx.fillStyle=scanColors[bucket];ctx.beginPath();
+          for(const [x,y] of points){const p=screen({x,y});
+            if(p.x<0||p.x>width||p.y<0||p.y>height)continue;
+            ctx.rect(p.x-1.5,p.y-1.5,3,3);
+          }
+          ctx.fill();
+        });
       }
       if(layers.footprint)line(state.footprint?.points,'#29dc13',2,true,alpha);
       if(layers.amcl&&state.amcl){ctx.globalAlpha=alpha;uncertainty(state.amcl);arrow(state.amcl,'#ffb400',9);ctx.globalAlpha=1;}
@@ -522,6 +536,7 @@
 
   canvas.addEventListener('pointerdown', event=>{
     if(event.button!==0)return;
+    requestDraw();
     const p=local(event);pointers.set(event.pointerId,p);canvas.setPointerCapture(event.pointerId);
     if(pointers.size>1){multiTouch=true;gesture=null;const [a,b]=[...pointers.values()];
       pinch={distance:Math.hypot(a.x-b.x,a.y-b.y),center:{x:(a.x+b.x)/2,y:(a.y+b.y)/2}};return;}
@@ -537,6 +552,7 @@
   canvas.addEventListener('pointermove',event=>{
     const p=local(event), position=world(p);$('cursor-coordinates').textContent=`X ${position.x.toFixed(2)} · Y ${position.y.toFixed(2)}`;
     if(!pointers.has(event.pointerId))return;pointers.set(event.pointerId,p);
+    requestDraw();
     if(multiTouch&&pointers.size>=2){const [a,b]=[...pointers.values()],center={x:(a.x+b.x)/2,y:(a.y+b.y)/2},distance=Math.hypot(a.x-b.x,a.y-b.y);
       if(pinch?.distance>0){zoom(distance/pinch.distance,pinch.center);camera.x-=(center.x-pinch.center.x)/camera.scale;camera.y+=(center.y-pinch.center.y)/camera.scale;}
       pinch={distance,center};return;}
@@ -546,12 +562,13 @@
     else if(Math.hypot(p.x-gesture.start.x,p.y-gesture.start.y)>8)gesture.pose.yaw=G.heading(gesture.pose,world(p));
   });
   canvas.addEventListener('pointerup',event=>{
+    requestDraw();
     pointers.delete(event.pointerId);stage.classList.remove('dragging');
     if(multiTouch){if(!pointers.size){multiTouch=false;pinch=null;}gesture=null;return;}
     const current=gesture;gesture=null;
     if(current?.kind==='pose'){setSelected(current.pose);command(mode==='initialpose'?'initialpose':'goal',current.pose);}
   });
-  canvas.addEventListener('pointercancel',event=>{pointers.delete(event.pointerId);gesture=null;pinch=null;multiTouch=pointers.size>0;stage.classList.remove('dragging');});
+  canvas.addEventListener('pointercancel',event=>{requestDraw();pointers.delete(event.pointerId);gesture=null;pinch=null;multiTouch=pointers.size>0;stage.classList.remove('dragging');});
   canvas.addEventListener('wheel',event=>{event.preventDefault();zoom(Math.exp(-event.deltaY*.001),local(event));},{passive:false});
   canvas.addEventListener('keydown',event=>{
     if(event.key==='Escape'){gesture=null;setMode('pan');return;}
@@ -561,18 +578,20 @@
       setSelected({...p,x:p.x+dx*.25,y:p.y+dy*.25,map_version:activeMap().info.version,room:undefined});}
   });
   document.querySelectorAll('[data-mode]').forEach(e=>e.addEventListener('click',()=>setMode(e.dataset.mode)));
-  document.querySelectorAll('[data-layer]').forEach(e=>e.addEventListener('change',()=>{layers[e.dataset.layer]=e.checked;}));
-  $('heading').addEventListener('input',()=>{headingOverride=true;if(selected)selected.yaw=Number($('heading').value)*Math.PI/180;});
+  document.querySelectorAll('[data-layer]').forEach(e=>e.addEventListener('change',()=>{layers[e.dataset.layer]=e.checked;requestDraw();}));
+  $('heading').addEventListener('input',()=>{requestDraw();headingOverride=true;if(selected)selected.yaw=Number($('heading').value)*Math.PI/180;});
   $('send').addEventListener('click',()=>{if(selected)command(mode==='initialpose'?'initialpose':'goal',selected);});
   $('cancel').addEventListener('click',()=>command('cancel'));
   $('relocalize').addEventListener('click',()=>command('relocalize'));
+  // Operator override when the floor is wrong (e.g. after a mission ended inside the car).
+  $('set-floor').addEventListener('change',event=>{const floor=event.target.value;event.target.value='';
+    if(floor&&confirm(`현재 층을 ${floor}(으)로 바꿀까요? 실제 층과 다를 때만 바꾸세요.`))command('set_floor',{floor});});
   // Only previews the saved pose; the operator still confirms with '초기 위치 적용'.
   $('last-pose').addEventListener('click',()=>{const last=state?.localization?.last_pose,info=activeMap().info;
     if(!last||!info)return;setMode('initialpose');setSelected({x:last.x,y:last.y,yaw:last.yaw,map_version:info.version});
     activity('마지막으로 확인된 위치를 표시했습니다. 지도에서 로봇 위치와 맞으면 ‘초기 위치 적용’을 누르세요.');});
-  $('estop-approve').addEventListener('click',approveClicked);
   $('fit').addEventListener('click',fit);$('zoom-in').addEventListener('click',()=>zoom(1.3));$('zoom-out').addEventListener('click',()=>zoom(1/1.3));
-  $('follow').addEventListener('click',()=>{follow=!follow;$('follow').classList.toggle('active',follow);$('follow').setAttribute('aria-pressed',String(follow));});
+  $('follow').addEventListener('click',()=>{requestDraw();follow=!follow;$('follow').classList.toggle('active',follow);$('follow').setAttribute('aria-pressed',String(follow));});
   $('select-goal')?.addEventListener('click',()=>{setMode('goal');canvas.focus();});
   $('room-select').addEventListener('change',event=>{
     const room=(floorInfo(viewFloor)?.rooms||[]).find(r=>r.id===event.target.value);event.target.value='';
@@ -580,5 +599,17 @@
     setMode('goal');const pose={x:room.x,y:room.y,yaw:room.yaw,map_version:info.version,floor:viewFloor,room:room.id};
     setSelected(pose);command('goal',pose);
   });
-  requestAnimationFrame(draw);poll();
+  new ResizeObserver(requestDraw).observe(canvas);
+  window.addEventListener('resize', requestDraw);
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(pollTimer);
+    if (document.hidden) {
+      if (drawFrame !== null) cancelAnimationFrame(drawFrame);
+      drawFrame = null;
+    } else {
+      requestDraw();
+      poll();
+    }
+  });
+  requestDraw();poll();
 })();

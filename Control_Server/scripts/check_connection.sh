@@ -14,12 +14,16 @@ fi
 if [[ -n "${1:-}" ]]; then
   tailscale ping --timeout=5s --c=3 "$1"
 fi
-"$project_root/.venv/bin/python" - "$host_ip" "${AMR_PORT:-8081}" <<'PY'
+server_python=python3
+if [[ -x "$project_root/.venv/bin/python" ]]; then
+  server_python="$project_root/.venv/bin/python"
+fi
+"$server_python" - "$host_ip" "${AMR_PORT:-8081}" <<'PY'
 import http.client
 import sys
 connection = http.client.HTTPConnection(sys.argv[1], int(sys.argv[2]), timeout=3)
 try:
-    connection.request('GET', '/fleet')
+    connection.request('GET', '/')
     response = connection.getresponse()
     print(f'Host server HTTP status: {response.status} (401 is expected without credentials)')
     if response.status != 401 or not response.getheader('WWW-Authenticate', '').startswith('Basic '):

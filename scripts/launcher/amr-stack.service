@@ -1,0 +1,16 @@
+[Unit]
+Description=AMR real-vehicle stack (터미널 1)
+# Started only from the "AMR 시작" icon (no [Install]: never on boot).
+
+[Service]
+Type=exec
+WorkingDirectory=%h/amr_ws
+ExecStart=%h/amr_ws/scripts/experiment.sh real start_camera:=true start_elevator_link:=true elevator_link_dry_run:=false
+Environment=PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0
+# Same as Ctrl+C in a terminal: SIGINT to every process, then ros2 launch escalates on its own.
+KillSignal=SIGINT
+TimeoutStopSec=30
+# A crashed stack stays down: an automatic restart while driving is worse than a stop.
+Restart=no
+# Match the login shell; the user manager's default soft limit is 1024.
+LimitNOFILE=16384:65535

@@ -20,7 +20,7 @@ from tf2_ros import Buffer, TransformException, TransformListener
 
 from .model import StatusModel, TIMEOUTS
 
-ESTOP_STATES = {'UNKNOWN','ESTOP','DISARMED','ARMING','READY','BYPASS'}
+ESTOP_STATES = {'UNKNOWN','ESTOP','ARMING','READY','BYPASS'}
 LOCALIZATION_STATES = {'WAITING_DATA','SEARCHING','VERIFYING','WAITING_INITIAL_POSE',
                        'STARTING_NAVIGATION','READY','FAILED','SUSPENDED'}
 
@@ -110,7 +110,6 @@ class VehicleStatusNode(Node):
             stm32 = status.get('stm32') if isinstance(status.get('stm32'),dict) else {}
             trips = stm32.get('trip_count',0)
             self.model.observe('estop',dict(state=status['state'],
-                approval_required=status.get('approval_required') is True,
                 pressed=stm32.get('raw') is True,stopped=stm32.get('stopped') is True,
                 drive_enabled=stm32.get('drive_enabled') is True,
                 trip_count=trips if type(trips) is int and 0 <= trips < 2**32 else 0,
@@ -272,7 +271,6 @@ class VehicleStatusNode(Node):
         msg.estop_status = self.metadata(estop)
         values = estop['values'] if estop['fresh'] else {}
         msg.estop_state = values.get('state','UNKNOWN')
-        msg.estop_approval_required = values.get('approval_required',False)
         msg.estop_button_pressed = values.get('pressed',False)
         msg.estop_stm32_stopped = values.get('stopped',False)
         msg.estop_drive_enabled = values.get('drive_enabled',False)

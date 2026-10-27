@@ -1,22 +1,16 @@
-"""Explicit host configuration with no ROS or system Python dependency."""
+"""Configuration for the dependency-free central console."""
 from dataclasses import dataclass
 import os
 from pathlib import Path
 
 from amr_remote_bridge.common import identifier, positive, read_token
-from amr_remote_bridge.server import find_assets
-
-
-ROOT = Path(__file__).resolve().parents[1]
-# ROS packages are shared with the robot from the monorepo's src/, not copied.
-PACKAGES = ROOT.parent / 'src/amr_system'
 
 
 @dataclass(frozen=True)
 class Settings:
     token_file: Path = Path.home() / '.config/amr_remote_bridge/token'
-    assets_dir: Path = PACKAGES / 'amr_web_ui/web'
-    fleet_dir: Path = PACKAGES / 'amr_remote_bridge/web'
+    slack_env: Path = Path.home() / '.config/amr_remote_bridge/slack.env'
+    slack_rooms: Path = Path.home() / '.config/amr_remote_bridge/slack_rooms.json'
     robot_id: str = 'amr-01'
     stale_after: float = 2
     command_timeout: float = 3
@@ -29,8 +23,8 @@ class Settings:
         defaults = cls()
         return cls(
             token_file=Path(os.environ.get('AMR_TOKEN_FILE', defaults.token_file)).expanduser(),
-            assets_dir=Path(os.environ.get('AMR_ASSETS_DIR', defaults.assets_dir)).expanduser().resolve(),
-            fleet_dir=Path(os.environ.get('AMR_FLEET_DIR', defaults.fleet_dir)).expanduser().resolve(),
+            slack_env=Path(os.environ.get('AMR_SLACK_ENV', defaults.slack_env)).expanduser(),
+            slack_rooms=Path(os.environ.get('AMR_SLACK_ROOMS', defaults.slack_rooms)).expanduser(),
             robot_id=os.environ.get('AMR_ROBOT_ID', defaults.robot_id),
             stale_after=float(os.environ.get('AMR_STALE_AFTER', defaults.stale_after)),
             command_timeout=float(os.environ.get('AMR_COMMAND_TIMEOUT', defaults.command_timeout)),
@@ -45,9 +39,4 @@ class Settings:
             positive(value)
         if type(self.max_robots) is not int or self.max_robots < 1:
             raise ValueError('AMR_MAX_ROBOTS must be a positive integer')
-        find_assets(self.assets_dir)
-        for name in ('fleet.html', 'fleet.js', 'fleet.css'):
-            if not (self.fleet_dir / name).is_file():
-                raise ValueError(f'Missing fleet asset: {name}')
         return read_token(self.token_file)
-

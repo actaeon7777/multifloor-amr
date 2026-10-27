@@ -39,7 +39,7 @@ from rcl_interfaces.msg import ParameterType, ParameterValue
 from rcl_interfaces.srv import GetParameters, SetParametersAtomically
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
-from std_srvs.srv import Empty, Trigger
+from std_srvs.srv import Empty, SetBool, Trigger
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from amr_stack import navigation_startup
@@ -1148,7 +1148,7 @@ def test_manual_refinement_below_threshold_keeps_the_operator_pose(harnesses):
     assert h.supervisor.source == 'manual' and h.supervisor.refinement is None
 
 
-def test_manual_refinement_is_discarded_when_the_robot_moves(harnesses, monkeypatch):
+def test_manual_refinement_is_retried_once_the_robot_is_still(harnesses, monkeypatch):
     h = harnesses(unique_map=True, startup_parameters={'manual_refinement': True})
     seeds = []
     h.probe.create_subscription(PoseWithCovarianceStamped, '/initialpose', seeds.append, 10)
@@ -1162,10 +1162,61 @@ def test_manual_refinement_is_discarded_when_the_robot_moves(harnesses, monkeypa
     monkeypatch.setattr(h.supervisor.map_quality, 'refine_pose', slow)
     h.initial_pub.publish(offset_pose(h.backend.estimated_pose(), .4, -.3, .25))
     h.until(lambda: h.supervisor.refinement is not None and h.supervisor.refinement['future'] is not None)
+    # The elevator mission seeds its hall pose while odometry still settles
+    # (2026-10-26): the search result is dropped, not the refinement itself.
     h.supervisor.record_motion()
-    h.until(lambda: h.supervisor.refinement is None)
-    h.spin(.2)
+    h.until(lambda: h.supervisor.refinement is not None and h.supervisor.refinement['future'] is None)
     assert len(seeds) == 1
+    h.backend.emit_pose = True
+    h.until(lambda: h.supervisor.state == 'READY')
+    assert len(seeds) == 2 and pose_error(seeds[1], h.backend.pose)[0] < .06
+    assert h.statuses[-1]['refinement_accepted'] is True
+    assert h.statuses[-1]['refinement_attempts'] == 2
+
+
+def test_manual_refinement_is_skipped_when_the_robot_never_stops(harnesses):
+    h = harnesses(unique_map=True, startup_parameters={
+        'manual_refinement': True, 'refinement_timeout': .4, 'refinement_attempts': 2})
+    seeds = []
+    h.probe.create_subscription(PoseWithCovarianceStamped, '/initialpose', seeds.append, 10)
+    h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
+    h.initial_pub.publish(offset_pose(h.backend.estimated_pose(), .4, -.3, .25))
+    h.until(lambda: h.supervisor.refinement is not None)
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline and h.supervisor.refinement is not None:
+        h.supervisor.record_motion()
+        h.spin(.05)
+    assert h.supervisor.refinement is None and h.supervisor.source == 'manual'
+    h.spin(.2)
+    assert len(seeds) == 1  # the operator's pose is verified unchanged
+
+
+def test_operator_and_hall_poses_are_admitted_at_the_lower_match_limit(harnesses):
+    h = harnesses(unique_map=True)
+    h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
+    # Carts and boxes absent from the map return a third of the beams early.
+    h.backend.ranges = [r if i % 3 else r/2 for i, r in enumerate(h.backend.ranges)]
+    h.set_initial_pose()
+    h.until(lambda: h.supervisor.state == 'READY')
+    assert .5 < h.supervisor.metrics['match_ratio'] < .7, h.supervisor.metrics
+    assert h.supervisor.source == 'manual' and not h.supervisor.ride_prior
+    # TIM and the automatic search keep the full admission limit.
+    h.supervisor.source = 'auto'
+    assert h.supervisor.admission_min_match() == pytest.approx(.7)
+    h.supervisor.source = 'manual'
+    suspend = h.probe.create_client(SetBool, '/localization/suspend')
+    h.until(suspend.service_is_ready)
+    for value in (True, False):
+        future = suspend.call_async(SetBool.Request(data=value))
+        h.until(future.done)
+        assert future.result().success
+    assert h.supervisor.state == 'WAITING_INITIAL_POSE' and not h.supervisor.ride_prior
+    h.initial_pub.publish(h.backend.estimated_pose())
+    h.until(lambda: h.supervisor.ride_prior)
+    h.until(lambda: h.supervisor.state == 'READY')
+    assert h.statuses[-1]['ride_prior'] is True
+    h.spin(.6)
+    assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
 
 
 def test_ready_stopped_pose_is_saved_per_map_and_offered_in_status(harnesses, tmp_path):

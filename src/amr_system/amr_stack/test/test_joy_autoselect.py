@@ -162,7 +162,7 @@ def test_wait_allows_controller_to_connect_after_startup():
     only = controller(52, 0)
     selected, clock, _, messages = wait_with_frames([(0.0, []), (0.1, [only])])
     assert selected == only
-    assert clock() == pytest.approx(0.1)
+    assert clock() == pytest.approx(0.25)  # First idle poll after attachment.
     assert len(messages) == 1
 
 
@@ -263,7 +263,7 @@ def test_wait_does_not_return_device_unplugged_at_final_check():
         (0.0, [first, second]), (0.3, [first, controller(52, 1, lb=1)]),
     ], hook=unplug)
     assert selected is None
-    assert clock() == 1.0
+    assert clock() == 1.08  # After removal, idle polls at .58, .83, then 1.08.
 
 
 def test_wait_cancellation_during_confirmation_does_not_select():
@@ -309,3 +309,33 @@ def test_duplicate_controllers_pin_the_selected_index():
     device = DeviceState(7, 2, 'Xbox Series X Controller', (0,), (0,))
     assert driver_arguments(original, device, unique=False) == [
         *original, '--ros-args', '-p', 'device_id:=2', '-p', 'device_name:=""']
+
+
+def test_idle_polls_every_quarter_second():
+    clock = FakeClock()
+    reader = FakeReader(clock, [])
+    sleeps = []
+
+    def sleep(duration):
+        sleeps.append(duration)
+        clock.sleep(duration)
+
+    assert wait_for_device(reader, lambda: clock() < 1., lambda _: None,
+                           clock=clock, sleep=sleep) is None
+    assert sleeps == [.25] * 4
+    assert reader.reads == 4
+
+
+def test_duplicate_polling_stays_fast_and_returns_to_idle_after_removal():
+    clock = FakeClock()
+    devices = [controller(41, 0), controller(52, 1)]
+    reader = FakeReader(clock, [(0., devices), (.1, [])])
+    sleeps = []
+
+    def sleep(duration):
+        sleeps.append(duration)
+        clock.sleep(duration)
+
+    assert wait_for_device(reader, lambda: clock() < .6, lambda _: None,
+                           clock=clock, sleep=sleep) is None
+    assert sleeps == [.02] * 5 + [.25] * 2

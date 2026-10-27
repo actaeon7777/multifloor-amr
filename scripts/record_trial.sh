@@ -10,7 +10,7 @@ usage() {
 한국 시간 기준 bags/YYYY-MM-DD/HHMMSS[_실험이름]/ 에 저장합니다.
 실험이름에는 영문, 숫자, 밑줄, 하이픈을 사용할 수 있습니다.
 기록을 종료하려면 Ctrl+C를 누르세요.
-costmap(전체·증분), ROS 로그, 목표 피드백도 함께 기록합니다.
+깊이 점군, costmap(전체·증분), ROS 로그, 목표 피드백도 함께 기록합니다.
 AMR_RECORD_DWB_EVALUATION=1이면 /evaluation을 추가합니다.
 (DWB publish_evaluation은 별도로 활성화해야 합니다.)
 EOF
@@ -109,6 +109,7 @@ topics=(/clock /cmd_vel /cmd_vel_navigation /cmd_vel_auto /wheel/odometry /joint
         /map /local_costmap/costmap /local_costmap/costmap_updates
         /global_costmap/costmap /global_costmap/costmap_updates
         /local_costmap/published_footprint /local_plan /transformed_global_plan
+        /camera/depth/points /camera/color/image_raw/compressed /system/time_health
         /rosout /diagnostics /parameter_events /goal_pose /initialpose
         /control_mux/mode /control_mux/status /navigation/status /localization/status /sim/status
         /navigate_to_pose/_action/status /navigation/navigate_to_pose/_action/status

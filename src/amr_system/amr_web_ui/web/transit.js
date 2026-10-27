@@ -286,6 +286,32 @@
     $('transit-events-empty').hidden = events.length > 0;
   }
 
+  // Camera snapshot: one <img> refreshed at most every 500 ms while this view is
+  // visible and the AMR reports a fresh frame. No timer: leaving the view stops it.
+  let cameraRequestedAt = 0;
+  let cameraLoading = false;
+  function renderCamera(s, online) {
+    const img = $('transit-camera');
+    const camera = online ? s?.camera : null;
+    const fresh = camera && Number(camera.age) < 3;
+    if (!fresh) {
+      img.hidden = true;
+      $('transit-camera-empty').hidden = false;
+      text('transit-camera-note', s?.preview ? '미리보기에서는 영상이 없습니다.' : !online ? '연결 끊김' :
+        camera ? `마지막 영상 ${Number(camera.age).toFixed(1)}초 전 · 수신 중단` : 'bringup에서 start_camera:=true로 켭니다.');
+      return;
+    }
+    text('transit-camera-note', `${camera.width}×${camera.height} · ${Math.round((camera.bytes || 0)/1024)} KB · ${Number(camera.age).toFixed(1)}초 전`);
+    const now = performance.now();
+    if (cameraLoading || now - cameraRequestedAt < 500) return;
+    cameraRequestedAt = now;
+    cameraLoading = true;
+    const next = new Image();
+    next.onload = () => { img.src = next.src; img.hidden = false; $('transit-camera-empty').hidden = true; cameraLoading = false; };
+    next.onerror = () => { cameraLoading = false; };
+    next.src = `/api/camera.jpg?t=${Date.now()}`;
+  }
+
   window.AMRTransit = {
     update(s, online) {
       if ($('transit-view').hidden) return;
@@ -295,6 +321,7 @@
       renderHeader(t, online ? s : null, online);
       renderSteps(t || {}, online ? s : null);
       renderDoor(t);
+      renderCamera(s, online);
       renderEvents(t);
       text('transit-source', s?.preview ? '미리보기 · ROS 미연결' : !online ? '연결 끊김' :
         !t ? '층 설정 없음' : s?.remote ? `중계 ${Number(s.remote.age ?? 0).toFixed(1)}초` : '실시간 ROS');

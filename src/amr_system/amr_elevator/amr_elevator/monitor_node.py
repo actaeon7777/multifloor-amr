@@ -13,6 +13,8 @@ moved with the car: the pose relative to the car is kept on the new floor map.
 import json
 import math
 
+import numpy as np
+
 from amr_elevator_interfaces.msg import (
     ElevatorBeacon, ElevatorCommand, ElevatorDoorState, FloorEvent, FloorState,
 )
@@ -72,6 +74,7 @@ class ElevatorMonitor(Node):
         self.p = p
         self.building = building or load_floor_config(p['floors_config'] or None)
         self.elevator_id = p['elevator_id']
+        self._geometry_cache = {}
         self.machine = FloorStateMachine(self.building, p['initial_floor'] or None)
         self.detector = DoorDetector()
         self.tf = Buffer()
@@ -113,7 +116,10 @@ class ElevatorMonitor(Node):
         return s.floor or s.transit_from or self.machine.building.default_floor
 
     def geometry(self, floor=None):
-        return self.building.elevator_geometry(floor or self.current_floor(), self.elevator_id)
+        key = (floor or self.current_floor(), self.elevator_id)
+        if key not in self._geometry_cache:
+            self._geometry_cache[key] = self.building.elevator_geometry(*key)
+        return self._geometry_cache[key]
 
     def inward_yaw(self, floor=None):
         return self.building.floor(floor or self.current_floor()).elevators[self.elevator_id].car_inward_yaw
@@ -186,7 +192,7 @@ class ElevatorMonitor(Node):
             except TransformException:
                 return
             self.laser_offset = pose_of_transform(transform)
-        ranges = list(message.ranges)
+        ranges = np.asarray(message.ranges, dtype=float)
         self.enclosed = enclosure_ratio(ranges, message.range_min, self.p['enclosure_near']) \
             >= self.p['enclosure_ratio']
         base = self.estimated_pose()
@@ -212,11 +218,12 @@ class ElevatorMonitor(Node):
     def correct_in_car(self, base, message, ranges, geometry):
         """Fit the scan to the car's interior walls and move the anchor accordingly."""
         laser = compose(base, self.laser_offset)
-        points = []
-        for index, value in enumerate(ranges):
-            if math.isfinite(value) and message.range_min <= value <= 4.:
-                angle = laser[2] + message.angle_min + index * message.angle_increment
-                points.append((laser[0] + value * math.cos(angle), laser[1] + value * math.sin(angle)))
+        ranges = np.asarray(ranges, dtype=float)
+        indices = np.flatnonzero(np.isfinite(ranges) & (ranges >= message.range_min) & (ranges <= 4.))
+        values = ranges[indices]
+        angles = laser[2] + message.angle_min + indices * message.angle_increment
+        points = np.column_stack((laser[0] + values * np.cos(angles),
+                                  laser[1] + values * np.sin(angles)))
         fit = fit_car(points, car_wall_segments(geometry), base[:2], max_distance=.3)
         if fit is None or math.hypot(fit.dx, fit.dy) > .35 or abs(fit.dyaw) > .3:
             return base

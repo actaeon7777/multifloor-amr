@@ -25,9 +25,8 @@ def spin_executor():
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Joy
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
 
-from amr_control.approve_gesture import ApproveGesture
+from amr_control.operator_hold import OperatorHold
 from amr_control.control_gate import ControlGate
 from amr_control.time_guard import HealthLease
 
@@ -45,6 +44,11 @@ class ControlMux(Node):
         parameters = {key: self.declare_parameter(key, value).value
                       for key, value in defaults.items()}
         self.gate = ControlGate(**parameters)
+        # Backstop behind navigation_manager/mission_node, which stop themselves on a hold.
+        # No maneuver needs time to finish (the mission abandons at once), so no grace by default.
+        self.operator_hold = OperatorHold(self.declare_parameter('hold_grace', 0.0).value)
+        self.create_subscription(String, '/operator/hold', self.on_operator_hold,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.require_time_health = self.declare_parameter('require_time_health', False).value
         self.time_health = HealthLease()
         self.create_subscription(String, '/system/time_health', self.on_time_health,
@@ -55,17 +59,6 @@ class ControlMux(Node):
         self.estop_blocked = self.require_estop
         self.create_subscription(String, '/estop/status', self.on_estop,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        # Operator at the robot: hold approve_button (LB up, sticks centred) to
-        # approve a restart after an E-stop. -1 disables the joystick approval.
-        approve_button = self.declare_parameter('approve_button', -1).value
-        approve_hold = self.declare_parameter('approve_hold', 2.0).value
-        self.approve_gesture = None
-        if approve_button >= 0:
-            self.approve_gesture = ApproveGesture(
-                approve_button, parameters['deadman_button'], approve_hold,
-                parameters['required_axes'])
-            self.approve_client = self.create_client(Trigger, '/estop/approve_resume')
-            self.approve_future = None
         rate = self.declare_parameter('publish_rate', 20.0).value
         if not isfinite(rate) or rate <= 0:
             raise ValueError('publish_rate must be finite and positive')
@@ -78,6 +71,11 @@ class ControlMux(Node):
             String, '~/mode', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self.last_mode = None
+        # Input callbacks republish only when the output changes; the timer is
+        # the 20 Hz heartbeat downstream watchdogs rely on. Joy, auto, estop
+        # and time_health callbacks each publishing made ~80 Hz of identical
+        # /cmd_vel on the Jetson (2026-10-27).
+        self.last_output = None
         self.joy_subscription = self.create_subscription(
             Joy, '/joy', self.on_joy,
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
@@ -90,7 +88,7 @@ class ControlMux(Node):
         )
         # Timeouts must still run if ROS simulation time stops or jumps.
         self.timer = self.create_timer(
-            1.0 / rate, self.publish_command, clock=Clock(clock_type=ClockType.STEADY_TIME),
+            1.0 / rate, self.publish_heartbeat, clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
         self.get_logger().info(
             'AUTO by default, with or without a joystick. Pressing LB takes over (MANUAL) and '
@@ -101,35 +99,7 @@ class ControlMux(Node):
     def on_joy(self, message):
         now = monotonic()
         self.gate.receive_joy(message.axes, message.buttons, now)
-        if self.approve_gesture is not None and self.approve_gesture.receive_joy(
-                message.axes, message.buttons, now, self.approval_required(now)):
-            self.request_approval()
         self.publish_command()
-
-    def approval_required(self, now):
-        fresh = 0 <= now - self.estop.received < self.estop.timeout
-        return self.require_estop and fresh and self.estop.status.get('approval_required') is True
-
-    def request_approval(self):
-        if self.approve_future is not None and not self.approve_future.done():
-            return
-        if not self.approve_client.service_is_ready():
-            self.get_logger().error('Joystick approval: /estop/approve_resume is not available')
-            return
-        self.get_logger().warning('Joystick approval held; requesting E-stop restart approval')
-        self.approve_future = self.approve_client.call_async(Trigger.Request())
-        self.approve_future.add_done_callback(self.on_approval)
-
-    def on_approval(self, future):
-        try:
-            response = future.result()
-        except Exception as error:  # Service died mid-call.
-            self.get_logger().error(f'Joystick approval failed: {error}')
-            return
-        if response.success:
-            self.get_logger().warning(f'Joystick approval accepted: {response.message}')
-        else:
-            self.get_logger().error(f'Joystick approval rejected: {response.message}')
 
     def on_command(self, message):
         self.gate.receive_command((
@@ -158,23 +128,44 @@ class ControlMux(Node):
         self.estop.receive(message.data)
         self.publish_command()
 
-    def publish_command(self):
+    def on_operator_hold(self, message):
+        self.operator_hold.receive(message.data, monotonic())
+        self.publish_command()
+
+    def publish_heartbeat(self):
+        self.publish_command(force=True)
+
+    def publish_command(self, force=False):
+        """Publish the gate output; without ``force`` only when it changed.
+
+        A change is a new (linear, angular) pair or a new mode: a takeover or
+        an E-stop block republishes its zero at once, identical values wait
+        for the heartbeat.
+        """
         linear, angular = self.gate.output(monotonic())
         if self.require_time_health and self.gate.auto_enabled and not self.time_health.healthy():
             linear = angular = 0.
             self.gate.auto_command = self.gate.auto_time = None
             self.gate.auto_reason = 'time_data_invalid'
+        # Operator hold: only AUTO is gated; LB manual driving remains available.
+        if self.gate.auto_enabled and self.operator_hold.blocking(monotonic()):
+            linear = angular = 0.
+            self.gate.auto_command = self.gate.auto_time = None
+            self.gate.auto_reason = 'operator_hold'
         self.estop_blocked = self.require_estop and not self.estop.healthy()
         if self.estop_blocked:
-            # After an E-stop, motion resumes only from commands sent after approval:
+            # After an E-stop, motion resumes only from commands sent once READY:
             # a stick held through it is not one, so LB must be pressed anew once READY.
             linear = angular = 0.
             self.gate.auto_command = self.gate.auto_time = None
             self.gate.manual.stop('estop_not_ready')
-        message = Twist()
-        message.linear.x = linear
-        message.angular.z = angular
-        self.publisher.publish(message)
+        output = (linear, angular, self.gate.mode)
+        if force or output != self.last_output:
+            self.last_output = output
+            message = Twist()
+            message.linear.x = linear
+            message.angular.z = angular
+            self.publisher.publish(message)
         self.publish_status()
 
     def publish_status(self):

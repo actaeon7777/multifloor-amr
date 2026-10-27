@@ -20,5 +20,6 @@ setup(
     entry_points={'console_scripts': [
         'elevator_monitor = amr_elevator.monitor_node:main',
         'floor_mission_manager = amr_elevator.mission_node:main',
+        'announcement_player = amr_elevator.announcement_player:main',
     ]},
 )

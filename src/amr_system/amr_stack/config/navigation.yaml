@@ -16,7 +16,7 @@ planner_server:
       max_iterations: 1000000
       max_on_approach_iterations: 1000
       max_planning_time: 2.0
-      # Broad inflation + higher traversal cost favor clearance in ~2.8 m corridors.
+      # Higher traversal cost keeps clearance inside the global inflation band.
       cost_travel_multiplier: 4.0
       use_final_approach_orientation: false
       # Strong smoothing removes 8-connected stair steps and medial-axis wiggles
@@ -179,6 +179,7 @@ global_costmap:
       plugins:
       - static_layer
       - obstacle_layer
+      - depth_layer
       - inflation_layer
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -197,9 +198,80 @@ global_costmap:
           raytrace_min_range: 0.1
           raytrace_max_range: 6.0
           max_obstacle_height: 2.0
+      # Depth-only low obstacles must invalidate the global path as well as
+      # constrain local motion. Keep height/clearing rules aligned with local.
+      depth_layer:
+        # STVL instead of VoxelLayer (2026-10-27): VoxelLayer forgot a mark only
+        # when its own rays crossed it, so marks in the blind band (bumper to
+        # 0.70 m ahead, the sides, behind) stayed forever. On 10-26 a false mark
+        # beside the robot after the 4F elevator exit, and a removed object at
+        # 401, kept every trajectory illegal and recovery kept them (2 m keep zone).
+        # Marks now expire voxel_decay s after their last observation, faster
+        # inside the camera frustum when no return re-marks them.
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
+        enabled: true
+        voxel_decay: 10.0
+        decay_model: 0
+        voxel_size: 0.05
+        track_unknown_space: true
+        # Any occupied voxel marks its column: a low box top fills one voxel.
+        mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1
+        origin_z: 0.0
+        publish_voxel_map: false
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
+          topic: /camera/depth/points_filtered
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # 0.06 with the persistence filter (2026-10-25 bags 012806/020944):
+          # single-frame glossy-floor returns at 5-11 cm, 1.5-2.8 m, blocked the
+          # corridor; 3-frame persistence removes them and keeps an 11 cm box
+          # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
+          min_obstacle_height: 0.06
+          max_obstacle_height: 1.0
+          obstacle_range: 3.0
+          inf_is_valid: false
+          voxel_min_points: 0
+          clear_after_reading: true
+        depth_clear:
+          # Frustum model: a voxel inside the measured view that no return
+          # re-marks expires ~1.4 s after its last mark (decay_acceleration 15
+          # against voxel_decay 10). Gemini 2 depth FOV 92.4 x 66.2 deg.
+          # STVL puts min_z/max_z on the corner rays, so on the axis they are
+          # x0.58: near 0.20 m (past the sensor's 0.15 m dead zone), far 3.0 m
+          # (= obstacle_range; a frame cannot re-mark what lies beyond it).
+          topic: /camera/depth/points
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          model_type: 0
+          min_z: 0.35
+          max_z: 5.1
+          horizontal_fov_angle: 1.613
+          vertical_fov_angle: 1.155
+          decay_acceleration: 15.0
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          clear_after_reading: true
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        inflation_radius: 1.6
+        # 1.0 (was 1.6, 2026-10-25 bag 023737): with 1.6 every cell of the 2.7 m
+        # corridor carried wall cost, so Smac followed the free-space medial axis,
+        # bulging into lobbies and swinging back to centre after each obstacle.
+        # Below half the corridor width the centre is cost-free and plans run
+        # straight. Real map + observed obstacles (benchmark_global_planner.py):
+        # turning -20..-36 %, heading reversals 3-6 -> 0-4, min clearance 0.45 m
+        # unchanged on the box routes. Local costmap keeps 1.6.
+        inflation_radius: 1.0
         cost_scaling_factor: 2.0
       always_send_full_costmap: false
       track_unknown_space: true
@@ -224,6 +296,7 @@ local_costmap:
       rolling_window: true
       plugins:
       - obstacle_layer
+      - depth_layer
       - inflation_layer
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
@@ -242,6 +315,75 @@ local_costmap:
           raytrace_min_range: 0.1
           raytrace_max_range: 6.0
           max_obstacle_height: 2.0
+      # Gemini 2 depth cloud (bringup start_camera:=true). The S2 scan plane is
+      # 0.195 m above the floor; this layer adds what it misses: low boxes, table
+      # tops, chair seats, up to the robot top (0.84 m). The lower FOV edge first
+      # meets the floor 0.70 m ahead of base_link (raised surfaces can remain
+      # visible closer); marks there are kept only for voxel_decay (see below).
+      # expected_update_rate 0 keeps the costmap current without the camera
+      # (simulation, start_camera:=false); time_health gates AUTO on a dead camera.
+      depth_layer:
+        # STVL instead of VoxelLayer (2026-10-27): VoxelLayer forgot a mark only
+        # when its own rays crossed it, so marks in the blind band (bumper to
+        # 0.70 m ahead, the sides, behind) stayed forever. On 10-26 a false mark
+        # beside the robot after the 4F elevator exit, and a removed object at
+        # 401, kept every trajectory illegal and recovery kept them (2 m keep zone).
+        # Marks now expire voxel_decay s after their last observation, faster
+        # inside the camera frustum when no return re-marks them.
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
+        enabled: true
+        voxel_decay: 10.0
+        decay_model: 0
+        voxel_size: 0.05
+        track_unknown_space: true
+        # Any occupied voxel marks its column: a low box top fills one voxel.
+        mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1
+        origin_z: 0.0
+        publish_voxel_map: false
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
+          topic: /camera/depth/points_filtered
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # 0.06 with the persistence filter (2026-10-25 bags 012806/020944):
+          # single-frame glossy-floor returns at 5-11 cm, 1.5-2.8 m, blocked the
+          # corridor; 3-frame persistence removes them and keeps an 11 cm box
+          # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
+          min_obstacle_height: 0.06
+          max_obstacle_height: 1.0
+          obstacle_range: 3.0
+          inf_is_valid: false
+          voxel_min_points: 0
+          clear_after_reading: true
+        depth_clear:
+          # Frustum model: a voxel inside the measured view that no return
+          # re-marks expires ~1.4 s after its last mark (decay_acceleration 15
+          # against voxel_decay 10). Gemini 2 depth FOV 92.4 x 66.2 deg.
+          # STVL puts min_z/max_z on the corner rays, so on the axis they are
+          # x0.58: near 0.20 m (past the sensor's 0.15 m dead zone), far 3.0 m
+          # (= obstacle_range; a frame cannot re-mark what lies beyond it).
+          topic: /camera/depth/points
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          model_type: 0
+          min_z: 0.35
+          max_z: 5.1
+          horizontal_fov_angle: 1.613
+          vertical_fov_angle: 1.155
+          decay_acceleration: 15.0
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          clear_after_reading: true
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         inflation_radius: 1.6
@@ -285,7 +427,10 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_footprint
     odom_topic: /odometry/filtered
-    bt_loop_duration: 10
+    # 20 ms (50 Hz) instead of the 10 ms default: the BT only relays the 20 Hz
+    # controller result, and 100 Hz ticks plus 100 Hz feedback were 13 % of a
+    # Jetson core in bt_navigator and half of navigation_manager's (2026-10-27).
+    bt_loop_duration: 20
     default_server_timeout: 100
     wait_for_service_timeout: 1000
     navigators:

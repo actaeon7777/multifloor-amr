@@ -1,0 +1,58 @@
+<!--
+  Nav2 Jazzy nav_to_pose_with_consistent_replanning_and_if_path_becomes_invalid.xml
+  (keep a valid path, check at 2 Hz, refresh after 10 s), with every
+  ClearEntireCostmap replaced by ClearCostmapExceptRegion(reset_distance 2.0).
+
+  Why (2026-10-25 bag 031230_depth_box): stuck in front of a 10 cm slipper,
+  "Failed to make progress" cleared the whole local costmap. The slipper was
+  then inside the depth camera's blind zone (floor < 0.70 m ahead of
+  base_link) and below the LiDAR plane (0.195 m), so nothing re-marked it and
+  the robot drove past with ~0-1 cm side clearance. Clearing everything
+  except a 2 m square around the robot keeps obstacles only the robot can no
+  longer see, while far stale marks are still refreshed. If the robot stays
+  stuck, the recovery round-robin moves on to Spin, Wait and BackUp, after
+  which the camera sees the obstacle again.
+-->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+        <RateController hz="2.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Fallback>
+              <ReactiveSequence>
+                <Inverter>
+                  <PathExpiringTimer seconds="10" path="{path}"/>
+                </Inverter>
+                <Inverter>
+                  <GlobalUpdatedGoal/>
+                </Inverter>
+                <IsPathValid path="{path}"/>
+              </ReactiveSequence>
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            </Fallback>
+            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_except_global_costmap" reset_distance="2.0"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <ClearCostmapExceptRegion name="ClearLocalCostmap-Context" service_name="local_costmap/clear_except_local_costmap" reset_distance="2.0"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearCostmapExceptRegion name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_except_local_costmap" reset_distance="2.0"/>
+            <ClearCostmapExceptRegion name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_except_global_costmap" reset_distance="2.0"/>
+          </Sequence>
+          <Spin spin_dist="1.57"/>
+          <Wait wait_duration="5.0"/>
+          <BackUp backup_dist="0.30" backup_speed="0.15"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

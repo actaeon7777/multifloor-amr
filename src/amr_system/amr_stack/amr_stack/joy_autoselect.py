@@ -170,7 +170,7 @@ def wait_for_device(reader, keep_running, report, clock=time.monotonic, sleep=ti
             for device in reader.snapshot():
                 if device.instance_id == selected:
                     return device if keep_running() else None
-        sleep(.02)
+        sleep(.02 if devices else .25)
     return None
 
 

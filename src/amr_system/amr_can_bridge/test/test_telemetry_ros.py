@@ -16,6 +16,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, JointState
 from amr_can_bridge import can_telemetry
+from executor_test_helpers import assert_test_domain, run_main_sigterm
 
 
 class ReceiveOnlyBus:
@@ -37,8 +38,7 @@ class ReceiveOnlyBus:
 
 
 def test_ros_measurements_and_stale_diagnostics(monkeypatch):
-    assert os.environ['ROS_DOMAIN_ID'] == '184'
-    assert os.environ['ROS_LOCALHOST_ONLY'] == '1'
+    assert_test_domain('184')
     rclpy.init()
     node = can_telemetry.CanTelemetry(bus_factory=ReceiveOnlyBus)
     probe = rclpy.create_node('telemetry_test_probe')
@@ -142,3 +142,19 @@ def test_ros_measurements_and_stale_diagnostics(monkeypatch):
         probe.destroy_node()
         node.destroy_node()
         rclpy.shutdown()
+
+
+def test_main_sigterm_stops_receiver_and_closes_bus(monkeypatch):
+    assert_test_domain('184')
+    buses = []
+
+    def bus_factory(**kwargs):
+        bus = ReceiveOnlyBus(**kwargs)
+        buses.append(bus)
+        return bus
+
+    node_class = can_telemetry.CanTelemetry
+    node = run_main_sigterm(monkeypatch, can_telemetry, 'CanTelemetry',
+                            lambda: node_class(bus_factory=bus_factory))
+    assert buses[0].closed
+    assert node.stop_receiving.is_set() and not node.receiver.is_alive()

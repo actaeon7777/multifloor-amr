@@ -219,6 +219,77 @@ def test_http_touch_goal_manual_takeover_result_cancel_and_initialpose():
         rclpy.shutdown()
 
 
+def test_set_floor_service_success_rejection_unavailable_and_executor_readiness():
+    from types import SimpleNamespace
+    from amr_elevator_interfaces.srv import SetCurrentFloor
+
+    assert os.environ.get('ROS_DOMAIN_ID') == '193'
+    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    rclpy.init()
+    shared = SharedState()
+    bridge = WebBridge(shared)
+    shared.building = SimpleNamespace(floors={'3F': None, '4F': None})
+    source = Node('web_ui_set_floor_test')
+    executor = SingleThreadedExecutor()
+    executor.add_node(bridge)
+    executor.add_node(source)
+    server = create_http_server(shared, '/nonexistent', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    calls = []
+
+    def stationary():
+        shared.state['velocity'] = dict(linear=0., angular=0., received_at=time.monotonic())
+
+    def post(request_id, floor='3F'):
+        stationary()
+        req = Request(f'http://127.0.0.1:{server.server_port}/api/set_floor',
+                      data=json.dumps(dict(request_id=request_id, floor=floor)).encode(),
+                      headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
+        with urlopen(req, timeout=2) as response:
+            assert response.status == 202
+            return json.load(response)
+
+    def until(predicate):
+        deadline = time.monotonic()+8
+        while not predicate():
+            assert time.monotonic() < deadline, shared.requests
+            stationary()
+            executor.spin_once(timeout_sec=.01)
+
+    def set_floor(request, response):
+        calls.append(request.floor)
+        response.success = request.floor == '3F'
+        response.message = 'confirmed' if response.success else 'operator override refused'
+        return response
+
+    try:
+        assert post('floor_unavailable')['status'] == 'QUEUED'
+        until(lambda: shared.requests['floor_unavailable']['status'] == 'FAILED')
+        assert shared.state['notice']['detail'] == '층 관리 노드에 연결되지 않았습니다.'
+        source.create_service(SetCurrentFloor, 'floor/set_current', set_floor)
+        until(lambda: bridge.set_floor_client.service_is_ready())
+        assert post('floor_success_01')['status'] == 'QUEUED'
+        until(lambda: shared.requests['floor_success_01']['status'] == 'SUCCEEDED')
+        assert post('floor_success_01')['status'] == 'SUCCEEDED'
+        assert shared.state['pending_request'] is None and calls == ['3F']
+        post('floor_rejected_01', '4F')
+        until(lambda: shared.requests['floor_rejected_01']['status'] == 'FAILED')
+        assert shared.state['notice']['detail'] == 'operator override refused'
+        post('floor_changed_01')
+        shared.state['navigation'] = 'RUNNING'
+        until(lambda: shared.requests['floor_changed_01']['status'] == 'FAILED')
+        assert calls == ['3F', '4F']  # Admission was repeated on the executor.
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        executor.shutdown()
+        bridge.destroy_node()
+        source.destroy_node()
+        rclpy.shutdown()
+
+
 def test_passive_vehicle_subscriptions_and_restart():
     rclpy.init()
     shared = SharedState()
@@ -343,36 +414,26 @@ def test_vehicle_display_rejects_expired_reordered_and_retired_messages():
 
 
 class FakeEstopBridge(Node):
-    """Stands in for cmd_vel_to_can: /estop/status plus /estop/approve_resume."""
+    """Stands in for cmd_vel_to_can's /estop/status."""
     def __init__(self):
         super().__init__('web_ui_estop_scene')
-        self.state = 'DISARMED'
+        self.state = 'ESTOP'
         self.sequence = 0
-        self.approvals = 0
         self.publisher = self.create_publisher(
             String, '/estop/status', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_service(Trigger, '/estop/approve_resume', self.approve)
         self.timer = self.create_timer(.05, self.publish)
-
-    def approve(self, _request, response):
-        self.approvals += 1
-        response.success = self.state == 'DISARMED'
-        response.message = '재개 승인됨. 시험 응답' if response.success else '승인 거절 시험 응답'
-        if response.success:
-            self.state = 'ARMING'
-        return response
 
     def publish(self):
         self.sequence += 1
         self.publisher.publish(String(data=json.dumps(dict(
             session='fake_estop', sequence=self.sequence, stamp=time.time(), epoch=1, state=self.state,
-            healthy=self.state == 'READY', latched=self.state in ('UNKNOWN', 'ESTOP', 'DISARMED'),
-            approval_required=self.state == 'DISARMED', detail='시험 E-stop', reason='awaiting_approval',
-            rx_error='', stm32=dict(raw=False, stopped=False, drive_enabled=self.state == 'READY',
-                                    trip_count=1, release_count=1)))))
+            healthy=self.state == 'READY', latched=self.state in ('UNKNOWN', 'ESTOP'),
+            detail='시험 E-stop', reason='stm32_stopped', rx_error='',
+            stm32=dict(raw=self.state == 'ESTOP', stopped=self.state == 'ESTOP',
+                       drive_enabled=self.state == 'READY', trip_count=1, release_count=1)))))
 
 
-def test_http_estop_approval_calls_bridge_service_once():
+def test_estop_status_follows_the_bridge_without_approval():
     assert os.environ.get('ROS_DOMAIN_ID') == '193'
     rclpy.init()
     from rclpy.parameter import Parameter
@@ -393,25 +454,14 @@ def test_http_estop_approval_calls_bridge_service_once():
             assert time.monotonic() < end, shared.snapshot()['estop']
             executor.spin_once(timeout_sec=.01)
 
-    def post(request_id):
-        req = Request(root+'/api/estop_approve', data=json.dumps(dict(request_id=request_id)).encode(),
-                      headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
-        return json.load(urlopen(req, timeout=2))
-
     try:
         assert shared.require_estop
-        until(lambda: shared.snapshot()['estop']['approval_required'] and bridge.estop_client.service_is_ready())
+        until(lambda: shared.snapshot()['estop']['state'] == 'ESTOP')
         state = json.load(urlopen(root+'/api/state', timeout=2))['estop']
-        assert state['state'] == 'DISARMED' and '재개를 승인' in state['error']
-        assert post('ros_estop_approve_1')['status'] == 'QUEUED'
-        until(lambda: (shared.state['notice'] or {}).get('request_id') == 'ros_estop_approve_1')
-        assert shared.state['notice']['status'] == 'APPROVED'
-        assert '재개 승인됨' in shared.state['notice']['detail']
+        assert 'E-stop이 눌려' in state['error'] and 'approval_required' not in state
+        fake.state = 'ARMING'  # Released: the bridge re-arms by itself.
         until(lambda: shared.snapshot()['estop']['state'] == 'ARMING')
-        with pytest.raises(HTTPError) as refused:
-            post('ros_estop_approve_2')
-        assert refused.value.code == 409
-        assert fake.approvals == 1
+        assert '주행 준비' in shared.estop_error()
         fake.state = 'READY'
         until(lambda: shared.snapshot()['estop']['healthy'])
         assert shared.estop_error() is None
@@ -425,5 +475,87 @@ def test_http_estop_approval_calls_bridge_service_once():
         server.shutdown(); server.server_close(); thread.join()
         executor.shutdown()
         for node in (bridge, fake):
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_operator_stop_sending_resume_and_return_home_over_http():
+    from types import SimpleNamespace
+    assert os.environ.get('ROS_DOMAIN_ID') == '193'
+    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    rclpy.init()
+    shared = SharedState()
+    bridge, manager, scene = WebBridge(shared), NavigationManager(), Scene()
+    executor = SingleThreadedExecutor()
+    for node in (bridge, manager, scene):
+        executor.add_node(node)
+    server = create_http_server(shared, Path(__file__).resolve().parents[1]/'web', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def until(predicate):
+        end = time.monotonic()+8
+        while not predicate():
+            assert time.monotonic() < end, shared.snapshot()
+            executor.spin_once(timeout_sec=.01)
+
+    def post(kind, request_id, **values):
+        req = Request(f'http://127.0.0.1:{server.server_port}/api/{kind}',
+            data=json.dumps(dict(request_id=request_id, **values)).encode(),
+            headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
+        with urlopen(req, timeout=2) as response:
+            assert response.status == 202
+            return json.load(response)
+
+    try:
+        scene.mode_pub.publish(String(data='AUTO'))
+        until(lambda: shared.readiness_error('goal') is None and 'map' in shared.grids)
+        # A late reader must receive the startup false sample without a new change.
+        holds = []
+        scene.create_subscription(String, '/operator/hold', lambda m: holds.append(json.loads(m.data)),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        until(lambda: holds)
+        assert holds[-1]['held'] is False
+        floor = SimpleNamespace(real_enabled=True, rooms={'401': SimpleNamespace(goal=(2., 3., 0.))})
+        shared.building = SimpleNamespace(home=SimpleNamespace(floor='4F', room='401'),
+            floors={'4F': floor}, floor=lambda _name: floor)
+        shared.state['floor'] = dict(floor='4F', zone=1, confidence='CONFIRMED')
+        pose = dict(x=2., y=3., yaw=0., map_version=shared.grids['map'].version)
+        post('goal', 'hold_sending_goal', **pose)
+        bridge.process_command(shared.commands.get_nowait())
+        assert shared.state['goal']['status'] == 'SENDING'
+        stopped = post('stop', 'operator_stop_001')
+        assert stopped['canceled'] == 'hold_sending_goal'
+        until(lambda: holds[-1]['held'] and shared.state['goal']['status'] in ('FAILED', 'CANCELED', 'REJECTED'))
+        until(lambda: manager.run is None and manager.last_status == 'HELD')
+        with pytest.raises(HTTPError) as error:
+            post('goal', 'hold_refused_goal', **pose)
+        assert error.value.code == 409
+        assert post('stop', 'operator_stop_001') == stopped
+        post('resume', 'operator_resume_001')
+        until(lambda: not holds[-1]['held'] and not manager.held and shared.state['pending_request'] is None)
+        count = len(scene.runs)
+        assert manager.desired is None
+        post('goal', 'before_home_goal', **pose)
+        until(lambda: len(scene.runs) > count and shared.state['goal']['status'] == 'ACCEPTED')
+        reply = post('return_home', 'operator_home_001')
+        assert reply['home'] == dict(floor='4F', room='401')
+        until(lambda: shared.state['goal']['request_id'] == 'operator_home_001'
+              and shared.state['goal']['status'] == 'ACCEPTED')
+        assert shared.state['goal']['origin'] == 'return_home'
+        assert shared.state['goal']['kind'] == 'goal'
+        assert shared.snapshot()['task'] == '복귀 중 (401호)'
+        until(lambda: manager.permitted())
+        scene.succeed()
+        until(lambda: shared.state['goal']['status'] == 'SUCCEEDED')
+        assert shared.snapshot()['task'] == '대기'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        executor.shutdown()
+        scene.action.destroy()
+        manager.server.destroy()
+        for node in (bridge, manager, scene):
             node.destroy_node()
         rclpy.shutdown()

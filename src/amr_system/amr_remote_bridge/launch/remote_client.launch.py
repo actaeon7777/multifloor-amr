@@ -1,4 +1,4 @@
-"""Run the outbound client alongside the existing local AMR web UI."""
+"""Run the outbound protocol-2 summary client alongside the local AMR web UI."""
 from pathlib import Path
 
 from launch import LaunchDescription

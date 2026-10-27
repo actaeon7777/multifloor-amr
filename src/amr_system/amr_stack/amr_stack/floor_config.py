@@ -110,6 +110,12 @@ class ElevatorGeometry:
 
 
 @dataclass(frozen=True)
+class Home:
+    floor: str
+    room: str
+
+
+@dataclass(frozen=True)
 class BuildingConfig:
     schema_version: int
     building: str
@@ -120,6 +126,8 @@ class BuildingConfig:
     source: Optional[Path] = None
     package_root: Path = _PACKAGE_ROOT
     pass_floors: Mapping[str, PassFloor] = field(default_factory=dict)
+
+    home: Optional[Home] = None
 
     def floor(self, name: str) -> Floor:
         try:
@@ -245,8 +253,14 @@ def parse_floor_config(raw, source: Optional[Path] = None,
         car_speed_m_s=_positive(sim.get('car_speed_m_s', 1.0), 'sim.car_speed_m_s'),
         car_accel_m_s2=_positive(sim.get('car_accel_m_s2', 0.5), 'sim.car_accel_m_s2'),
     )
+    home = None
+    if 'home' in data:
+        entry = _mapping(data['home'], f'{where}.home')
+        home = Home(str(entry.get('floor', '')), str(entry.get('room', '')))
+        if home.floor not in floors or home.room not in floors[home.floor].rooms:
+            raise FloorConfigError(f'{where}: home must reference an existing floor and room')
     return BuildingConfig(SCHEMA_VERSION, str(data.get('building', '')), default_floor,
-                          elevators, floors, settings, source, Path(package_root), pass_floors)
+                          elevators, floors, settings, source, Path(package_root), pass_floors, home)
 
 
 def _elevator_spec(name, data) -> ElevatorSpec:

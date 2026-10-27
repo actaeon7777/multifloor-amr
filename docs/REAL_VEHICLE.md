@@ -13,6 +13,9 @@ Nav2 → navigation_manager → /cmd_vel_auto ──────┘   (바퀴 �
 
 CAN 피드백 → can_telemetry → /wheel/odometry, /joint_states, /imu/data_raw → EKF → odom → base_footprint
 S2 LiDAR → /scan_raw → scan_body_filter → /scan → AMCL → map → odom
+Gemini 2 (start_camera:=true) → /camera/depth/points → depth_persistence_filter(같은 odom 5 cm 칸에 3프레임 연속일 때만 장애물 점 통과) → /camera/depth/points_filtered → 전역·지역 costmap depth_layer(STVL) 표시(지우기는 원본 점군의 시야 frustum, 시야 밖 표시는 10초 뒤 만료), time_health depth 감시(필터 출력)
+                              (Nav2 복구는 behavior_trees/navigate_to_pose_keep_nearby.xml: 로봇 주변 2 m 정사각형은 지우지 않음 — 카메라 사각지대 낮은 물체 보존, 보존된 깊이 표시도 10초 뒤 만료)
+                              → /camera/color/image_raw/compressed → web_ui /api/camera.jpg → 중앙 관제 중계
 ```
 
 | 패키지 | 실차에서의 역할 |
@@ -20,7 +23,8 @@ S2 LiDAR → /scan_raw → scan_body_filter → /scan → AMCL → map → odom
 | `amr_stack` | bringup·localization·navigation·experiment launch와 설정 YAML, 지도 |
 | `amr_control` | `control_mux`(수동/자율 선택, 바퀴 속도 제한), `time_health` |
 | `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(수신), `elevator_can_link`(층간 이동용, 기본 꺼짐) |
-| `amr_description` | v80 URDF, 실물 `laser`·`imu_link` 프레임 |
+| `amr_description` | v80 URDF, 실물 `laser`·`imu_link`·`camera_link` 프레임 |
+| `orbbec_camera` (apt) | Gemini 2 드라이버(OrbbecSDK_ROS2 v2.10.6 .deb). `camera.launch.py`가 감싸며 기본 꺼짐 |
 | `teleop_tools` | F1TENTH 소스에서 복사한 `joy_teleop` (출처 `src/amr_system/teleop_tools/AMR_SOURCE.md`) |
 
 설정 파일은 모두 `src/amr_system/amr_stack/config/`에 있다. 설정 변경은 해당 launch 재시작 후 적용된다.
@@ -43,6 +47,12 @@ MAKEFLAGS=-j2 CMAKE_BUILD_PARALLEL_LEVEL=2 colcon build --base-paths src --symli
 `source scripts/env.sh`가 Jazzy와 AMR 패키지를 불러오고 `ROS_DOMAIN_ID`를 기본 7로 둔다(이미 지정한 값은 유지).
 Jetson에는 이를 실행하는 `amr` 별칭과 `ros2 launch amr_stack bringup.launch.py`를 실행하는 `stack` 별칭이 설정되어 있다.
 같은 ROS 도메인에서 다른 주행 노드를 함께 실행하지 않는다.
+
+깊이 카메라(`start_camera:=true`)에는 OrbbecSDK_ROS2 v2.10.6 릴리스의 `orbbec-ros2-debs-jazzy-arm64.zip`에 든
+`ros-jazzy-orbbec-camera-msgs`·`ros-jazzy-orbbec-camera`와 `ros-jazzy-image-transport-plugins`(JPEG 발행)가 필요하다. ROS apt 저장소에는 없으므로
+zip을 받아 `dpkg-deb -I`·`-c`로 확인한 뒤 `sudo apt-get install ./ros-jazzy-orbbec-camera-msgs_*.deb ./ros-jazzy-orbbec-camera_*.deb ros-jazzy-image-transport-plugins`로
+설치한다(2026-10-24 설치: 유지보수 스크립트 없음, 파일은 모두 `/opt/ros/jazzy/`와 udev 규칙 `/etc/udev/rules.d/99-obsensor-libusb.rules`뿐, 기존 SDK 규칙과 동일).
+제거는 `sudo apt-get remove ros-jazzy-orbbec-camera ros-jazzy-orbbec-camera-msgs`. `/opt/OrbbecSDK`(C++ SDK, 실측 도구용)는 별개다.
 
 CAN 송신에는 `sudo apt-get install python3-can`이 필요하다. `can0`는 [`deploy/jetson/can0.service`](../deploy/jetson/can0.service)
 (`/etc/systemd/system/`에 설치)가 부팅 시 500 kbit/s 일반 CAN으로 설정한다.
@@ -162,35 +172,30 @@ YAML 없이 노드를 단독 실행하면 코드 기본 상한 0.20 m/s, 0.40 ra
 ### E-stop 연동 (`0x202`)
 
 STM32는 하드웨어 E-stop을 `0x202` 상태 프레임으로 알리고, 버튼이 원위치로 돌아오면 스스로 정지를 해제한다.
-**재가동 승인은 Jetson 책임**이라 `cmd_vel_to_can`이 아래 상태 머신으로 `0x201` 송신을 막는다. 프로토콜 전체는 [ESTOP_CAN_PROTOCOL.md](ESTOP_CAN_PROTOCOL.md)에 있다.
+`cmd_vel_to_can`이 아래 상태 머신으로 `0x201` 송신을 막고, 해제되면 운영자 승인 없이 스스로 재무장한다. 프로토콜 전체는 [ESTOP_CAN_PROTOCOL.md](ESTOP_CAN_PROTOCOL.md)에 있다.
 
 | 상태 | 뜻 | `0x201` 송신 |
 |---|---|---|
 | `UNKNOWN` | 부팅 후 `0x202`를 아직 받지 못함 | 보내지 않음 |
 | `ESTOP` | 버튼 눌림·단선, `trip_count` 증가, `0x202` 0.5초 미수신, 잘못된 상태 프레임 | 보내지 않음 |
-| `DISARMED` | STM32는 해제됐지만 운영자 승인 전 | 보내지 않음 |
-| `ARMING` | 승인 후 STM32 주행 gate가 열리기를 기다림 | `(0, 0)`만 |
-| `READY` | `drive_enabled=1` | `/cmd_vel` (승인 뒤 새로 받은 0 명령 이후부터) |
+| `ARMING` | STM32가 해제를 알린 뒤 주행 gate가 열리기를 기다림 | `(0, 0)`만 |
+| `READY` | `drive_enabled=1` | `/cmd_vel` (재무장 뒤 새로 받은 0 명령 이후부터) |
 | `BYPASS` | `can_dry_run:=true` 또는 `require_estop_status: false` | 기존 동작 |
 
-- **매 부팅과 매 E-stop 뒤에 재개 승인이 필요하다.** `DISARMED`에서만 받아들이며, 로봇 현장에서 아래 셋 중 하나로 한다.
-  - 로봇 웹 UI의 **재개 승인**을 3초 안에 두 번 누른다(첫 누름은 확인 요청). 원격 중계·Control_Server 화면에는 버튼이 없다.
-  - 조이스틱: LB를 뗀 채 스틱을 중앙에 두고 승인 버튼(`control_mux.yaml`의 `approve_button`, 기본 11 = Menu ≡)을 2초 누른다.
-    누른 채로 E-stop을 지났거나 도중에 LB·스틱을 움직이면 떼었다가 다시 눌러야 한다. 버튼 번호는 실제 패드에서 `ros2 topic echo /joy`로 확인한다.
-  - 아래 서비스.
+- **재개 승인 절차는 없다.** 부팅 뒤 첫 `0x202`가 정상이거나 E-stop이 해제되면 곧바로 `ARMING`으로 가서 `(0, 0)`을 보낸다.
 
   ```bash
-  ROS_DOMAIN_ID=7 ros2 service call /estop/approve_resume std_srvs/srv/Trigger '{}'
   ROS_DOMAIN_ID=7 ros2 topic echo /estop/status --once   # state, stm32.trip_count 등 JSON
   ```
 
-- 승인은 주행을 다시 시작하지 않는다. E-stop이 나면 `navigation_manager`가 목표를 끝내고(층간 미션은 `ESTOP`으로 중단),
-  `control_mux`가 캐시된 AUTO 명령을 버리고 수동 gate를 닫는다. 승인 뒤에는 새 목표나 **LB를 새로 누른** 조이스틱 입력으로만 움직인다.
-- `0x202`의 `sequence`가 뒤로 가거나 64 넘게 건너뛰면(STM32 재부팅, 상태 유실) E-stop과 같이 처리한다. IWDG 리셋이 0.5초 안에 끝나도 승인을 다시 받는다.
-- 승인 뒤 5초 넘게 `ARMING`이면 상태 안내가 "STM32 주행 준비가 늦어짐"으로 바뀐다. ODrive 연결·오류를 확인한다.
-- `READY`에서 STM32 gate가 닫히면(명령 공백 300 ms, ODrive fault, bus-off) E-stop이 아니므로 승인 없이 `ARMING`으로 돌아가 `(0, 0)`부터 다시 보낸다.
-- E-stop 상태(`ESTOP`·`DISARMED`·`UNKNOWN`)에서는 종료 시 정지 프레임도 보내지 않는다. 0 명령이 STM32 gate를 열기 때문이다.
-- `0x202`를 보내지 않는 구 펌웨어에서는 `can_bridge.yaml`의 `require_estop_status: false`로 기존 동작을 쓴다. 이때는 E-stop 뒤 재가동을 브리지가 막지 못한다.
+- 해제가 곧 출발은 아니다. E-stop이 나면 `navigation_manager`가 목표를 끝내고(층간 미션은 `ESTOP`으로 중단),
+  `control_mux`가 캐시된 AUTO 명령을 버리고 수동 gate를 닫는다. 브리지도 재무장할 때 받아 둔 명령을 버린다.
+  `READY` 뒤에는 새 목표나 **LB를 새로 누른** 조이스틱 입력으로만 움직인다.
+- `0x202`의 `sequence`가 뒤로 가거나 64 넘게 건너뛰면(STM32 재부팅, 상태 유실) E-stop과 같이 처리한다(목표 중단 후 재무장).
+- 5초 넘게 `ARMING`이면 상태 안내가 "STM32 주행 준비가 늦어짐"으로 바뀐다. ODrive 연결·오류를 확인한다.
+- `READY`에서 STM32 gate가 닫히면(명령 공백 300 ms, ODrive fault, bus-off) E-stop이 아니므로 목표는 유지한 채 `ARMING`으로 돌아가 `(0, 0)`부터 다시 보낸다.
+- `ESTOP`·`UNKNOWN`에서는 종료 시 정지 프레임도 보내지 않는다. 0 명령이 STM32 gate를 열기 때문이다.
+- `0x202`를 보내지 않는 구 펌웨어에서는 `can_bridge.yaml`의 `require_estop_status: false`로 기존 동작을 쓴다. 이때는 E-stop 상태를 브리지가 보지 못한다.
 - 상태 프레임은 `candump can0,202:7FF`로 관찰한다. 래치 중 IMU(`0x301`/`0x302`)는 끊기고, 해제 뒤 `seq`가 건너뛰는 것은 정상이다(진단 `imu_seq_gaps`).
   EKF는 yaw rate를 IMU에서만 받으므로, 회전 중 E-stop이면 래치 동안 odom yaw가 흐를 수 있다(실측 전). 해제 뒤 IMU가 돌아와도
   `time_health`가 1초 동안 회복을 기다려 그사이 목표가 거절될 수 있다.
@@ -241,6 +246,8 @@ base_footprint
     ├── lidar_mount_link           z = -0.029 m
     │   └── lidar_link             z = 0.137605 m
     │       └── laser              yaw = pi
+    ├── camera_link                xyz = (0.320488, 0.025, 0.061017) m, pitch = -11.25°(광축 11.25° 위; CAD 12°)  (2026-10-25 ROS 점군 바닥 실측 11.2–11.4°·0.146 m, 10-24 SDK 실측 11.84°)
+    │   └── camera_depth_frame → camera_depth_optical_frame, camera_color_frame …   (드라이버 static TF, start_camera:=true일 때)
     └── 바퀴·캐스터 링크            v28 관절 구조 유지(v80 윤거 0.529 m)
 ```
 
@@ -324,6 +331,7 @@ base_footprint
 | DWB critic | `BaseObstacle 0.12`, `PathAlign 32`(전방 0.50 m), `GoalAlign 8`, `PathDist 32`, `GoalDist 32`, `PreferForward`(미세 명령 비용 0.5) |
 | costmap | 전역 `map` 0.05 m 2 Hz, 반경 0.44 m / 지역 `odom` 6×6 m 10 Hz, 0.656×0.574 m 직사각형 + padding 0.02 m |
 | 장애물 | `/scan` 반영 5 m, ray tracing 6 m, inflation 1.60 m·감소 계수 2.0, LiDAR 0.5초 지연 시 오래된 것으로 처리 |
+| 깊이 장애물 (전역·지역) | 두 costmap의 `depth_layer`(STVL `spatio_temporal_voxel_layer`): 표시는 `/camera/depth/points_filtered` 높이 0.06~1.0 m·3 m, 복셀 0.05 m·`mark_threshold 0`. 지움은 원본 점군의 시야 frustum(축 방향 0.2~3.0 m, 92.4°×66.2°) 안에서 다시 보이지 않으면 약 1.4초, 시야 밖(사각대·옆·뒤)은 마지막 관측 10초 뒤 만료(`voxel_decay`). 전역 경로 무효화·우회 계획과 지역 충돌 검사에 함께 사용. `expected_update_rate 0`이라 카메라가 없어도 costmap은 유효(감시는 `time_health`). inflation·footprint는 유지 |
 | 전역 계획 | Smac 2D, 미확인 공간 통과 안 함, smoother(`w_smooth 0.95`, `w_data 0.02`), 2 Hz 유효성 확인·10초 만료 재계획 |
 | 도착 | 위치 0.15 m·방향 0.15 rad + `StoppedGoalChecker` |
 | 복구 | costmap 갱신, 90° 회전(0.40 rad/s), 5초 대기, 0.30 m 후진(0.05 m/s), 6회 소진 시 실패 |
@@ -360,10 +368,49 @@ base_footprint
 - `can_telemetry` 30~40 %: 5 ms 타이머로 초당 200번 실행기를 깨워 CAN 소켓을 비웠다(프레임은 초당 약 60개). 이제 수신 스레드가
   커널 `recv`에서 블록하다가 프레임이 올 때만 깨고, 실행기는 1 Hz 진단 타이머만 돌린다. 메시지 내용·타임스탬프는 그대로다.
 
+## 9b. 깊이 카메라 (Gemini 2, 2026-10-24)
+
+- 장치에서 읽은 intrinsic: 깊이 FOV 92.4°×66.2°(상하 각 33.1°)는 1280×800·640×400·320×200 모두 같다(비닝). 컬러 85.9°×55.2°(640×480만 63.6°×49.9° 크롭).
+  렌즈 높이 0.147 m·12° 위 장착이라 깊이 하단 광선은 렌즈 앞 0.38 m(base_link 앞 0.70 m)에서 바닥에 닿고, 2 m 앞에서 바닥~1.83 m, 3 m 앞에서 ~2.84 m가 보인다.
+  차체 앞면(0.33 m)~0.70 m 바닥은 LiDAR도 카메라도 못 보는 사각이라 `depth_layer` 표시가 코스트맵에 남아 메운다. 2026-10-27부터 이 기억은 마지막 관측 뒤 10초까지다(아래 STVL 항목).
+- `camera.launch.py` 설정: 깊이 320×200·10 Hz를 드라이버 decimation 2배로 줄여 점군 160×100(약 14k점·230 KB/프레임), 컬러 640×360·5 fps 요청(실측 2.7 Hz, JPEG 약 68 KB),
+  IR·IMU·D2C·컬러 점군 끔. 클라우드 시각 지연 0.3~0.45초.
+- CPU 실측(2026-10-24, 실차 스택 정지 상태·`can_dry_run`, 코어 1개 기준): 드라이버 컨테이너 12~14 %. 지역 costmap을 같은 설정으로 따로 띄워 비교하면 scan만 6.4 %,
+  scan+depth_layer 19.8~20.3 %(decimation 전 57k점에서는 42.9 %, 그래서 decimation을 켰다). `time_health`는 depth 감시로 13.6 → 16.8~17.8 %. 그 밖의 노드는 변화 없음, 부하 평균 2.5~3.2.
+  depth_layer만 켠 costmap에는 카메라 시야 방향(전방 92°)에만 표시가 생기고 LiDAR 벽 점과 정렬됐다(`diagnostics/depth_costmap_probe/`). 주행 중·낮은 장애물 시험은 아직이다.
+- 드라이버는 벤더 launch의 컴포넌트 컨테이너가 아니라 **단독 노드**(`orbbec_camera_node`, `/camera/camera`)로 띄운다. 실차 스택 전체가 한꺼번에 뜰 때 컨테이너의
+  `load_node` 요청이 유실돼 컨테이너만 비어 있는 채로 launch가 영원히 기다렸고(2026-10-25, `/camera/camera` 없음·`time_health` `depth: missing or stale`),
+  단독 노드로는 재현되지 않았다. 인자 이름·기본값은 벤더 `gemini2.launch.py`에서 그대로 읽어 온다.
+- 2026-10-25 낮은 박스 누락 수정: `depth_layer.mark_threshold`를 1 → 0으로 변경했다. Nav2는 같은 XY 칸에서 점유된 높이 복셀 수가
+  이 값보다 **커야** 장애물로 표시한다. 높이 해상도 10 cm에서 기존 값 1은 8~10 cm 박스나 윗면만 보이는 물체를 누락시킬 수 있었다.
+  바닥 제외용 `min_obstacle_height=0.05`는 유지한다. 격리 Nav2 시험에서 8·10 cm 윗면 감지, 바닥 제외, 빈 점군에서 표시 유지,
+  실제 지움 광선에 의한 제거를 확인했다. 이는 합성 점군 검증이며, 실제 카메라의 최초 감지 거리·최종 정지 간격은 재측정이 필요하다.
+  inflation은 선호 비용이며 차체 앞 일정 거리에서 정지를 보장하는 별도 조건은 아니다.
+- 같은 날 후속 실차 시험에서 양옆 공간이 충분한 10 cm 박스 약 20 cm 앞 정지가 보고됐다. 로그에는 경로 교체와 `No valid trajectories`가 반복됐고,
+  전역 costmap에는 depth가 빠져 있었다. 전역에도 같은 VoxelLayer 설정을 추가해 박스가 기존 경로를 무효화하고 우회 계획에 반영되도록 했다.
+  실제 Smac planner 격리 시험에서 깊이 점군만 추가해 기존 직선 경로 무효화·유효한 우회 경로 생성을 확인했다. 실제 카메라 감지거리·우회 주행·정지거리와
+  추가 전역 레이어의 CPU 부하는 현장에서 확인해야 한다. `record_trial.sh`는 이제 깊이 점군도 함께 기록한다.
+- 2026-10-27 깊이 층을 VoxelLayer → STVL(`ros-jazzy-spatio-temporal-voxel-layer` 2.5.5)로 교체했다. 10-26 실차 엘리베이터 시험(3F→4F 405, 401)에서
+  하차 뒤·도착 직전에 `No valid trajectories` → 복구(회전 `Collision Ahead`·후진) 반복으로 3.6 m에 156초가 걸렸다. 차체 0.2~0.5 m 옆에 LiDAR로 설명되지 않는
+  깊이 표시가 있었고(현장에 물체 없음), 401에서는 치운 물체의 표시가 남았다. VoxelLayer는 자기 광선이 지나가야만 지우므로 사각대(앞 0.33~0.70 m·옆·뒤)에
+  들어간 표시는 영원히 남았고, 복구의 2 m 보존이 이를 지켰다. STVL은 시야 frustum 안에서 다시 안 보이면 약 1.4초, 시야 밖은 마지막 관측 10초 뒤 지운다.
+  STVL `min_z`/`max_z`는 frustum 모서리 광선 기준이라 축 방향은 ×0.58이다(처음 3.0을 넣었을 때 축 방향 1.74 m만 지워졌다).
+  bag 023737 재생(같은 필터, 지역 costmap 단독): 차체 0.35 m 안 LiDAR로 설명 안 되는 깊이 칸의 최장 수명 17.2 → 12.0초, 0.35~1.5 m 깊이 칸이
+  사라지는 시간도 짧아졌고(예: 180초 구간 130 → 0칸), 박스 표시 구간(100·220초)은 유지됐다. costmap CPU는 16.3 → 13.7 %(코어 1개). 잘못 찍힌 점의 출처는 미확인이고,
+  사각대의 진짜 낮은 물체도 10초 뒤 잊으므로 실차에서 슬리퍼·엘리베이터 하차 시험으로 `voxel_decay`를 확인해야 한다.
+- 카메라 IMU는 쓰지 않는다(광축 대비 피치 1.5°·롤 1° 틀어짐, `CHECK_V130_CAMERA.md`). 컬러는 `/camera/color/image_raw/compressed`로 드라이버가 JPEG 인코딩하고
+  `web_ui`는 바이트만 저장해 `/api/camera.jpg`로 낸다(3초 넘으면 404). 층간 이동 화면 카드가 0.5초마다 갱신하고 `remote_client`가 1초마다 중앙 관제에 중계한다(≤300 KiB).
+- 2026-10-25 첫 실차 기동: 초기 위치 지정 직후 TIM 전역 위치 추정(ICP 2스레드, 약 23초)이 돌며 부하 평균 8까지 올랐고, 그사이 AMCL의 bond heartbeat가
+  4초 넘게 끊겨 `lifecycle_manager_localization`이 "SERVER amcl IS DOWN"으로 localization을 내렸다(스택 재시작 필요). 조치: 두 lifecycle manager의
+  `bond_timeout`을 12초로, `tim_global_localizer`는 `nice -n 10`으로 띄운다. 주행 중 Jetson Chromium은 탭 하나만 둔다(25 %).
+- 주행 중 CPU 실측은 아직이다. 절차는 [검증 §6](VALIDATION.md#6-장치-읽기와-현장-판정).
+
 ## 10. 시간 이상 처리
 
 - bringup은 `time_health`를 실행한다. `/scan`, `/wheel/odometry`, `/imu/data_raw`, `/odometry/filtered`, `odom → base_footprint` TF의 시각과 신선도를 본다.
   허용 지연 0.75초, 미래 시각 0.1초, 정상 유지 1초. AMCL의 미래 시각 `map → odom`은 검사하지 않는다.
+- `start_camera:=true`이면 `watch_depth`로 `/camera/depth/points`도 본다(허용 지연 `depth_max_age` 1.0초: 10 Hz 클라우드의 드라이버 지연이 약 0.3~0.45초).
+  카메라가 멈추면 LiDAR처럼 AUTO를 막는다. 원시 바이트 구독으로 헤더 시각만 읽어 1 MB 클라우드를 파이썬에서 역직렬화하지 않는다.
 - `/system/time_health`가 비정상이거나 heartbeat가 0.6초 끊기면 control_mux는 AUTO 출력을 0으로 막고, navigation_manager는 목표를 중단하며,
   웹 UI는 새 목표를 막는다. MANUAL의 LB 규칙은 그대로다.
 - 실물에서는 ROS/시스템 시간 증가량과 monotonic 증가량 차이가 0.5초를 넘으면 오류를 유지(latch)한다. CAN 수신기는 이전 시간·샘플 조합만 비우고
@@ -401,6 +448,7 @@ AMR_REQUIRE_TIME_SYNC=1 ./scripts/experiment.sh real   # chrony 점검 실패 �
 | `start_ekf` | `true` | EKF와 `odom → base_footprint` |
 | `can_dry_run` | `false` | `true`이면 CAN 송신 없이 미리보기 |
 | `start_elevator_link` / `elevator_link_dry_run` | `false` / `true` | 층간 이동 CAN 중계 |
+| `start_camera` | `false` | Gemini 2 깊이 카메라(`camera.launch.py`): 깊이 320×200·10 Hz → 전역·지역 costmap, 컬러 640×360 JPEG → 웹, `time_health` depth 감시. 실차 전용(sim은 강제 off) |
 
 ```bash
 # 차량·센서·EKF
@@ -411,6 +459,8 @@ ros2 launch amr_stack bringup.launch.py can_dry_run:=true start_joy:=false
 ros2 launch amr_stack bringup.launch.py can_dry_run:=true start_lidar:=false start_can_telemetry:=false
 # LiDAR와 로봇 TF만 (bringup과 동시에 실행하지 않음)
 ros2 launch amr_stack lidar.launch.py
+# 깊이 카메라만 (드라이버 토픽·TF·CPU 확인; bringup과 동시에 실행하지 않음)
+ros2 launch amr_stack camera.launch.py start_camera:=true
 # 지도·AMCL, 목표점 주행
 ros2 launch amr_stack localization.launch.py [map:=/absolute/path/map.yaml]
 ros2 launch amr_stack navigation.launch.py [use_rviz:=true]
@@ -445,7 +495,7 @@ ros2 topic echo /control_mux/mode --qos-durability transient_local
 주행 스택을 실행한 상태에서 별도 터미널에서 실행한다.
 
 ```bash
-./scripts/record_trial.sh [실험이름]
+AMR_EXPERIMENT_MODE=real ./scripts/record_trial.sh [실험이름]
 ```
 
 - 한국 시간 기준 `bags/YYYY-MM-DD/HHMMSS[_실험이름]/`에 새 폴더를 만들고 기존 기록을 지우지 않는다.
@@ -453,4 +503,28 @@ ros2 topic echo /control_mux/mode --qos-durability transient_local
   `bag/`(전체·숨김 토픽 SQLite3), `session.txt`(시각과 ROS 환경)를 저장한다.
 - 차량을 정지시킨 뒤 Ctrl+C로 끝낸다. 정상 종료 시 `bag/metadata.yaml`과 `bag_info.txt`가 생성된다.
   서비스 요청·응답과 액션 목표 요청 전체를 저장하는 방식은 아니다.
+- 깊이 회피 시험은 `/camera/depth/points`, 양쪽 costmap과 증분, `/plan`, `/local_plan`, TF·속도를 함께 기록한다.
+  목표 전송 전에 기록 시작 메시지를 확인한다. 점군 최초 관측 → 지도 반영 → 경로 변경 → 감속을 시간순으로 비교할 수 있다.
 - 시뮬레이션에서는 `AMR_EXPERIMENT_MODE=sim ./scripts/record_trial.sh 이름`을 쓴다([시뮬레이션](SIMULATION.md#기록과-비교)).
+
+## 원격 정지(관리자 정지)
+
+중앙 관제 **정지**는 `/operator/hold`(transient local, depth 1)로 자율 목표를 중단하고
+새 목표·새 기동 임대를 막는다. 이미 발급된 엘리베이터 기동 임대는 안전한 취소 정리를 위해 유지하며,
+`control_mux`도 같은 토픽을 받아 AUTO 출력을 0으로 고정하고 자동 명령 캐시를 버린다(`hold_grace` 기본 0초,
+navigation_manager·미션이 스스로 멈추는 뒤의 백스톱). E-stop·LB 동작과 제어 모드 값은 그대로이며 수동 조작은
+가능하다. 관리자 정지는 물리 E-stop을 대체하지 않는다.
+
+엘리베이터 구간(탑승 시작 `BOARDING`부터 하차 뒤 위치 확인 `RELOCALIZE`까지)에서 정지를 누르면 그 자리에서
+멈추지 않는다. 문 사이나 카 안에 서면 엘리베이터를 막고, 카 안은 위치 추정이 꺼져 있어 원격 복귀도 못 하기
+때문이다. 웹 UI가 정지를 **보류**(`hold.pending`)로 기록하고 미션을 계속 진행시킨 뒤, 목적지 층 복도에서
+`NAV_TO_GOAL`로 넘어가거나 미션이 끝나는 순간 정지를 건다. 그동안 콘솔·키오스크에는 `하차 후 정지 예정`이
+표시되고, 해제나 복귀를 누르면 보류가 풀린다. 탑승 전 단계(홀 이동·호출·문 대기)와 일반 주행은 즉시 멈춘다.
+보류 중 즉시 세워야 하면 로봇의 물리 E-stop을 쓴다.
+
+정지는 통신 단절 중에도 로봇 내부에 유지되지만 웹 프로세스 재시작까지 보존되지는 않는다.
+**해제** 후 이전 목표는 재개되지 않는다. **복귀**는 명시적인 이동 명령으로 정지를 풀고,
+기존 목표 종료와 주행 준비 후 `floors.yaml`의 `home`(4F 401호)으로 이동한다.
+대기 한도는 30초이며 새 정지·복귀·목표 요청은 대기 중 복귀를 취소한다.
+격리 ROS 시험(navigation_manager 190, 엘리베이터 미션·웹 UI 193)이 SENDING 목표 취소, 정지 중 새 목표·임대 거부,
+해제 후 자동 재출발 없음, 미션 중 정지의 취소 처리를 확인한다.

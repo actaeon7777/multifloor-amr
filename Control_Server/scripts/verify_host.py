@@ -25,21 +25,19 @@ def main():
     token = read_token(args.token_file)
     auth = {'Authorization': 'Basic ' + base64.b64encode(('operator:' + token).encode()).decode()}
     http = HttpClient()
-    anonymous = http.request(url + '/fleet', timeout=3)
+    anonymous = http.request(url + '/', timeout=3)
     assert anonymous[0] == 401
     checks = {}
-    for path in ('/', '/robots/amr-01/', '/fleet', '/api/robots'):
+    for path in ('/', '/console.js', '/console.css', '/api/robots'):
         status, headers, body = http.request(url + path, headers=auth, timeout=3)
         assert status == 200, (path, status)
         normalized = {key.lower(): value for key, value in headers.items()}
         assert normalized['cache-control'] == 'no-store'
         checks[path] = status
         if path == '/api/robots':
-            robot_count = len(loads(body)['robots'])
-    state_status, _, _ = http.request(url + '/api/state', headers=auth, timeout=3)
-    assert state_status in (200, 503)
+            robot_count = len(loads(body))
     report = {'host_url': url, 'anonymous_status': anonymous[0], 'authenticated_paths': checks,
-              'state_status': state_status, 'registered_robots': robot_count,
+              'registered_robots': robot_count,
               'scope': 'host requests to its own Tailscale address; remote AMR not verified'}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')

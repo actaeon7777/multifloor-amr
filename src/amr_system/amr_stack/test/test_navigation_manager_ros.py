@@ -576,7 +576,7 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
     h.manager.require_estop = True
     qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     publisher = h.probe.create_publisher(String, '/estop/status', qos)
-    estop = {'state': 'DISARMED', 'epoch': 0, 'sequence': 0}
+    estop = {'state': 'ARMING', 'epoch': 0, 'sequence': 0}
 
     def publish():
         estop['sequence'] += 1
@@ -584,7 +584,7 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
         publisher.publish(String(data=json.dumps(dict(
             session='estop_test', sequence=estop['sequence'], epoch=estop['epoch'],
             stamp=time.time(), state=state, healthy=state in ('READY', 'BYPASS'),
-            latched=state in ('UNKNOWN', 'ESTOP', 'DISARMED')))))
+            latched=state in ('UNKNOWN', 'ESTOP')))))
     timer = h.probe.create_timer(.05, publish)
 
     def set_state(state, epoch=None):
@@ -593,9 +593,9 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
         estop['state'] = state
         h.until(lambda: h.manager.estop.status.get('state') == state)
 
-    set_state('DISARMED')
+    set_state('ARMING')
     rejected, _ = h.goal()
-    assert not rejected.accepted  # A clear STM32 alone is not a restart.
+    assert not rejected.accepted  # Goals wait for READY.
     set_state('READY')
     _, result = h.goal()
     h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
@@ -617,14 +617,14 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
     h.until(lambda: h.manager.run is None)
     h.spin(.1)
     assert h.manager.last_status == 'ESTOP'
-    set_state('DISARMED')
+    set_state('ARMING')  # Released: the bridge re-arms by itself.
     rejected, _ = h.goal()
     assert not rejected.accepted
     lease = h.probe.create_client(SetBool, '/navigation/maneuver_lease')
     assert not h.wait(lease.call_async(SetBool.Request(data=True))).success
     set_state('READY')
     h.spin()
-    assert len(h.backend.runs) == 1  # Never resumed after approval.
+    assert len(h.backend.runs) == 1  # Never resumed after re-arming.
     h.assert_zero()
 
     # A lost status stream is treated as an E-stop.
@@ -634,3 +634,53 @@ def test_estop_aborts_goal_holds_while_arming_and_requires_ready_for_new_goals(h
     response = h.wait(result)
     assert response.status == GoalStatus.STATUS_ABORTED
     assert 'E-stop' in response.result.error_msg
+
+
+def test_operator_hold_aborts_goal_rejects_new_goals_and_preserves_granted_lease(h):
+    from amr_control.operator_hold import HOLD_DETAIL
+    qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    publisher = h.probe.create_publisher(String, '/operator/hold', qos)
+    h.until(lambda: publisher.get_subscription_count() > 0)
+
+    def hold(value):
+        publisher.publish(String(data=json.dumps(dict(held=value, reason='central', stamp=time.time(), sequence=1))))
+        h.until(lambda: h.manager.held == value)
+
+    _, result = h.goal()
+    h.until(lambda: h.outputs and h.outputs[-1][1] == .3)
+    hold(True)
+    response = h.wait(result)
+    assert response.status == GoalStatus.STATUS_ABORTED
+    assert response.result.error_msg == HOLD_DETAIL
+    h.until(lambda: h.backend.runs[0]['handle'].is_cancel_requested)
+    h.assert_zero()
+    h.backend.finish(0)
+    h.until(lambda: h.manager.run is None and h.manager.last_status == 'HELD')
+    assert not h.goal()[0].accepted
+    pose = PoseStamped()
+    pose.header.frame_id = 'map'
+    pose.pose.orientation.w = 1.
+    h.topic_goal.publish(pose)
+    h.spin(.2)
+    assert len(h.backend.runs) == 1
+    lease = h.probe.create_client(SetBool, '/navigation/maneuver_lease')
+    h.until(lease.service_is_ready)
+    response = h.wait(lease.call_async(SetBool.Request(data=True)))
+    assert not response.success and response.message == HOLD_DETAIL
+    hold(False)
+    h.assert_zero()
+    assert len(h.backend.runs) == 1
+    assert h.wait(lease.call_async(SetBool.Request(data=True))).success
+    hold(True)
+    command = Twist()
+    command.linear.x = .1
+    maneuver = h.probe.create_publisher(Twist, '/cmd_vel_maneuver', 1)
+    h.until(lambda: maneuver.get_subscription_count() > 0)
+    timer = h.probe.create_timer(.03, lambda: maneuver.publish(command))
+    h.until(lambda: h.outputs[-1][1] == .1)
+    assert h.manager.lease_active()
+    assert not h.wait(lease.call_async(SetBool.Request(data=True))).success
+    timer.cancel()
+    assert h.wait(lease.call_async(SetBool.Request(data=False))).success
+    h.until(lambda: h.manager.last_status == 'HELD')
+    h.assert_zero()

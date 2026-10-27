@@ -9,7 +9,7 @@ dry_run (default) never imports CAN: commands are only previewed on ~/tx_preview
 import json
 from math import isfinite
 import signal
-from threading import Event
+from threading import Event, Lock, Thread
 from time import time
 import uuid
 
@@ -35,6 +35,20 @@ from amr_can_bridge.elevator_rf_status import ERROR, OK, WARN, RfStatusBoard
 # One kernel filter entry passes 0x310 (events) and 0x311 (diagnostics).
 CAN_FILTER = {'can_id': ELEVATOR_EVENT_CAN_ID, 'can_mask': 0x7FE, 'extended': False}
 RECENT_ERROR_WINDOW = 10.  # s; a decode or TX error warns for this long, not forever.
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 
 
 class ElevatorLink:
@@ -74,26 +88,33 @@ class ElevatorLink:
         records = []
         if self.bus is None:
             return records
-        decoders = {ELEVATOR_EVENT_CAN_ID: decode_event, ELEVATOR_DIAG_CAN_ID: decode_diagnostic}
         for _ in range(limit):
             message = self.bus.recv(timeout=0.)
             if message is None:
                 break
-            decode = decoders.get(message.arbitration_id)
-            if (decode is None or message.is_extended_id or message.is_remote_frame
-                    or message.is_error_frame or message.is_fd):
-                continue
-            self.received += 1
-            stamp = message.timestamp
-            if not isfinite(stamp) or stamp <= 0 or not -.02 <= now - stamp <= self.max_frame_age:
-                self.stale += 1
-                continue
-            try:
-                records.append((decode(message.data), stamp))
-            except ValueError as error:
-                self.invalid += 1
-                self.last_error, self.last_error_at = str(error), now
+            record = self.handle(message, now)
+            if record is not None:
+                records.append(record)
         return records
+
+    def handle(self, message, now):
+        """Return (record, kernel_stamp) for one fresh, valid classic CAN frame."""
+        decoders = {ELEVATOR_EVENT_CAN_ID: decode_event, ELEVATOR_DIAG_CAN_ID: decode_diagnostic}
+        decode = decoders.get(message.arbitration_id)
+        if (decode is None or message.is_extended_id or message.is_remote_frame
+                or message.is_error_frame or message.is_fd):
+            return None
+        self.received += 1
+        stamp = message.timestamp
+        if not isfinite(stamp) or stamp <= 0 or not -.02 <= now - stamp <= self.max_frame_age:
+            self.stale += 1
+            return None
+        try:
+            return decode(message.data), stamp
+        except ValueError as error:
+            self.invalid += 1
+            self.last_error, self.last_error_at = str(error), now
+            return None
 
     def recent_error(self, now):
         return self.last_error_at is not None and now - self.last_error_at < RECENT_ERROR_WINDOW
@@ -110,6 +131,9 @@ class ElevatorCanLink(Node):
     def __init__(self, bus_factory=None, **kwargs):
         super().__init__('elevator_can_link', **kwargs)
         self.link = None
+        self.lock = Lock()
+        self.stop_receiving = Event()
+        self.receiver = None
         try:
             channel = self.declare_parameter('channel', 'can0').value
             dry_run = self.declare_parameter('dry_run', True).value
@@ -139,10 +163,12 @@ class ElevatorCanLink(Node):
             self.diag_pub = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
             self.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 10)
             steady = Clock(clock_type=ClockType.STEADY_TIME)
-            self.create_timer(.01, self.poll, clock=steady)
             self.create_timer(1., self.publish_health, clock=steady)
             self.add_on_set_parameters_callback(lambda _: SetParametersResult(
                 successful=False, reason='Restart elevator_can_link to apply parameter changes'))
+            if bus is not None:
+                self.receiver = Thread(target=self.receive_loop, name='elevator_can_rx', daemon=True)
+                self.receiver.start()
         except Exception:
             self.close()
             self.destroy_node()
@@ -155,38 +181,66 @@ class ElevatorCanLink(Node):
 
     def on_command(self, message):
         try:
-            payload = self.link.command_frame(message.command, message.floor_code,
-                                              message.direction, message.sequence, message.repeat)
+            with self.lock:
+                payload = self.link.command_frame(message.command, message.floor_code,
+                                                  message.direction, message.sequence, message.repeat)
         except Exception as error:  # noqa: BLE001 - report and keep relaying
             self.get_logger().error(f'Elevator command rejected: {error}')
             return
         self.preview_pub.publish(String(data=f'0x{ELEVATOR_COMMAND_CAN_ID:03X} {payload.hex(" ")}'))
 
+    def receive_loop(self):
+        while not self.stop_receiving.is_set():
+            try:
+                message = self.link.bus.recv(timeout=.1)
+                if message is not None:
+                    with self.lock:
+                        now = time()  # Freshness is evaluated when the frame is handled.
+                        result = self.link.handle(message, now)
+                        if result is not None:
+                            self._publish_record(*result, now)
+                        if self.board.changed:
+                            self._publish_rf_status(now)
+            except Exception as error:
+                with self.lock:
+                    self.link.last_error, self.link.last_error_at = str(error), time()
+                self.stop_receiving.wait(.1)
+
     def poll(self):
-        now = time()
-        for record, stamp in self.link.poll(now):
-            header_stamp = Time(nanoseconds=round(stamp * 1e9)).to_msg()
-            if isinstance(record, ElevatorEvent):
-                beacon = ElevatorBeacon(
-                    event=record.event, location=record.location, floor_code=record.floor_code,
-                    sequence=record.sequence, ack_sequence=record.ack_sequence,
-                    rssi_dbm=record.rssi_dbm, source='can')
-                beacon.header.stamp = header_stamp
-                self.beacon_pub.publish(beacon)
-                self.board.event(record, now)
-                continue
-            if isinstance(record, CommandStatus):
-                status = ElevatorCommandStatus(
-                    cmd_seq=record.cmd_seq, status=record.status,
-                    device_result=record.device_result, target=record.target,
-                    attempts=record.attempts, source='can')
-                status.header.stamp = header_stamp
-                self.command_status_pub.publish(status)
-            self.board.diagnostic(record, now)
-        if self.board.changed:
-            self.publish_rf_status(now)
+        """Drain synchronously for callers without the receive thread."""
+        with self.lock:
+            now = time()
+            for record, stamp in self.link.poll(now):
+                self._publish_record(record, stamp, now)
+            if self.board.changed:
+                self._publish_rf_status(now)
+
+    def _publish_record(self, record, stamp, now):
+        """Publish and update the board while holding self.lock."""
+        header_stamp = Time(nanoseconds=round(stamp * 1e9)).to_msg()
+        if isinstance(record, ElevatorEvent):
+            beacon = ElevatorBeacon(
+                event=record.event, location=record.location, floor_code=record.floor_code,
+                sequence=record.sequence, ack_sequence=record.ack_sequence,
+                rssi_dbm=record.rssi_dbm, source='can')
+            beacon.header.stamp = header_stamp
+            self.beacon_pub.publish(beacon)
+            self.board.event(record, now)
+            return
+        if isinstance(record, CommandStatus):
+            status = ElevatorCommandStatus(
+                cmd_seq=record.cmd_seq, status=record.status,
+                device_result=record.device_result, target=record.target,
+                attempts=record.attempts, source='can')
+            status.header.stamp = header_stamp
+            self.command_status_pub.publish(status)
+        self.board.diagnostic(record, now)
 
     def publish_rf_status(self, now):
+        with self.lock:
+            self._publish_rf_status(now)
+
+    def _publish_rf_status(self, now):
         self.board.changed = False
         self.sequence += 1
         link = self.link
@@ -196,8 +250,12 @@ class ElevatorCanLink(Node):
         self.rf_status_pub.publish(String(data=json.dumps(report)))
 
     def publish_health(self):
+        with self.lock:
+            self._publish_health()
+
+    def _publish_health(self):
         now = time()
-        self.publish_rf_status(now)
+        self._publish_rf_status(now)
         link = self.link
         live = link.bus is not None
         problems = self.board.problems(now, live)
@@ -225,25 +283,54 @@ class ElevatorCanLink(Node):
         self.diag_pub.publish(array)
 
     def close(self):
+        self.stop_receiving.set()
+        if self.receiver is not None and self.receiver.is_alive():
+            self.receiver.join(timeout=1.)
         if self.link is not None:
             self.link.close()
 
 
 def main(args=None):
+    # Signals only complete the future and wake the executor. Keep the ROS
+    # context alive until close() has finished sending shutdown stop frames.
+    previous = {}
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    stop = Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stop.set())
-    node = None
+    node = executor = None
     try:
+        executor = spin_executor()
+        stopped = executor.create_future()
+
+        def request_stop(*_):
+            if not stopped.done():
+                stopped.set_result(None)
+                executor.wake()
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, request_stop)
         node = ElevatorCanLink()
-        while rclpy.ok() and not stop.is_set():
-            rclpy.spin_once(node, timeout_sec=.05)
+        executor.add_node(node)
+        # Return to Python regularly: the C++ wait does not dispatch Python signals.
+        while rclpy.ok() and not stopped.done():
+            executor.spin_until_future_complete(stopped, timeout_sec=.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        if node is not None:
-            node.close()
-            node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            try:
+                if executor is not None:
+                    executor.shutdown()
+                    if node is not None:
+                        executor.remove_node(node)
+            finally:
+                if node is not None:
+                    try:
+                        node.close()
+                    finally:
+                        node.destroy_node()
+        finally:
+            try:
+                if rclpy.ok():
+                    rclpy.shutdown()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)

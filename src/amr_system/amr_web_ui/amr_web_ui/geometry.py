@@ -48,7 +48,7 @@ class Grid:
                          origin=list(origin), frame=frame,
                          render_origin=list(origin) if frame == 'map' else None,
                          transform_valid=frame == 'map')
-        self.data = list(data)
+        self.data = array('b', data)
         self.costmap = costmap
         self.version = 0
         self._png = None
@@ -70,19 +70,29 @@ class Grid:
     def png(self, value):
         self._png = value
 
-    def render(self):
+    @property
+    def cached_png(self):
+        """The encoded PNG if one exists for the current version, else None."""
+        return self._png
+
+    def render(self, raw=None):
+        """Encode ``raw`` cells (default: a copy of the current data) as PNG.
+
+        Callers holding a lock take ``data.tobytes()`` under it and encode
+        outside: the compress is the slow part and needs no shared state.
+        """
         size = (self.info['width'], self.info['height'])
-        raw = array('b', self.data).tobytes()
+        if raw is None:
+            raw = self.data.tobytes()
         if self.costmap:
             image = Image.frombytes('P', size, raw)
             image.putpalette(COST_PALETTE)
             image.info['transparency'] = COST_ALPHA
-            image = image.convert('RGBA')
         else:
             image = Image.frombytes('L', size, raw).point(MAP_COLORS)
         image = image.transpose(getattr(Image, 'Transpose', Image).FLIP_TOP_BOTTOM)
         output = io.BytesIO()
-        image.save(output, format='PNG')
+        image.save(output, format='PNG', compress_level=1)
         return output.getvalue()
 
     def update(self, x, y, width, height, data):
@@ -90,6 +100,7 @@ class Grid:
                 x+width > self.info['width'] or y+height > self.info['height'] or
                 len(data) != width*height):
             raise ValueError('Grid update exceeds the full grid')
+        data = array('b', data)
         for row in range(height):
             start = (y+row)*self.info['width'] + x
             self.data[start:start+width] = data[row*width:(row+1)*width]

@@ -1,5 +1,8 @@
 """The public navigation Action is the same manager used by RViz /goal_pose."""
+import json
 import math
+
+from .server import ScanPoints, delivery_announcement, ACTIVE_GOALS
 
 import numpy as np
 import queue
@@ -16,7 +19,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import CompressedImage, LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -39,12 +42,14 @@ from amr_vehicle_interfaces.msg import VehicleStatus
 
 try:  # Multi-floor support is optional: the web UI still runs without the elevator packages.
     from amr_elevator_interfaces.action import NavigateToFloorPose
+    from amr_elevator_interfaces.srv import SetCurrentFloor
     from amr_elevator_interfaces.msg import (
         ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorEvent, FloorState)
     from amr_stack.floor_config import load_floor_config
 except ImportError:  # pragma: no cover - depends on the installed workspace
     NavigateToFloorPose = ElevatorCommandStatus = FloorState = load_floor_config = None
     ElevatorBeacon = ElevatorCommand = ElevatorDoorState = FloorEvent = None
+    SetCurrentFloor = None
 
 from .geometry import Grid, transform_xy, yaw
 from .vehicle_status import display_snapshot, seconds
@@ -75,9 +80,19 @@ class WebBridge(Node):
                 self.get_logger().warning(f'Multi-floor goals disabled: {error}')
         self.relocalize_client = self.create_client(Trigger, '/localization/relocalize')
         self.pending_relocalize = None
-        self.estop_client = self.create_client(Trigger, '/estop/approve_resume')
-        self.pending_estop = None
+        # Match the absolute /floor/state topic used by this bridge; the monitor
+        # exposes floor/set_current in the same root namespace.
+        self.set_floor_client = (self.create_client(SetCurrentFloor, '/floor/set_current')
+                                 if SetCurrentFloor is not None else None)
+        self.waiting_set_floor = None
+        self.pending_set_floor = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
+        self.announcement_pub = self.create_publisher(String, '/robot/announcement', 10)
+        self.shared.announce = self.announce
+        self.hold_pub = self.create_publisher(String, '/operator/hold',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.hold_pub.publish(String(data=json.dumps(dict(
+            held=False, reason='', stamp=time.time(), sequence=0))))
         self.goal_handle = None
         self.goal_id = None
         self.pending_scan = None
@@ -142,7 +157,16 @@ class WebBridge(Node):
                     m.event, m.from_floor, m.to_floor, m.detail), 20))
         self.subscriptions_list.append(self.create_subscription(
             VehicleStatus, '/vehicle/status', self.on_vehicle_status, QoSProfile(depth=1)))
-        self.create_timer(.05, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        # Depth camera color stream, JPEG-encoded by the driver (bringup start_camera).
+        # Bytes are stored as-is for /api/camera.jpg; nothing is decoded here (Jetson CPU).
+        self.subscriptions_list.append(self.create_subscription(
+            CompressedImage, '/camera/color/image_raw/compressed',
+            lambda m: self.shared.update_camera(bytes(m.data), m.format), QoSProfile(depth=1)))
+        steady = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(.05, self.tick, clock=steady)
+        # server_is_ready() walks the ROS graph; twice per 50 ms tick was 6 % of
+        # this process on the Jetson. Goal sending re-checks directly.
+        self.create_timer(1., self.update_ready, clock=steady)
 
     def set_state(self, **values):
         with self.shared.lock:
@@ -162,11 +186,14 @@ class WebBridge(Node):
         self.pending_scan = None
         self.pending_vectors.clear()
         self.robot_stamp = self.goal_id = self.goal_handle = None
-        for name in ('pending_relocalize', 'pending_estop'):
-            pending = getattr(self, name)
-            if pending:
-                setattr(self, name, None)
-                pending[0].cancel()
+        if self.pending_relocalize:
+            self.pending_relocalize[0].cancel()
+            self.pending_relocalize = None
+        self.waiting_set_floor = None
+        if self.pending_set_floor:
+            future = self.pending_set_floor[0]
+            self.pending_set_floor = None
+            future.cancel()
         self.seen_epoch = self.shared.connection_epoch
         self.reset_requested = False
 
@@ -197,7 +224,7 @@ class WebBridge(Node):
                 if msg.header.frame_id and msg.header.frame_id != grid.info['frame']:
                     return
                 try:
-                    grid.update(msg.x, msg.y, msg.width, msg.height, list(msg.data))
+                    grid.update(msg.x, msg.y, msg.width, msg.height, msg.data)
                 except ValueError as error:
                     self.get_logger().warning(str(error))
 
@@ -270,10 +297,21 @@ class WebBridge(Node):
                 if time.monotonic()-received > 2:
                     self.pending_vectors.pop(name, None)
 
+    def update_ready(self):
+        self.set_state(action_ready=self.client.server_is_ready(),
+                       floor_action_ready=bool(self.floor_client and self.floor_client.server_is_ready()))
+
     def update_scan(self):
         if self.pending_scan is None:
             return
+        if not self.shared.display_wanted(time.monotonic()):
+            return  # Display only: nobody polled the full state lately.
         msg, received = self.pending_scan
+        stamp = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
+        with self.shared.lock:
+            if stamp == self.shared.scan_stamp:
+                self.pending_scan = None
+                return
         try:
             tf = self.transform(msg.header.frame_id, msg.header.stamp)
             # Keep all valid rays; decimation is not needed for a single 2D scan.
@@ -291,11 +329,17 @@ class WebBridge(Node):
             intensities = np.asarray(msg.intensities, dtype=float)
             if len(intensities) == len(ranges):
                 intensity = intensities[index]
-                intensity = [v if math.isfinite(v) else None for v in intensity.tolist()]
+                finite = np.isfinite(intensity)
+                values = np.trunc(np.where(finite, intensity, 0.)).astype(np.int64).tolist()
+                for i in np.flatnonzero(~finite).tolist():
+                    values[i] = None
             else:
-                intensity = [None]*len(index)
-            points = [[px, py, pi] for px, py, pi in zip(x.tolist(), y.tolist(), intensity)]
-            self.set_state(scan=dict(points=points, received_at=received))
+                values = [None]*len(index)
+            # Millimetres are plenty for display; round in numpy, not per point in Python.
+            points = ScanPoints(map(list, zip(np.round(x, 3).tolist(), np.round(y, 3).tolist(), values)))
+            with self.shared.lock:
+                self.shared.state['scan'] = dict(points=points, received_at=received)
+                self.shared.scan_stamp = stamp
             self.pending_scan = None
         except TransformException:
             if time.monotonic()-received > 1:
@@ -344,7 +388,17 @@ class WebBridge(Node):
         with self.shared.lock:
             goal = self.shared.state.get('goal')
             if goal and goal['request_id'] == request_id:
+                before = goal.get('status')
                 goal.update(values)
+                key = delivery_announcement(goal, before)
+                if key:
+                    self.announce(key, goal)
+
+    def announce(self, key, goal):
+        """Kiosk delivery voice cue for announcement_player (same JSON as the elevator mission)."""
+        self.announcement_pub.publish(String(data=json.dumps(dict(
+            key=key, room=goal.get('room', ''), floor=goal.get('floor', ''), phase='DELIVERY',
+            stamp=self.get_clock().now().nanoseconds / 1e9), ensure_ascii=False)))
 
     def process_command(self, command):
         kind, request_id, pose = command['kind'], command['request_id'], command['pose']
@@ -356,6 +410,10 @@ class WebBridge(Node):
             return
         if kind == 'floor_goal':
             self.send_floor_goal(command)
+            return
+        if kind == 'set_floor':
+            self.waiting_set_floor = (command, time.monotonic())
+            self.poll_set_floor()
             return
         if pose is not None or kind == 'relocalize':
             with self.shared.lock:
@@ -375,7 +433,10 @@ class WebBridge(Node):
             self.goal_id = request_id
             self.goal_handle = None
             self.set_state(goal=dict(x=pose[0], y=pose[1], yaw=pose[2], request_id=request_id,
-                                     kind=kind, status='SENDING'))
+                                     kind=kind, status='SENDING',
+                                     **({'origin': command['origin']} if command.get('origin') else {}),
+                                     **({key: command[key] for key in ('floor', 'room')}
+                                        if command.get('room') else {})))
             with self.shared.lock:
                 self.shared.telemetry.begin_journey(request_id)
             goal = NavigateToPose.Goal()
@@ -411,13 +472,6 @@ class WebBridge(Node):
             future = self.relocalize_client.call_async(Trigger.Request())
             self.pending_relocalize = (future, request_id, time.monotonic())
             future.add_done_callback(lambda f: self.on_relocalize_response(request_id, f))
-        elif kind == 'estop_approve':
-            if not self.estop_client.service_is_ready():
-                self.shared.complete(request_id, 'FAILED', 'E-stop 재개 승인 서비스에 연결되지 않았습니다.')
-                return
-            future = self.estop_client.call_async(Trigger.Request())
-            self.pending_estop = (future, request_id, time.monotonic())
-            future.add_done_callback(lambda f: self.on_estop_response(request_id, f))
         elif kind == 'cancel':
             if not self.goal_handle or not self.goal_handle.accepted:
                 self.shared.complete(request_id, 'FAILED', '취소할 목표가 없습니다.')
@@ -426,6 +480,42 @@ class WebBridge(Node):
             self.goal_state(goal_id, status='CANCELING')
             self.goal_handle.cancel_goal_async().add_done_callback(
                 lambda f: self.on_cancel_response(request_id, goal_id, f))
+
+    def poll_set_floor(self):
+        """Discover the service on steady ticks, without blocking the executor."""
+        if self.waiting_set_floor:
+            command, started = self.waiting_set_floor
+            request_id = command['request_id']
+            error = self.shared.readiness_error('set_floor', request_id)
+            if error:
+                self.waiting_set_floor = None
+                self.shared.complete(request_id, 'FAILED', error)
+            elif self.set_floor_client is not None and self.set_floor_client.service_is_ready():
+                self.waiting_set_floor = None
+                try:
+                    future = self.set_floor_client.call_async(SetCurrentFloor.Request(floor=command['floor']))
+                    self.pending_set_floor = (future, request_id, time.monotonic())
+                    future.add_done_callback(lambda f: self.on_set_floor_response(request_id, f))
+                except Exception as error:
+                    self.shared.complete(request_id, 'FAILED', f'층 설정 요청을 보내지 못했습니다: {error}')
+            elif time.monotonic()-started >= 1:
+                self.waiting_set_floor = None
+                self.shared.complete(request_id, 'FAILED', '층 관리 노드에 연결되지 않았습니다.')
+        if self.pending_set_floor and time.monotonic()-self.pending_set_floor[2] > 5:
+            future, request_id, _started = self.pending_set_floor
+            self.pending_set_floor = None
+            future.cancel()
+            self.shared.complete(request_id, 'FAILED', '층 설정 응답이 지연됩니다. 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
+
+    def on_set_floor_response(self, request_id, future):
+        if self.pending_set_floor is None or self.pending_set_floor[0] is not future:
+            return
+        self.pending_set_floor = None
+        try:
+            result = future.result()
+            self.shared.complete(request_id, 'SUCCEEDED' if result.success else 'FAILED', result.message)
+        except Exception as error:
+            self.shared.complete(request_id, 'FAILED', f'층 설정 응답을 확인하지 못했습니다: {error}')
 
     def send_floor_goal(self, command):
         request_id, pose, floor, room = command['request_id'], command['pose'], command['floor'], command['room']
@@ -442,7 +532,8 @@ class WebBridge(Node):
         self.goal_id = request_id
         self.goal_handle = None
         self.set_state(goal=dict(x=pose[0], y=pose[1], yaw=pose[2], request_id=request_id, kind='floor_goal',
-                                 floor=floor, room=room, status='SENDING'))
+                                 floor=floor, room=room, status='SENDING',
+                                 **({'origin': command['origin']} if command.get('origin') else {})))
         with self.shared.lock:
             self.shared.telemetry.begin_journey(request_id)
         goal = NavigateToFloorPose.Goal(floor=floor, destination_id=room)
@@ -486,26 +577,18 @@ class WebBridge(Node):
         except Exception as error:
             self.shared.complete(request_id, 'FAILED', f'자동 위치 찾기 응답을 확인하지 못했습니다: {error}')
 
-    def on_estop_response(self, request_id, future):
-        if self.pending_estop is None or self.pending_estop[0] is not future:
-            return
-        self.pending_estop = None
-        try:
-            result = future.result()
-            self.shared.complete(request_id, 'APPROVED' if result.success else 'FAILED',
-                                 result.message or ('재개를 승인했습니다.' if result.success
-                                                    else '재개 승인이 거절되었습니다.'))
-        except Exception as error:
-            self.shared.complete(request_id, 'FAILED', f'재개 승인 응답을 확인하지 못했습니다: {error}')
-
     def on_goal_response(self, request_id, future, floor=False):
         if self.goal_id != request_id:
             return
         try:
             handle = future.result()
             if not handle.accepted:
-                self.goal_state(request_id, status='REJECTED')
-                self.shared.complete(request_id, 'REJECTED', '목표가 거절되었습니다.')
+                # A hold that lands before the goal request makes the manager reject it; that
+                # is the operator's stop, not a robot error (delivery_announcement keys on '관리자').
+                held = self.shared.state['hold']['held']
+                detail = '관리자가 원격으로 정지해 목표가 거절되었습니다.' if held else '목표가 거절되었습니다.'
+                self.goal_state(request_id, status='REJECTED', **({'error_message': detail} if held else {}))
+                self.shared.complete(request_id, 'REJECTED', detail)
                 return
             if self.goal_id == request_id:
                 self.goal_handle = handle
@@ -513,6 +596,7 @@ class WebBridge(Node):
             self.shared.complete(request_id, 'ACCEPTED', '목표가 접수되었습니다.')
             handle.get_result_async().add_done_callback(
                 lambda f: (self.on_floor_result if floor else self.on_result)(request_id, f))
+            self.cancel_operator_goal()
         except Exception as error:
             self.goal_state(request_id, status='FAILED')
             self.shared.complete(request_id, 'FAILED', f'목표 전송 실패: {error}')
@@ -553,6 +637,49 @@ class WebBridge(Node):
             self.shared.complete(request_id, 'FAILED', str(error))
             self.goal_state(goal_id, status='ACCEPTED')
 
+    def cancel_operator_goal(self):
+        with self.shared.lock:
+            goal = self.shared.state.get('goal') or {}
+            goal_id = goal.get('request_id')
+            # Keep SENDING targets until their action response arrives, even after resume.
+            self.shared.cancel_goal_ids.intersection_update({goal_id} if goal_id else set())
+            if goal.get('status') not in ACTIVE_GOALS:
+                self.shared.cancel_goal_ids.discard(goal_id)
+                return
+            if (goal_id not in self.shared.cancel_goal_ids or goal.get('status') != 'ACCEPTED'
+                    or self.goal_id != goal_id or self.goal_handle is None):
+                return
+            self.goal_state(goal_id, status='CANCELING')
+            future = self.goal_handle.cancel_goal_async()
+            future.add_done_callback(lambda f: self.on_operator_cancel_response(goal_id, f))
+
+    def on_operator_cancel_response(self, goal_id, future):
+        try:
+            accepted = bool(future.result().goals_canceling)
+        except Exception:
+            accepted = False
+        if not accepted:
+            with self.shared.lock:
+                goal = self.shared.state.get('goal') or {}
+                if goal.get('request_id') == goal_id and goal.get('status') == 'CANCELING':
+                    self.goal_state(goal_id, status='ACCEPTED')
+
+    def poll_operator_commands(self):
+        with self.shared.lock:
+            while self.shared.operator_commands:
+                command = self.shared.operator_commands.popleft()
+                if command['hold'] is not None:
+                    self.hold_pub.publish(String(data=json.dumps(command['hold'])))
+                if command['kind'] != 'return_home':
+                    self.shared.complete(command['request_id'], 'SUCCEEDED')
+            event = self.shared.next_hold_event()
+            if event is not None:
+                self.hold_pub.publish(String(data=json.dumps(event)))
+            self.cancel_operator_goal()
+            command = self.shared.next_return_command()
+            if command:
+                self.process_command(command)
+
     def tick(self):
         if self.clock_monitor.observe(self.get_clock().now().nanoseconds/1e9, time.monotonic(),
                                       self.get_parameter('use_sim_time').value):
@@ -560,23 +687,19 @@ class WebBridge(Node):
                 self.request_clock_reset()
         if self.reset_requested or self.seen_epoch != self.shared.connection_epoch:
             self.reset_transport()
-        self.set_state(action_ready=self.client.server_is_ready(),
-                       floor_action_ready=bool(self.floor_client and self.floor_client.server_is_ready()))
         self.update_robot()
         self.update_vectors()
         self.update_scan()
         self.update_grid_origins()
+        self.poll_set_floor()
+        self.poll_operator_commands()
         if self.pending_relocalize and time.monotonic()-self.pending_relocalize[2] > 5:
             future, request_id, _received = self.pending_relocalize
             self.pending_relocalize = None
             future.cancel()
             self.shared.complete(request_id, 'FAILED', '자동 위치 찾기 응답이 지연됩니다. 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
-        if self.pending_estop and time.monotonic()-self.pending_estop[2] > 5:
-            future, request_id, _received = self.pending_estop
-            self.pending_estop = None
-            future.cancel()
-            self.shared.complete(request_id, 'FAILED', '재개 승인 응답이 지연됩니다. E-stop 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
         try:
-            self.process_command(self.shared.commands.get_nowait())
+            with self.shared.lock:
+                self.process_command(self.shared.commands.get_nowait())
         except queue.Empty:
             pass

@@ -51,8 +51,9 @@ def test_floors_without_a_map_are_pass_floors(config):
 
 
 def test_only_the_elevator_tested_floors_are_enabled_on_the_real_vehicle(config):
-    # 3F: hall call to in-car alignment passed on the real vehicle (2026-10-24). 5F is not tested yet.
-    assert {n for n, f in config.floors.items() if f.real_enabled} == {'3F', '4F'}
+    # 3F: hall call to in-car alignment passed on the real vehicle (2026-10-24); 3F->4F ride
+    # 2026-10-26. 5F enabled on request 2026-10-27 before its first real ride.
+    assert {n for n, f in config.floors.items() if f.real_enabled} == {'3F', '4F', '5F'}
     assert all(f.provisional_copy_of is None for f in config.floors.values())
 
 
@@ -228,3 +229,17 @@ def _broken(raw, mutate):
 def test_invalid_configs_are_rejected(raw, mutate, message):
     with pytest.raises(FloorConfigError, match=message):
         parse_floor_config(_broken(raw, mutate))
+
+
+def test_home_valid_and_missing(raw):
+    config = parse_floor_config(raw)
+    assert (config.home.floor, config.home.room) == ('4F', '401')
+    without = copy.deepcopy(raw)
+    without.pop('home')
+    assert parse_floor_config(without).home is None
+
+
+@pytest.mark.parametrize('home', [{'floor': '4F', 'room': '999'}, {'floor': '9F', 'room': '401'}, {}])
+def test_home_must_reference_existing_room(raw, home):
+    with pytest.raises(ValueError, match='home'):
+        parse_floor_config(dict(raw, home=home))

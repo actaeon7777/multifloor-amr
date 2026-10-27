@@ -604,7 +604,7 @@
   </joint>
   <!--
     Orbbec Gemini 2 mount frame (+X along the optical axis, +Z up, pitched
-    12 deg up). OrbbecSDK_ROS2 publishes camera_link -> depth/color/IR and
+    11.25 deg up as measured; CAD 12 deg). OrbbecSDK_ROS2 publishes camera_link -> depth/color/IR and
     optical frames itself from the factory calibration, so none of those
     frames are defined here. Depth FOV 91 x 66 deg, 50 mm baseline.
   -->
@@ -612,6 +612,6 @@
   <joint name="camera_joint" type="fixed">
     <parent link="base_link"/>
     <child link="camera_link"/>
-    <origin rpy="0 -0.20943951023931953 0" xyz="0.320488 0.025 0.061017"/>
+    <origin rpy="0 -0.19634954084936207 0" xyz="0.320488 0.025 0.061017"/>
   </joint>
 </robot>

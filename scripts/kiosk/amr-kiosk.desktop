@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AMR 배송 키오스크
+Comment=로봇 터치 화면
+Exec=/home/acus03/amr_ws/scripts/kiosk/launch.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

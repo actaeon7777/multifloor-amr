@@ -89,15 +89,15 @@ def test_time_lease_expiry_even_when_ros_clock_stops(node):
 def test_estop_fields_and_lease_expiry(node):
     msg = node.message()
     assert msg.estop_state=='UNKNOWN' and not msg.estop_status.received and msg.estop_detail==''
-    status = dict(session='estop-test',sequence=1,epoch=1,stamp=time.time(),state='DISARMED',
-                  healthy=False,latched=True,approval_required=True,detail='재개 승인 필요',
+    status = dict(session='estop-test',sequence=1,epoch=1,stamp=time.time(),state='ARMING',
+                  healthy=False,latched=False,detail='주행 준비 중',
                   stm32=dict(raw=False,stopped=False,drive_enabled=False,trip_count=3))
     node.on_estop(String(data=json.dumps(status)))
     msg = node.message()
-    assert msg.estop_status.fresh and msg.estop_state=='DISARMED' and msg.estop_approval_required
+    assert msg.estop_status.fresh and msg.estop_state=='ARMING'
     assert not msg.estop_button_pressed and not msg.estop_stm32_stopped and msg.estop_trip_count==3
     node.on_estop(String(data=json.dumps({**status,'sequence':2,'stamp':time.time(),'state':'ESTOP',
-        'approval_required':False,'stm32':dict(raw=True,stopped=True,trip_count=4)})))
+        'latched':True,'stm32':dict(raw=True,stopped=True,trip_count=4)})))
     msg = node.message()
     assert msg.estop_state=='ESTOP' and msg.estop_button_pressed and msg.estop_stm32_stopped
     stale = node.message(now=time.monotonic()+.7,ros=node.ros_now())

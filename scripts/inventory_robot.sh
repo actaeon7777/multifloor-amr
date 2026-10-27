@@ -6,12 +6,14 @@ mkdir -- "$output_dir"
 uname -a > "$output_dir/uname.txt"
 cat /etc/os-release > "$output_dir/os-release.txt"
 dpkg-query -W 'ros-jazzy-*' > "$output_dir/ros-packages.txt" 2>/dev/null || true
+lsusb > "$output_dir/usb.txt" 2>&1 || true   # Gemini 2 shows as 2bc5:0670
 ip -details link show can0 > "$output_dir/can0.txt" 2>&1 || true
 if command -v ros2 >/dev/null; then
   timeout 10s ros2 node list > "$output_dir/nodes.txt" || true
   timeout 10s ros2 topic list -t > "$output_dir/topics.txt" || true
-  for node in control_mux navigation_manager controller_server planner_server ekf_filter_node amcl can_telemetry cmd_vel_to_can; do
-    timeout 10s ros2 param dump "/$node" > "$output_dir/$node.yaml" 2> "$output_dir/$node.errors.txt" || true
+  for node in control_mux navigation_manager controller_server planner_server ekf_filter_node amcl can_telemetry cmd_vel_to_can time_health camera/camera; do
+    file=${node//\//_}
+    timeout 10s ros2 param dump "/$node" > "$output_dir/$file.yaml" 2> "$output_dir/$file.errors.txt" || true
   done
 fi
 cat > "$output_dir/hardware_identity.json" <<'EOF'

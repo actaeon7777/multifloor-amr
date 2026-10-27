@@ -54,6 +54,10 @@ def generate_launch_description():
             description='Elevator RF relay over CAN (0x210/0x310/0x311, ELEVATOR_CAN_PROTOCOL.md v1.1); '
                         'firmware implemented, keep false until the integration test passes'),
         DeclareLaunchArgument('elevator_link_dry_run', default_value='true'),
+        DeclareLaunchArgument(
+            'start_camera', default_value='false',
+            description='Gemini 2 depth camera (camera.launch.py): depth points for global/local costmaps '
+                        '(STVL), JPEG color for the web, and a depth watch in time_health.'),
         DeclareLaunchArgument('ekf_config', default_value=str(config_dir / 'ekf.yaml')),
         DeclareLaunchArgument('predict_to_current_time', default_value=LaunchConfiguration('use_sim_time'),
                               description='Predict EKF output between sensor samples; enabled for simulation.'),
@@ -81,6 +85,13 @@ def generate_launch_description():
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             }.items(),
         ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(str(config_dir.parent / 'launch/camera.launch.py')),
+            launch_arguments={
+                'start_camera': LaunchConfiguration('start_camera'),
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }.items(),
+        ),
         OpaqueFunction(
             function=launch_joy,
             condition=IfCondition(LaunchConfiguration('start_joy')),
@@ -97,7 +108,12 @@ def generate_launch_description():
         ),
         Node(
             package='amr_control', executable='time_health', name='time_health',
-            parameters=[{'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)}], output='screen',
+            parameters=[{'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool),
+                         # With the camera on, stale depth inhibits AUTO like a stale LiDAR.
+                         'watch_depth': ParameterValue(LaunchConfiguration('start_camera'), value_type=bool),
+                         # The costmaps mark from the filtered cloud, so a dead filter is a dead camera.
+                         'depth_topic': '/camera/depth/points_filtered'}],
+            output='screen',
         ),
         Node(
             package='amr_can_bridge', executable='can_telemetry', name='can_telemetry',

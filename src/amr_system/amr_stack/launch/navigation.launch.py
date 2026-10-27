@@ -59,7 +59,6 @@ def launch_nodes(context):
         if not isfinite(value) or value <= 0:
             raise ValueError(f'{control_path}: {name} must be positive and finite')
         geometry['FollowPath.WheelSpeed.' + name] = value
-    tree = Path(get_package_share_directory('nav2_bt_navigator')) / 'behavior_trees'
     # Action endpoints must be remapped explicitly; remapping only the
     # action base name does not move its hidden services/topics.
     action_remaps = [
@@ -79,8 +78,10 @@ def launch_nodes(context):
              parameters=[config, {
                  # Keep a valid route around an obstacle instead of changing sides
                  # at every 1 Hz replan. Check validity at 2 Hz, refresh after 10 s.
+                 # Recoveries keep a 2 m square around the robot: obstacles in the
+                 # depth camera's blind zone must not be forgotten (see the XML).
                  'default_nav_to_pose_bt_xml': str(
-                     tree / 'nav_to_pose_with_consistent_replanning_and_if_path_becomes_invalid.xml'),
+                     share / 'behavior_trees/navigate_to_pose_keep_nearby.xml'),
              }], remappings=action_remaps + [
                  ('goal_pose', '/navigation/internal_goal_pose'),
              ], output='screen'),
@@ -90,6 +91,9 @@ def launch_nodes(context):
         Node(package='amr_tim_localization', executable='tim_global_localizer',
              name='tim_global_localizer',
              parameters=[LaunchConfiguration('tim_config'), {'use_sim_time': use_sim_time}],
+             # Batch matching saturates its threads for ~20 s; yield to AMCL, the EKF
+             # and the controller so their heartbeats and 20 Hz loops keep running.
+             prefix='nice -n 10',
              output='screen'),
         Node(package='amr_stack', executable='navigation_startup', name='navigation_startup',
              parameters=[LaunchConfiguration('startup_config'), {'use_sim_time': use_sim_time}],
@@ -100,6 +104,7 @@ def launch_nodes(context):
                  # initial pose exists. The supervisor requests STARTUP later.
                  'use_sim_time': use_sim_time, 'autostart': False,
                  'attempt_respawn_reconnection': False,
+                 'bond_timeout': 12.0,  # same reason as lifecycle_manager_localization
                  'node_names': ['planner_server', 'controller_server', 'behavior_server', 'bt_navigator'],
              }], output='screen'),
     ]

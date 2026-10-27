@@ -239,13 +239,21 @@ class MapQuality:
         clearance = max(self.match_tolerance, self.resolution)
         steps = np.arange(ray_step, max(0.0, distances.max() - clearance), ray_step)
         if len(steps):
-            active = steps[None, :] < (distances[:, None] - clearance)
+            # Use the original step lattice and strict comparison, including
+            # its floating-point boundary behavior; only materialize active
+            # samples instead of a count-by-longest-ray rectangle.
+            step_counts = np.searchsorted(steps, distances - clearance, side='left')
+            ray_indices = np.repeat(np.arange(count), step_counts)
+            offsets = np.cumsum(step_counts) - step_counts
+            step_indices = np.arange(len(ray_indices)) - np.repeat(offsets, step_counts)
+            samples = steps[step_indices]
             rx, ry, rinside = self._cells(
-                poses[:, 0, None] + cosine[:, None] * steps,
-                poses[:, 1, None] + sine[:, None] * steps)
-            obstructed = np.any(active & rinside & self.occupied[ry, rx], axis=1)
+                poses[ray_indices, 0] + cosine[ray_indices] * samples,
+                poses[ray_indices, 1] + sine[ray_indices] * samples)
+            obstructed = np.bincount(
+                ray_indices[rinside & self.occupied[ry, rx]], minlength=count) > 0
             traversable = rinside & self.known[ry, rx]
-            known &= np.all(~active | traversable, axis=1)
+            known &= np.bincount(ray_indices[~traversable], minlength=count) == 0
             matched &= known & ~obstructed
         return ScanQuality(
             count, int(matched.sum()), int(known.sum()), int(obstructed.sum()),

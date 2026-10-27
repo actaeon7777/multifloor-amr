@@ -28,6 +28,11 @@ apt-get install -y ros-jazzy-desktop ros-dev-tools \
   ros-jazzy-navigation2 ros-jazzy-nav2-bringup ros-jazzy-robot-localization \
   ros-jazzy-test-msgs ros-jazzy-slam-toolbox ros-jazzy-joy ros-jazzy-xacro ros-jazzy-rosbag2 \
   ros-jazzy-pcl-conversions ros-jazzy-tf2-eigen libpcl-dev libopencv-dev libeigen3-dev liboctomap-dev \
+  ros-jazzy-image-transport-plugins \
   python3-can python3-yaml python3-pytest python3-numpy python3-scipy python3-pil
+# Gemini 2 depth camera (bringup start_camera:=true): ros-jazzy-orbbec-camera(-msgs) are not in the
+# ROS apt index. Download orbbec-ros2-debs-jazzy-arm64.zip from the OrbbecSDK_ROS2 v2.10.6 release,
+# inspect with dpkg-deb -I/-c, then: apt-get install ./ros-jazzy-orbbec-camera-msgs_*.deb ./ros-jazzy-orbbec-camera_*.deb
+# (docs/REAL_VEHICLE.md section 2).
 if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then rosdep init; fi
 echo 'Installed. Next, as your normal user: ./scripts/build_ros.sh'

@@ -1,3 +1,5 @@
+# Central console return-home destination.
+home: {floor: "4F", room: "401"}
 # 층·지도·장면·엘리베이터 지점 설정 (층간 이동). 설명: docs/ELEVATOR.md
 #
 # 지도를 교체할 때는 이 파일만 고친다. 파서: amr_stack/floor_config.py
@@ -33,7 +35,7 @@ floors:
       E1:
         door_center: [9.975, 3.31]
         car_inward_yaw: 3.141593     # 홀 → 카 진입 방향
-        hall_wait_pose: [10.575, 3.31, 3.141593]
+        hall_wait_pose: [10.975, 3.31, 3.141593]   # 2026-10-27: 1.0 m from the door (was 0.6 m: bumper 27 cm from the door blocked people leaving the car)
         hall_exit_pose: [10.775, 3.31, 0.0]
     # 호실: 401~406 남쪽 벽, 407~412 북쪽 벽(동→서), 413 세로 복도 서쪽 벽(앞문 북쪽·뒷문 남쪽), 414 세로 복도 북쪽 끝.
     # goal은 문 앞 복도에서 문을 바라보는 정차 자세. "413-앞문"·"413-뒷문"은 같은 호실의 두 문.
@@ -67,7 +69,7 @@ floors:
       E1:
         door_center: [9.975, 3.31]
         car_inward_yaw: 3.141593
-        hall_wait_pose: [10.575, 3.31, 3.141593]
+        hall_wait_pose: [10.975, 3.31, 3.141593]   # 2026-10-27: 1.0 m from the door (was 0.6 m: bumper 27 cm from the door blocked people leaving the car)
         hall_exit_pose: [10.775, 3.31, 0.0]
     rooms:
       "401": {goal: [41.08, -0.2, -1.5708], door: [41.08, -1.17]}
@@ -89,7 +91,7 @@ floors:
   "5F":
     level: 5
     beacon_floor_code: 5
-    real_enabled: false              # 엘리베이터 실차 시험 전까지 실차 층간 이동 금지
+    real_enabled: true               # 2026-10-27 사용자 요청으로 켬. 5F 실차 층간 이동은 아직 미시험(3F와 같은 홀·카 절차). 호실 좌표는 4F 값이라 문 앞 위치 현장 확인 필요
     # 실측 지도(2026-10-06)를 4F 좌표계로 정렬. 영역지정·sim_map·sim_layer·호실은 아직 4F 복사본 (maps/G_5_floor/MAP_SOURCE.md)
     map: maps/G_5_floor/5_floor_1006.yaml
     annotations: maps/G_5_floor/5_floor_tmp_from_4F(영역지정).png
@@ -100,7 +102,7 @@ floors:
       E1:
         door_center: [9.975, 3.31]
         car_inward_yaw: 3.141593
-        hall_wait_pose: [10.575, 3.31, 3.141593]
+        hall_wait_pose: [10.975, 3.31, 3.141593]   # 2026-10-27: 1.0 m from the door (was 0.6 m: bumper 27 cm from the door blocked people leaving the car)
         hall_exit_pose: [10.775, 3.31, 0.0]
     rooms:
       "501": {goal: [41.08, -0.2, -1.5708], door: [41.08, -1.17]}

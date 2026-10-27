@@ -74,6 +74,8 @@ def launch_mode(context):
             # Real elevator RF relay (CAN 0x210/0x310/0x311); off unless asked.
             'start_elevator_link': LaunchConfiguration('start_elevator_link'),
             'elevator_link_dry_run': LaunchConfiguration('elevator_link_dry_run'),
+            # Gemini 2 depth camera; the simulation has no camera model.
+            'start_camera': 'false' if sim else LaunchConfiguration('start_camera'),
         }),
         include('localization', {'map': map_path}),
         include('navigation', {
@@ -84,6 +86,11 @@ def launch_mode(context):
             'use_rviz': LaunchConfiguration('use_rviz'),
         }),
     ]
+    if not sim and LaunchConfiguration('start_announcer').perform(context) == 'true':
+        from launch_ros.actions import Node
+        # Voice cues and the driving alert on the HDMI display speaker (PipeWire default sink).
+        actions.append(Node(package='amr_elevator', executable='announcement_player',
+                            name='announcement_player', output='screen'))
     if elevator == 'true':
         # Multi-floor: shared door/floor monitor and mission manager; the simulated
         # elevator relay replaces the real RF -> STM32 -> CAN link (bringup start_elevator_link).
@@ -119,6 +126,11 @@ def generate_launch_description():
         DeclareLaunchArgument('elevator_link_dry_run', default_value='true', choices=['true', 'false'],
                               description='true: no CAN socket (0x210 preview only, no beacon RX); '
                                           'false: receive beacons and press real buttons.'),
+        DeclareLaunchArgument('start_camera', default_value='false', choices=['true', 'false'],
+                              description='mode:=real only: Gemini 2 depth -> global/local costmap STVL layers, '
+                                          'JPEG color -> web snapshot, depth watch in time_health.'),
+        DeclareLaunchArgument('start_announcer', default_value='true', choices=['true', 'false'],
+                              description='mode:=real only: announcement_player (voice + driving alert)'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
         DeclareLaunchArgument('map', default_value=''),
         DeclareLaunchArgument('start_floor', default_value='',

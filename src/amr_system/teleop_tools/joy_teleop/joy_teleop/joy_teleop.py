@@ -413,12 +413,28 @@ class JoyTeleop(Node):
             command.run(self, msg)
 
 
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = JoyTeleop()
+    executor = spin_executor()
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except JoyTeleopException as e:
         node.get_logger().error(e.message)
     except KeyboardInterrupt:

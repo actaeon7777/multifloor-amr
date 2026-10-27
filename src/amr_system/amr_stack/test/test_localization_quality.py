@@ -1,13 +1,275 @@
 """Evidence gates must reject plausible but unsupported localization poses."""
 
+import ast
+from array import array
+from concurrent.futures import ThreadPoolExecutor
+import json
 import math
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
+import amr_stack.localization_quality as localization_quality
 from amr_stack.localization_quality import (
-    MapQuality, covariance_is_bounded, particle_concentration,
+    MapQuality, ScanQuality, covariance_is_bounded, particle_concentration,
 )
+
+
+class TestTime:
+    """Only the timestamp interface needed by the pure startup calculations."""
+
+    __test__ = False
+
+    def __init__(self, *, nanoseconds):
+        self.nanoseconds = nanoseconds
+        self.clock_type = 'ROS_TIME'
+
+    @classmethod
+    def from_msg(cls, stamp):
+        return cls(nanoseconds=stamp.sec * 1_000_000_000 + stamp.nanosec)
+
+
+@pytest.fixture
+def startup_unit():
+    """Execute actual methods without importing ROS or constructing a Node."""
+    path = Path(localization_quality.__file__).with_name('navigation_startup.py')
+    tree = ast.parse(path.read_text())
+    functions = {'compose_se2', 'inverse_se2', 'stamp_ns'}
+    methods = {'tracking_ray_poses', 'scan_args', 'quality_range',
+               'pose_covariance_is_bounded', 'transform_available',
+               'tick', 'set_state', 'publish_status'}
+    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in functions]
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'NavigationStartup')
+    cls.bases = []
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in methods]
+    body.append(cls)
+    namespace = dict(np=np, math=math, json=json, Time=TestTime, String=SimpleNamespace,
+                     time=SimpleNamespace(monotonic=lambda: 100., time=lambda: 200.),
+                     covariance_is_bounded=Mock(wraps=covariance_is_bounded))
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), 'exec'), namespace)
+    node = namespace['NavigationStartup']()
+    node._in_tick = False
+    node._status_dirty = False
+    node._covariance_cache = node._tf_availability_cache = None
+    node.cfg = dict(odom_frame='odom', quality_max_beams=60, quality_max_range=30.,
+                    tracking_quality_max_range=12., global_localization_backend='tim')
+    node.metrics = {}
+    node.prior_verified = True
+    node.ride_prior = False
+    node.get_logger = lambda: SimpleNamespace(info=Mock(), error=Mock())
+    return node, namespace
+
+
+@pytest.mark.parametrize('duration', [.0001, .01, .1, .215])
+@pytest.mark.parametrize('returns', ['mixed', 'none'])
+@pytest.mark.parametrize('heading', [0., math.pi - .03, -math.pi + .03])
+def test_vectorized_tracking_ray_poses_equal_original_loop(startup_unit, duration, returns, heading):
+    node, namespace = startup_unit
+    ranges = np.linspace(.1, 15., 121).astype(np.float32)
+    ranges[::7] = np.nan
+    ranges[::11] = np.inf
+    if returns == 'none':
+        ranges[:] = np.inf
+    node.scan = SimpleNamespace(
+        ranges=array('f', ranges), angle_min=-1., angle_increment=.03,
+        range_min=.01, range_max=30., time_increment=duration / 120,
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=10, nanosec=123), frame_id='laser'))
+    node.map_quality = MapQuality
+    node.valid_scan = lambda scan: True
+    lookups = []
+
+    def transform(target, source, when):
+        lookups.append((target, source, when.nanoseconds))
+        t = (when.nanoseconds - 10_000_000_123) / 1e9
+        theta = heading + 4. * t
+        return (1. + .7*t + .3*math.cos(theta), -.5 + t*t + .3*math.sin(theta),
+                math.atan2(math.sin(theta), math.cos(theta)))
+
+    node.checked_transform = transform
+    laser_pose = (2., -3., heading)
+    expected = loop_tracking_ray_poses_reference(node, laser_pose, namespace)
+    expected_metrics, expected_lookups = node.metrics.copy(), lookups.copy()
+    lookups.clear()
+    actual = node.tracking_ray_poses(laser_pose)
+    assert actual.shape == expected.shape
+    np.testing.assert_allclose(actual, expected, rtol=0., atol=1e-9)
+    assert node.metrics == expected_metrics
+    assert lookups == expected_lookups
+
+
+@pytest.mark.parametrize('scene', ['corridor', 'far_wall', 'leaving_map'])
+@pytest.mark.parametrize('ray_step', [.1, .2, .3, 20.])
+@pytest.mark.parametrize('moving', [False, True])
+def test_ragged_score_equals_dense_reference(scene, ray_step, moving):
+    if scene == 'corridor':
+        grid = np.zeros((20, 140), dtype=int)
+        grid[[0, -1], :] = 100
+        grid[:, [0, -1]] = 100
+        grid[1:8, 50:55] = -1
+        grid[12:19, 70:72] = 100
+        pose, max_range = (2.05, 1.05, .1), 12.
+    elif scene == 'far_wall':
+        grid = np.zeros((80, 450), dtype=int)
+        grid[[0, -1], :] = 100
+        grid[:, [0, -1]] = 100
+        pose, max_range = (2.05, 4.05, 0.), 8.
+    else:
+        grid = np.zeros((30, 40), dtype=int)
+        grid[5:10, 10:15] = -1
+        grid[10:25, 25] = 100
+        pose, max_range = (1.05, 1.55, .3), 12.
+    scan = synthetic_scan(grid, pose, count=96)
+    # Include paths with no interior samples, exact/adjacent step boundaries,
+    # and long measured returns through unknown, walls and map boundaries.
+    scan['ranges'][::9] = [0.1, .3, np.nextafter(.3, 0.), np.nextafter(.3, 1.),
+                           1., 3., 6., 9., 11., 2., 5.]
+    if scene == 'far_wall':
+        # A real endpoint at the room's far wall must be excluded by max_range.
+        scan['range_max'] = 50.
+        scan['ranges'][48] = 42.85
+    indices, _, _ = MapQuality.sampled_rays(**scan, max_beams=73, max_range=max_range)
+    if scene == 'far_wall':
+        assert 48 not in indices
+    poses = None
+    if moving:
+        poses = np.tile(pose, (len(indices), 1))
+        poses[:, 0] += np.linspace(-.1, .2, len(indices))
+        poses[:, 2] += np.linspace(-.2, .2, len(indices))
+    quality = map_quality(grid)
+    args = dict(**scan, laser_pose=pose, max_beams=73, max_range=max_range,
+                ray_step=ray_step, ray_poses=poses)
+    expected = dense_score_reference(quality, **args)
+    actual = quality.score(**args)
+    # Dataclass equality checks every count, ratio and origin_free exactly.
+    assert actual == expected
+    assert actual.valid_beams > 0
+    if scene == 'leaving_map':
+        assert actual.known_beams < actual.valid_beams
+
+
+@pytest.mark.parametrize('ray_step', [.1, .2, .3])
+def test_ragged_score_preserves_strict_step_boundaries_and_empty_paths(ray_step):
+    grid = np.zeros((30, 80), dtype=int)
+    grid[:, 10] = -1
+    grid[:, 20] = 100
+    quality = map_quality(grid, tolerance=.2)
+    stops = np.arange(ray_step, 5., ray_step) + .2
+    ranges = np.column_stack((np.nextafter(stops, 0.), stops,
+                              np.nextafter(stops, np.inf))).ravel()
+    for values in (ranges, [.1, .2, .3], [], [np.inf, np.nan]):
+        args = dict(ranges=values, angle_min=0., angle_increment=.0001,
+                    range_min=.01, range_max=12., laser_pose=(.55, 1.55, 0.),
+                    max_beams=180, ray_step=ray_step)
+        assert quality.score(**args) == dense_score_reference(quality, **args)
+
+
+def prepare_status(node):
+    node.state, node.detail, node.source = 'READY', 'ready', 'manual'
+    node.last_logged_detail, node.last_state_log = '', -math.inf
+    node.verification_requirements = lambda: (1., 4)
+    node.status_pub = SimpleNamespace(publish=Mock())
+    node.generation, node.session = 1, 'test'
+    node.beam_phase, node.applied_beams = 'tracking', 60
+    node.saved_poses, node.map_id = {}, 'map'
+    node.tracking_warning, node.tracking_bad_count = '', 0
+    node.tracking_bad_since = node.good_since = None
+    node.good_count = 0
+    node.tim_metrics, node.refinement_metrics = {}, {}
+    node.remember_pose = Mock()
+
+
+@pytest.mark.parametrize('raises', [False, True])
+def test_tick_coalesces_status_but_outside_callbacks_publish_immediately(startup_unit, raises):
+    node, _ = startup_unit
+    prepare_status(node)
+
+    def advance():
+        node.set_state('VERIFYING', 'checking')
+        node.set_state('READY', 'ready')
+        assert node.status_pub.publish.call_count == 0
+        if raises:
+            raise ValueError('test fault')
+
+    node.advance = advance
+    node.remember_pose = lambda: node.metrics.update(remembered=True)
+    node.tick()
+    assert node.status_pub.publish.call_count == 1
+    payload = json.loads(node.status_pub.publish.call_args.args[0].data)
+    assert payload['state'] == ('FAILED' if raises else 'READY')
+    assert payload['remembered']
+    assert payload['quality_max_range'] == 12.
+    assert not node._in_tick and not node._status_dirty
+    node.set_state('SUSPENDED', 'service callback')
+    assert node.status_pub.publish.call_count == 2
+    assert json.loads(node.status_pub.publish.call_args.args[0].data)['detail'] == 'service callback'
+    # The periodic heartbeat remains even when advance changes nothing.
+    node.advance = lambda: None
+    node.tick()
+    assert node.status_pub.publish.call_count == 3
+
+
+def test_covariance_and_tf_caches_are_scoped_to_tick_and_exact_keys(startup_unit):
+    node, namespace = startup_unit
+    prepare_status(node)
+    checker = namespace['covariance_is_bounded']
+    poses = [SimpleNamespace(pose=SimpleNamespace(covariance=covariance().ravel())),
+             SimpleNamespace(pose=SimpleNamespace(covariance=np.zeros(36)))]
+    node.tf_buffer = SimpleNamespace(can_transform=Mock(return_value=True))
+
+    def advance():
+        for _ in range(2):
+            assert node.pose_covariance_is_bounded(poses[0], math.inf, math.inf)
+            assert not node.pose_covariance_is_bounded(poses[0], .01, .01)
+            assert not node.pose_covariance_is_bounded(poses[1], math.inf, math.inf)
+            for stamp, source in [(1, 'laser'), (2, 'laser'), (1, 'base')]:
+                actual = node.transform_available('odom', source, TestTime(nanoseconds=stamp))
+                assert actual is node.tf_buffer.can_transform.return_value
+
+    node.advance = advance
+    node.tick()
+    assert checker.call_count == node.tf_buffer.can_transform.call_count == 3
+    # TF loss must be observed again on the next tick, never persistently cached.
+    node.tf_buffer.can_transform.return_value = False
+    node.tick()
+    assert checker.call_count == node.tf_buffer.can_transform.call_count == 6
+    assert node._covariance_cache is node._tf_availability_cache is None
+    # Calls from outside a tick never reuse results.
+    for _ in range(2):
+        node.pose_covariance_is_bounded(poses[0], math.inf, math.inf)
+        assert not node.transform_available('odom', 'laser', TestTime(nanoseconds=1))
+    assert checker.call_count == node.tf_buffer.can_transform.call_count == 8
+
+
+def test_readonly_scan_array_survives_new_message_and_threaded_consumers(startup_unit):
+    node, _ = startup_unit
+    grid, pose = room_grid(), (2.05, 2.55, .1)
+    scan = synthetic_scan(grid, pose, count=24)
+    scan['ranges'] = array('f', scan['ranges'])
+    original = scan['ranges'].tobytes()
+    node.scan = SimpleNamespace(**scan)
+    args = node.scan_args()
+    assert isinstance(args['ranges'], np.ndarray)
+    assert not args['ranges'].flags.writeable
+    assert np.shares_memory(args['ranges'], np.asarray(scan['ranges']))
+    with pytest.raises(ValueError):
+        args['ranges'][0] = 0.
+    node.scan = SimpleNamespace(ranges=array('f', [0.]))
+    quality = map_quality(grid)
+    list_args = dict(args, ranges=list(scan['ranges']))
+    consumers = [
+        (quality.score, {}),
+        (quality.find_rival, dict(max_candidates=10)),
+        (quality.refine_pose, dict(position_window=.1, yaw_window=.05, seeds=1)),
+    ]
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        for consumer, extra in consumers:
+            expected = consumer(**list_args, laser_pose=pose, **extra)
+            actual = worker.submit(consumer, **args, laser_pose=pose, **extra).result()
+            assert actual == expected
+    assert scan['ranges'].tobytes() == original
 
 
 def map_quality(grid, resolution=.1, origin=(0., 0., 0.), tolerance=.15):
@@ -378,3 +640,103 @@ def test_empty_scan_requires_an_empty_pose_array_when_acquisition_poses_are_supp
     assert result.match_ratio == 0.
     with pytest.raises(ValueError):
         quality.score(*args, ray_poses=[(2., 2., 0.)])
+
+
+# Frozen pre-optimization reference; do not share the optimized algorithm.
+def dense_score_reference(
+    self, ranges, angle_min, angle_increment, range_min, range_max, laser_pose,
+    max_beams=180, max_range=30.0, ray_step=0.2, ray_poses=None,
+):
+    pose = np.asarray(laser_pose, dtype=float)
+    if pose.shape != (3,) or not np.isfinite(pose).all() or not math.isfinite(ray_step) or ray_step <= 0:
+        raise ValueError('Invalid laser pose or ray sampling step')
+    distances, angles = self._rays(
+        ranges, angle_min, angle_increment, range_min, range_max, max_beams, max_range)
+    ox, oy, in_map = self._cells(pose[0], pose[1])
+    origin_free = bool(in_map & self.free[oy, ox])
+    count = len(distances)
+    if ray_poses is None:
+        poses = np.broadcast_to(pose, (count, 3))
+    else:
+        poses = np.asarray(ray_poses, dtype=float)
+        if poses.shape != (count, 3) or not np.isfinite(poses).all():
+            raise ValueError('Ray poses must contain one finite map-frame laser pose per selected ray')
+    if not count:
+        return ScanQuality(0, 0, 0, 0, 0.0, 0.0, 0.0, origin_free)
+    ox, oy, in_map = self._cells(poses[:, 0], poses[:, 1])
+    origin_free = origin_free and bool(np.all(in_map & self.free[oy, ox]))
+    cosine, sine = np.cos(angles + poses[:, 2]), np.sin(angles + poses[:, 2])
+    gx, gy, inside = self._cells(poses[:, 0] + distances * cosine,
+                               poses[:, 1] + distances * sine)
+    known = inside & self.known[gy, gx]
+    matched = known & self.near_occupied[gy, gx]
+    obstructed = np.zeros(count, dtype=bool)
+    # Count all measured returns in denominators, including points outside
+    # the saved map.  Discarding them can make the wrong map pose score 100%.
+    clearance = max(self.match_tolerance, self.resolution)
+    steps = np.arange(ray_step, max(0.0, distances.max() - clearance), ray_step)
+    if len(steps):
+        active = steps[None, :] < (distances[:, None] - clearance)
+        rx, ry, rinside = self._cells(
+            poses[:, 0, None] + cosine[:, None] * steps,
+            poses[:, 1, None] + sine[:, None] * steps)
+        obstructed = np.any(active & rinside & self.occupied[ry, rx], axis=1)
+        traversable = rinside & self.known[ry, rx]
+        known &= np.all(~active | traversable, axis=1)
+        matched &= known & ~obstructed
+    return ScanQuality(
+        count, int(matched.sum()), int(known.sum()), int(obstructed.sum()),
+        float(matched.mean()), float(known.mean()), float(obstructed.mean()), origin_free)
+
+
+# Frozen pre-optimization reference; do not share the optimized algorithm.
+def loop_tracking_ray_poses_reference(self, laser_pose, helpers):
+    compose_se2, inverse_se2 = helpers['compose_se2'], helpers['inverse_se2']
+    stamp_ns, Time = helpers['stamp_ns'], helpers['Time']
+    self.metrics.update(scan_motion_compensated=False, scan_motion_translation=0.0,
+                        scan_motion_yaw=0.0, scan_duration=0.0)
+    scan = self.scan
+    if not self.prior_verified or scan.time_increment == 0:
+        return None
+    if not self.valid_scan(scan):
+        raise ValueError('Invalid rolling scan metadata')
+    args = self.scan_args()
+    indices, _, _ = self.map_quality.sampled_rays(**args)
+    start_ns = stamp_ns(scan.header.stamp)
+    start = self.checked_transform(self.cfg['odom_frame'], scan.header.frame_id,
+                                   Time.from_msg(scan.header.stamp))
+    correction = compose_se2(laser_pose, inverse_se2(start))
+    poses = []
+    duration = (len(scan.ranges)-1)*scan.time_increment
+    # Check even an invalid/no-return final beam's time. Completeness must
+    # not depend on which ranges happened to survive subsampling.
+    end = self.checked_transform(self.cfg['odom_frame'], scan.header.frame_id,
+                                 Time(nanoseconds=start_ns + round(duration*1e9)))
+    inverse_start = inverse_se2(start)
+    delta = compose_se2(inverse_start, end)
+    translation, rotation = math.hypot(delta[0], delta[1]), abs(delta[2])
+    # One lookup per ray (360 per tick) was 15 % of this node's CPU on the
+    # Jetson. Odometry TF arrives at 30 Hz and tf2 interpolates linearly
+    # between samples, so 10 ms knots lose nothing; interpolate the rest.
+    knot_times = np.arange(0.0, duration, 0.01)
+    if not len(knot_times) or knot_times[-1] < duration:
+        knot_times = np.append(knot_times, duration)
+    knots = []
+    for elapsed in knot_times:
+        odom_laser = (end if elapsed >= duration else self.checked_transform(
+            self.cfg['odom_frame'], scan.header.frame_id, Time(nanoseconds=start_ns + round(elapsed*1e9))))
+        delta = compose_se2(inverse_start, odom_laser)
+        translation = max(translation, math.hypot(delta[0], delta[1]))
+        rotation = max(rotation, abs(delta[2]))
+        knots.append(odom_laser)
+    knots = np.asarray(knots, dtype=float)
+    unwrapped = np.unwrap(knots[:, 2])
+    ray_times = np.asarray(indices, dtype=float)*scan.time_increment
+    for ray_time in ray_times:
+        odom_laser = (float(np.interp(ray_time, knot_times, knots[:, 0])),
+                      float(np.interp(ray_time, knot_times, knots[:, 1])),
+                      float(np.interp(ray_time, knot_times, unwrapped)))
+        poses.append(compose_se2(correction, odom_laser))
+    self.metrics.update(scan_motion_compensated=True, scan_duration=duration,
+                        scan_motion_translation=translation, scan_motion_yaw=rotation)
+    return np.asarray(poses, dtype=float).reshape(-1, 3)

@@ -1,4 +1,5 @@
 """Multi-floor destinations: floor list, other-floor maps and cross-floor goal admission."""
+import dataclasses
 import io
 import json
 import time
@@ -34,7 +35,7 @@ def test_floor_list_rooms_and_maps(shared):
     assert info['current_floor'] == '4F' and info['default_floor'] == '4F'
     third = info['floors'][0]
     assert not third['provisional'] and third['selectable'] and third['real_enabled']
-    assert not info['floors'][2]['real_enabled']  # 5F: no real-vehicle transit yet
+    assert all(f['real_enabled'] for f in info['floors'])
     assert [r['id'] for r in third['rooms']][:2] == ['301', '302']
     assert third['map']['width'] == 1014 and third['map']['resolution'] == .05
     versions = {f['name']: f['map']['version'] for f in info['floors']}
@@ -66,8 +67,13 @@ def test_cross_floor_goal_validation(shared):
 def test_real_vehicle_blocks_disabled_floors_and_unready_missions(shared):
     shared.state['preview'] = False
     shared.simulation = False
+    # Every mapped floor is enabled now; disable one to keep the refusal covered.
+    building = shared.building
+    shared.building = dataclasses.replace(building, floors={
+        **building.floors, '5F': dataclasses.replace(building.floors['5F'], real_enabled=False)})
     with pytest.raises(ApiError, match='실차 층간 이동이 꺼져'):
         goal(shared, '5F')
+    shared.building = building
     shared.simulation = True
     now = time.time()
     shared.update_localization(json.dumps(dict(state='READY', ready=True, detail='ok', source='manual',
@@ -233,3 +239,26 @@ def test_floor_transit_beacon_timeline(shared, monkeypatch):
     now[0] += 61
     rows = {b['label']: b for b in shared.snapshot()['transit']['beacons']}
     assert rows['4F']['presence_age'] is None and rows['4F']['bins'] == [None]*60
+
+
+def test_one_unreadable_floor_map_disables_only_that_floor(monkeypatch):
+    """A malformed map (any exception type) fails its own floor, not the floor list."""
+    from amr_stack import floor_config
+    building = load_floor_config()
+    real = floor_config.load_occupancy_map
+
+    def load(path):
+        if path == building.map_path('3F', simulation=True):
+            raise KeyError('resolution')  # e.g. a YAML key missing from 3F
+        return real(path)
+
+    monkeypatch.setattr(floor_config, 'load_occupancy_map', load)
+    state = SharedState(preview=True)
+    state.set_building(building, simulation=True)
+    info = state.floors_info()
+    maps = {f['name']: f['map'] for f in info['floors']}
+    assert maps['3F'] is None and maps['4F'] is not None and maps['5F'] is not None
+    for _ in range(3):  # the stored error is text: every request raises a fresh ApiError
+        with pytest.raises(ApiError) as error:
+            state.floor_grid('3F')
+        assert error.value.status == 503 and 'KeyError' in str(error.value)

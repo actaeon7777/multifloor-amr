@@ -6,6 +6,7 @@ from threading import Event, Lock, Thread
 from time import time, monotonic
 
 from amr_vehicle_interfaces.msg import MotorStatus
+from builtin_interfaces.msg import Time as TimeMsg
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from nav_msgs.msg import Odometry
 import rclpy
@@ -15,12 +16,25 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
-from rclpy.time import Time
 from sensor_msgs.msg import Imu, JointState
 
 from amr_can_bridge.can_sender import require_interface_up
 from amr_control.time_guard import ClockMonitor
 from amr_can_bridge.telemetry import TELEMETRY_IDS, ImuPairer, WheelOdometry, decode_frame, positive
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 
 
 class CanTelemetry(Node):
@@ -64,9 +78,12 @@ class CanTelemetry(Node):
             self.diag_pub = self.create_publisher(DiagnosticArray, 'diagnostics', 10)
             self.motor_pubs = {side: self.create_publisher(MotorStatus, f'motor/{side}/telemetry', 10)
                                for side in ('left', 'right')}
+            self.init_messages()
+            self.last_joint_publish = None
             self.received = self.invalid = self.stale = self.odom_count = self.imu_count = 0
             self.last_wheel = self.last_imu = None
             self.clock_monitor = ClockMonitor()
+            self.last_clock_check = None
             self.clock_resets = 0
             self.rx_error = ''
             if bus_factory is None:
@@ -97,9 +114,36 @@ class CanTelemetry(Node):
             f'IMU ranges ±{c["accel_range_g"]}g / ±{c["gyro_range_dps"]}dps. '
             'No CAN requests, motor commands or odom TF are sent.')
 
+    def init_messages(self):
+        """Allocate reusable messages before the receive thread starts."""
+        c = self.config
+        self.odom_msg = msg = Odometry()
+        msg.header.frame_id, msg.child_frame_id = c['odom_frame'], c['base_frame']
+        for index in (14, 21, 28):
+            msg.pose.covariance[index] = 1e6
+        for index, variance in zip((0, 7, 14, 21, 28, 35),
+                                   (c['linear_velocity_variance'], .01, 1e6, 1e6, 1e6,
+                                    c['angular_velocity_variance'])):
+            msg.twist.covariance[index] = float(variance)
+        self.joints_msg = joints = JointState()
+        joints.header.frame_id = c['base_frame']
+        joints.name = ['left_drive_wheel_joint', 'right_drive_wheel_joint']
+        joints.position, joints.velocity = [0., 0.], [0., 0.]
+        self.imu_msg = msg = Imu()
+        msg.header.frame_id = c['imu_frame']
+        msg.orientation.w = 1.
+        msg.orientation_covariance[0] = -1.  # No attitude measurement in the CAN protocol.
+        for index in (0, 4, 8):
+            msg.linear_acceleration_covariance[index] = c['accel_variance']
+            msg.angular_velocity_covariance[index] = c['gyro_variance']
+
     @staticmethod
-    def stamp(seconds):
-        return Time(nanoseconds=round(seconds * 1e9)).to_msg()
+    def stamp(seconds, target=None):
+        if target is None:
+            target = TimeMsg()
+        # Preserve the old Time(nanoseconds=round(...)) result, including sub-ns rounding.
+        target.sec, target.nanosec = divmod(round(seconds * 1e9), 10**9)
+        return target
 
     def receive_loop(self):
         while not self.stop_receiving.is_set():
@@ -113,9 +157,19 @@ class CanTelemetry(Node):
                 self.rx_error = str(error)
                 self.stop_receiving.wait(.1)
 
-    def check_clock(self):
+    def check_clock(self, force=False):
+        """Detect a realtime clock step; the receive loop checks at most every 100 ms.
+
+        The jump limit is 0.5 s, so a 100 ms cadence loses nothing, while a
+        check per CAN frame (~240/s) was measurable on the Jetson.
+        """
         with self.lock:
-            if self.clock_monitor.observe(time(), monotonic()):
+            steady = monotonic()
+            if (not force and self.last_clock_check is not None
+                    and steady < self.last_clock_check + .1):
+                return
+            self.last_clock_check = steady
+            if self.clock_monitor.observe(time(), steady):
                 self.wheels.reset_time()
                 self.imu.reset_time()
                 self.last_wheel = self.last_imu = None
@@ -124,7 +178,7 @@ class CanTelemetry(Node):
 
     def poll(self):
         """Drain frames synchronously (tests and callers without the thread)."""
-        self.check_clock()
+        self.check_clock(force=True)
         for _ in range(500):
             message = self.bus.recv(timeout=0.)
             if message is None:
@@ -163,6 +217,8 @@ class CanTelemetry(Node):
 
     def publish_motor(self, kind, values, stamp):
         side, source = kind.split('_', 1)
+        if self.motor_pubs[side].get_subscription_count() == 0:
+            return
         msg = MotorStatus()
         msg.node_id = 1 if side == 'left' else 0
         meta = getattr(msg, source)
@@ -176,42 +232,33 @@ class CanTelemetry(Node):
         self.motor_pubs[side].publish(msg)
 
     def publish_wheel(self, sample):
-        c = self.config
-        msg = Odometry()
-        msg.header.stamp = self.stamp(sample.stamp)
-        msg.header.frame_id, msg.child_frame_id = c['odom_frame'], c['base_frame']
+        msg = self.odom_msg
+        self.stamp(sample.stamp, msg.header.stamp)
         msg.pose.pose.position.x, msg.pose.pose.position.y = sample.x, sample.y
         msg.pose.pose.orientation.z, msg.pose.pose.orientation.w = sin(sample.yaw/2), cos(sample.yaw/2)
         msg.twist.twist.linear.x, msg.twist.twist.angular.z = sample.v, sample.w
         # Conservative diagonal growth; dropouts imply unobserved displacement.
         position_var = .01 + .02*self.wheels.travel + self.wheels.rebases
         yaw_var = .01 + .02*(self.wheels.travel+self.wheels.rotation) + self.wheels.rebases
-        for index, variance in zip((0,7,14,21,28,35),
-                                   (position_var, position_var, 1e6, 1e6, 1e6, yaw_var)):
-            msg.pose.covariance[index] = float(variance)
-        for index, variance in zip((0,7,14,21,28,35),
-                                   (c['linear_velocity_variance'], .01, 1e6, 1e6, 1e6,
-                                    c['angular_velocity_variance'])):
-            msg.twist.covariance[index] = float(variance)
+        msg.pose.covariance[0] = msg.pose.covariance[7] = float(position_var)
+        msg.pose.covariance[35] = float(yaw_var)
         self.odom_pub.publish(msg)
-        joints = JointState()
-        joints.header.stamp = msg.header.stamp
-        joints.header.frame_id = c['base_frame']
-        joints.name = ['left_drive_wheel_joint', 'right_drive_wheel_joint']
-        joints.position, joints.velocity = list(sample.positions), list(sample.velocities)
-        self.joints_pub.publish(joints)
+        steady = monotonic()
+        if self.last_joint_publish is None or steady >= self.last_joint_publish + .1:
+            joints = self.joints_msg
+            self.stamp(sample.stamp, joints.header.stamp)
+            for index in (0, 1):
+                joints.position[index] = sample.positions[index]
+                joints.velocity[index] = sample.velocities[index]
+            self.joints_pub.publish(joints)
+            self.last_joint_publish = steady
         self.last_wheel, self.odom_count = sample.stamp, self.odom_count + 1
 
     def publish_imu(self, sample):
-        msg = Imu()
-        msg.header.stamp, msg.header.frame_id = self.stamp(sample.stamp), self.config['imu_frame']
-        msg.orientation.w = 1.
-        msg.orientation_covariance[0] = -1.  # No attitude measurement in the CAN protocol.
+        msg = self.imu_msg
+        self.stamp(sample.stamp, msg.header.stamp)
         msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z = sample.acceleration
         msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z = sample.angular_velocity
-        for index in (0,4,8):
-            msg.linear_acceleration_covariance[index] = self.config['accel_variance']
-            msg.angular_velocity_covariance[index] = self.config['gyro_variance']
         self.imu_pub.publish(msg)
         self.last_imu, self.imu_count = sample.stamp, self.imu_count + 1
 
@@ -257,26 +304,49 @@ class CanTelemetry(Node):
 
 
 def main(args=None):
-    stop = Event()
+    # Signals only complete the future and wake the executor. Keep the ROS
+    # context alive until close() has finished sending shutdown stop frames.
     previous = {}
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    node = None
+    node = executor = None
     try:
+        executor = spin_executor()
+        stopped = executor.create_future()
+
+        def request_stop(*_):
+            if not stopped.done():
+                stopped.set_result(None)
+                executor.wake()
+
         for signum in (signal.SIGINT, signal.SIGTERM):
-            previous[signum] = signal.signal(signum, lambda *_: stop.set())
+            previous[signum] = signal.signal(signum, request_stop)
         node = CanTelemetry()
-        while rclpy.ok() and not stop.is_set():
-            rclpy.spin_once(node, timeout_sec=.2)  # 1 Hz health timer only
+        executor.add_node(node)
+        # Return to Python regularly: the C++ wait does not dispatch Python signals.
+        while rclpy.ok() and not stopped.done():
+            executor.spin_until_future_complete(stopped, timeout_sec=.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as error:
         rclpy.logging.get_logger('can_telemetry').error(str(error))
         raise SystemExit(1)
     finally:
-        if node is not None:
-            node.close()
-            node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
+        try:
+            try:
+                if executor is not None:
+                    executor.shutdown()
+                    if node is not None:
+                        executor.remove_node(node)
+            finally:
+                if node is not None:
+                    try:
+                        node.close()
+                    finally:
+                        node.destroy_node()
+        finally:
+            try:
+                if rclpy.ok():
+                    rclpy.shutdown()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)

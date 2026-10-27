@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import queue
 import threading
+import time
 
 from .common import HttpClient, loads
 
@@ -37,6 +38,7 @@ class SlackNotifier:
         self.backoff = backoff
         self.queue = queue.Queue(maxsize=queue_size)
         self.stop = threading.Event()
+        self.closing = False
         self.thread = None
         if token is None:
             token = ''
@@ -68,7 +70,7 @@ class SlackNotifier:
         self.thread.start()
 
     def arrival(self, robot_id, room, request_id):
-        if not self.enabled or self.stop.is_set():
+        if not self.enabled or self.closing or self.stop.is_set():
             return
         user = self.rooms.get(room)
         if user is None:
@@ -138,7 +140,16 @@ class SlackNotifier:
             finally:
                 self.queue.task_done()
 
-    def close(self):
+    def close(self, drain=6):
+        """Stop accepting arrivals, let queued DMs go out for up to ``drain`` s, then stop."""
+        self.closing = True
+        if self.thread:
+            deadline = time.monotonic() + drain
+            while self.queue.unfinished_tasks and time.monotonic() < deadline:
+                time.sleep(.05)
+            if self.queue.unfinished_tasks:
+                LOG.warning('Slack: %d arrival notification(s) not sent before shutdown',
+                            self.queue.unfinished_tasks)
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=6)

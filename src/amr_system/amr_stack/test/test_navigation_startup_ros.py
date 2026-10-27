@@ -1191,16 +1191,19 @@ def test_manual_refinement_is_skipped_when_the_robot_never_stops(harnesses):
     assert len(seeds) == 1  # the operator's pose is verified unchanged
 
 
-def test_hall_pose_after_a_ride_is_admitted_at_the_lower_match_limit(harnesses):
+def test_operator_and_hall_poses_are_admitted_at_the_lower_match_limit(harnesses):
     h = harnesses(unique_map=True)
     h.until(lambda: h.supervisor.state == 'WAITING_INITIAL_POSE')
     # Carts and boxes absent from the map return a third of the beams early.
     h.backend.ranges = [r if i % 3 else r/2 for i, r in enumerate(h.backend.ranges)]
     h.set_initial_pose()
-    h.until(lambda: 'match_ratio' in h.supervisor.metrics)
-    h.spin(.6)
+    h.until(lambda: h.supervisor.state == 'READY')
     assert .5 < h.supervisor.metrics['match_ratio'] < .7, h.supervisor.metrics
-    assert h.supervisor.state == 'VERIFYING' and '70%' in h.supervisor.detail
+    assert h.supervisor.source == 'manual' and not h.supervisor.ride_prior
+    # TIM and the automatic search keep the full admission limit.
+    h.supervisor.source = 'auto'
+    assert h.supervisor.admission_min_match() == pytest.approx(.7)
+    h.supervisor.source = 'manual'
     suspend = h.probe.create_client(SetBool, '/localization/suspend')
     h.until(suspend.service_is_ready)
     for value in (True, False):
@@ -1212,14 +1215,8 @@ def test_hall_pose_after_a_ride_is_admitted_at_the_lower_match_limit(harnesses):
     h.until(lambda: h.supervisor.ride_prior)
     h.until(lambda: h.supervisor.state == 'READY')
     assert h.statuses[-1]['ride_prior'] is True
-    # Tracking keeps READY at this ratio too; a later operator click has no
-    # ride prior and faces the full admission limit again.
     h.spin(.6)
     assert h.supervisor.state == 'READY' and not h.supervisor.tracking_warning
-    h.initial_pub.publish(h.backend.estimated_pose())
-    h.until(lambda: not h.supervisor.ride_prior and h.supervisor.state != 'READY')
-    h.spin(.8)
-    assert h.supervisor.state == 'VERIFYING' and '70%' in h.supervisor.detail
 
 
 def test_ready_stopped_pose_is_saved_per_map_and_offered_in_status(harnesses, tmp_path):

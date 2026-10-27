@@ -61,14 +61,19 @@ navigation_startup:
     # legitimately reaches 0.36-0.39 m between distinctive features.
     tracking_max_xy_std: 0.6
     tracking_max_yaw_std: 0.35
-    # Match-ratio limit for the tracking_warning after READY; admission keeps
-    # min_match_ratio 0.70. Objects missing from the map (401 doorway) give
-    # 68-70 % at the correct pose, a cluttered 4F corridor 59 % (2026-10-26).
+    # Match-ratio limit for the tracking_warning after READY. Objects missing
+    # from the map (401 doorway) give 68-70 % at the correct pose, a cluttered
+    # 4F corridor 59 % (2026-10-26).
     tracking_min_match_ratio: 0.50
     max_xy_std: 0.35
     max_yaw_std: 0.25
     min_particle_concentration: 0.90
+    # TIM candidates, the automatic search and a refinement that moves an
+    # operator pose.
     min_match_ratio: 0.70
+    # Operator poses (map click, "마지막 위치 적용"), lowered for the same
+    # clutter as above (2026-10-27).
+    manual_min_match_ratio: 0.50
     # The first /initialpose after an elevator resume (the mission's hall pose)
     # carries a tight prior: beacon-confirmed floor, in-car wall alignment and
     # a straight exit leg. No corridor-copy ambiguity applies, so admit it

@@ -106,6 +106,9 @@ class NavigationStartup(Node):
             tracking_max_xy_std=0.6, tracking_max_yaw_std=0.35, tracking_min_match_ratio=0.50,
             max_xy_std=0.35, max_yaw_std=0.25, min_particle_concentration=0.90,
             min_match_ratio=0.70, min_known_ratio=0.85, min_valid_beams=30,
+            # Operator poses (click, last pose): cluttered corridors score 59-70 % at the
+            # right pose. TIM, the automatic search and refinement keep min_match_ratio.
+            manual_min_match_ratio=0.50,
             # The first /initialpose after an elevator resume carries a tight prior
             # (beacon floor, car alignment, straight exit): admit it at this ratio.
             after_ride_min_match_ratio=0.50,
@@ -124,7 +127,7 @@ class NavigationStartup(Node):
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f'{key} must be positive and finite')
         for key in ('min_match_ratio', 'min_known_ratio', 'min_particle_concentration', 'ambiguity_margin',
-                    'tracking_min_match_ratio', 'after_ride_min_match_ratio'):
+                    'tracking_min_match_ratio', 'after_ride_min_match_ratio', 'manual_min_match_ratio'):
             if self.cfg[key] > 1:
                 raise ValueError(f'{key} must be at most 1')
         for key in ('initialization_max_beams', 'tracking_max_beams', 'quality_max_beams'):
@@ -569,6 +572,12 @@ class NavigationStartup(Node):
                        '지정된 초기 위치에서 스캔·지도 정렬을 확인합니다.' if valid else '유효한 지도 좌표계 초기 위치를 지정하세요.')
 
     def admission_min_match(self):
+        if self.ride_prior:
+            return self.cfg['after_ride_min_match_ratio']
+        return self.cfg['manual_min_match_ratio'] if self.source == 'manual' else self.cfg['min_match_ratio']
+
+    def refinement_min_match(self):
+        # Moving an operator's pose needs the full limit; the hall pose after a ride does not.
         return self.cfg['after_ride_min_match_ratio'] if self.ride_prior else self.cfg['min_match_ratio']
 
     def stationary(self):
@@ -884,7 +893,7 @@ class NavigationStartup(Node):
             refinement_accepted=False)
         if (not quality.origin_free or quality.valid_beams < self.cfg['min_valid_beams']
                 # Strict scores are beam-count quantized; allow a hair of noise.
-                or quality.match_ratio < max(self.admission_min_match(), hint.match_ratio-.02)
+                or quality.match_ratio < max(self.refinement_min_match(), hint.match_ratio-.02)
                 or quality.known_ratio < self.cfg['min_known_ratio']):
             self.get_logger().info(
                 f'주변 스캔 정합 결과가 기준 미달이라 지정한 위치를 그대로 검증합니다. '

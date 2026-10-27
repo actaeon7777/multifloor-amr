@@ -17,6 +17,8 @@ import math
 from pathlib import Path
 from time import monotonic
 
+import numpy as np
+
 from action_msgs.msg import GoalStatus
 from amr_elevator_interfaces.action import NavigateToFloorPose
 from amr_elevator_interfaces.msg import (
@@ -48,12 +50,16 @@ def spin_executor():
     except ImportError:  # older rclpy
         from rclpy.executors import SingleThreadedExecutor
         return SingleThreadedExecutor()
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, PointCloud2, PointField
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from amr_control.time_guard import HealthLease
+from amr_elevator.announcements import ANNOUNCEMENTS
+from amr_elevator.clearance import (
+    boarding_region, cloud_points_xy, exit_region, scan_points, strip_clearance, sweep_hits,
+)
 from amr_elevator.geometry import depth_beyond, wrap
 from amr_elevator.maneuver import DONE, TURN, LineManeuver, ManeuverLimits, travel_clearances
 
@@ -62,6 +68,8 @@ ACTIVE = ('NAV_TO_HALL', 'CALL_ELEVATOR', 'WAIT_DOOR_OPEN', 'BOARDING', 'BACKING
           'RELOCALIZE', 'NAV_TO_GOAL')
 # Phases where the robot may stand in the doorway; stopping there holds the door open.
 DOORWAY = ('BOARDING', 'BACKING_OUT', 'ALIGHTING', 'RETURN_TO_CAR')
+DEPTH_PHASES = ('WAIT_DOOR_OPEN', 'BOARDING', 'BACKING_OUT', 'IN_CAR_ALIGN',
+                'ALIGHTING', 'RETURN_TO_CAR')
 HALF_LENGTH = .32
 STATUS_NAMES = {
     ElevatorCommandStatus.STATUS_DELIVERED: 'DELIVERED',
@@ -137,7 +145,24 @@ class FloorMissionManager(Node):
             # Door-open presses about 1 s apart, repeated by the car beacon itself.
             'door_open_repeat_board': 6, 'door_open_repeat_exit': 10, 'door_open_repeat_hold': 15,
             'door_open_rearm_s': 8., 'door_open_rearm_max': 2,
+            'use_depth': True, 'depth_topic': '/camera/depth/points_filtered', 'depth_max_age': .5,
+            'space_margin': .10, 'wall_margin': .12, 'turn_margin': .05, 'clear_confirm_s': .5,
+            'announce_period': 5., 'board_block_timeout': 15., 'alight_block_timeout': 20.,
+            'turn_block_timeout': 30., 'max_alighting_attempts': 3,
+            'depth_min_height': .06, 'depth_max_height': 1., 'depth_max_range': 3.,
+            'door_cancel_grace': 1.5,
+            'scan_max_age': .5,
         }.items()}
+        for key in ('depth_max_age', 'space_margin', 'wall_margin', 'turn_margin', 'clear_confirm_s',
+                    'announce_period', 'board_block_timeout', 'alight_block_timeout', 'turn_block_timeout',
+                    'max_alighting_attempts', 'depth_min_height', 'depth_max_height',
+                    'depth_max_range', 'door_cancel_grace', 'scan_max_age'):
+            if not math.isfinite(p[key]) or p[key] <= 0.:
+                raise ValueError(f'{key} must be positive and finite')
+        if type(p['max_alighting_attempts']) is not int:
+            raise ValueError('max_alighting_attempts must be an integer')
+        if p['depth_min_height'] >= p['depth_max_height']:
+            raise ValueError('depth_min_height must be less than depth_max_height')
         for key in ('door_open_repeat_board', 'door_open_repeat_exit', 'door_open_repeat_hold'):
             if type(p[key]) is not int or not 0 <= p[key] <= ElevatorCommand.DOOR_OPEN_REPEAT_MAX:
                 raise ValueError(f'{key} must be an integer in [0, {ElevatorCommand.DOOR_OPEN_REPEAT_MAX}]')
@@ -152,9 +177,16 @@ class FloorMissionManager(Node):
         self.door = ElevatorDoorState()
         self.pose = None
         self.scan = None
+        self.scan_received = -math.inf  # monotonic receive time, independent of ROS clock jumps
         self._clearance_scan = None
         self._clearances = (math.inf, math.inf)
         self.laser_pose = None     # laser (x, y, yaw) in base_frame, from TF once
+        self._scan_points = np.empty((0, 2))
+        self._depth_points = np.empty((0, 2))
+        self._depth_clearances = (math.inf, math.inf)
+        self.depth_received = -math.inf
+        self.depth_transform = None
+        self._announced = {}
         self.tf = Buffer()
         self.tf_listener = TransformListener(self.tf, self, spin_thread=False)
         self.mode = 'MANUAL'
@@ -173,6 +205,7 @@ class FloorMissionManager(Node):
         self.seed_after_resume = False
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = self.create_publisher(String, 'floor_mission/status', latched)
+        self.announcement_pub = self.create_publisher(String, 'robot/announcement', 10)
         self.command_pub = self.create_publisher(ElevatorCommand, 'elevator/command', 10)
         self.twist_pub = self.create_publisher(Twist, 'cmd_vel_maneuver', 1)
         self.initial_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
@@ -184,6 +217,8 @@ class FloorMissionManager(Node):
                                  self.on_command_status, 20)
         self.create_subscription(PoseStamped, 'floor/pose_estimate', self.on_pose, 10)
         self.create_subscription(LaserScan, 'scan', self.on_scan, qos_profile_sensor_data)
+        if p['use_depth']:
+            self.create_subscription(PointCloud2, p['depth_topic'], self.on_depth, qos_profile_sensor_data)
         self.create_subscription(String, 'control_mux/mode', self.on_mode, latched)
         self.create_subscription(String, 'estop/status', self.on_estop, latched)
         self.create_subscription(String, 'localization/status', self.on_localization, latched)
@@ -223,7 +258,23 @@ class FloorMissionManager(Node):
         if m.phase in ACTIVE:
             m.timings[m.phase] = m.timings.get(m.phase, 0.) + now - m.phase_since
         m.phase, m.phase_since, m.detail = phase, now, detail
+        for key in ('_clear_since', '_blocked_since', '_align_active_since', '_exit_started',
+                    '_exit_started_at', '_return_wait_since', '_return_arrived', '_prepared',
+                    '_alight_announced',
+                    '_door_not_open_since'):
+            m.counters.pop(key, None)
+        if phase == 'RIDING':
+            for key in ('_last_transit', '_assumed_since', '_assumed_hold'):
+                m.counters.pop(key, None)
+        if phase == 'RETURN_TO_CAR':
+            m.counters.pop('return_open_press', None)
         self.maneuver = None
+        for key in {'BOARDING': ('board_start',), 'SWITCH_MAP': ('arrival',)}.get(phase, ()):
+            self.announce(key)
+        if phase == 'SELECT_FLOOR' and not m.counters.get('_boarding_announced'):
+            self.announce('board_done')
+            self.announce('alight_floor')
+            m.counters['_boarding_announced'] = True
         self.get_logger().info(f'Mission {phase}: {detail}'.rstrip(': '))
         self.publish_status(force=True)
 
@@ -235,10 +286,73 @@ class FloorMissionManager(Node):
         counters[key] = counters.get(key, 0) + 1
         return counters[key]
 
+    def announce(self, key):
+        now = self.now()
+        if now - self._announced.get(key, -math.inf) < self.p['announce_period']:
+            return
+        self._announced[key] = now
+        floor = self.mission.floor if key == 'alight_floor' else self.current_floor()
+        self.announcement_pub.publish(String(data=json.dumps({
+            'key': key, 'text': ANNOUNCEMENTS[key].format(floor=floor),
+            'phase': self.mission.phase, 'floor': floor, 'stamp': now,
+        }, ensure_ascii=False)))
+
+    def depth_fresh(self):
+        return (self.p['use_depth'] and self.depth_transform is not None
+                and 0. <= self.now() - self.depth_received <= self.p['depth_max_age'])
+
+    def scan_fresh(self):
+        return (self.scan is not None and self.laser_pose is not None
+                and 0. <= monotonic() - self.scan_received <= self.p['scan_max_age'])
+
+    def obstacle_points(self):
+        if self.depth_fresh():
+            return np.concatenate((self._scan_points, self._depth_points))
+        return self._scan_points
+
+    def space_clear(self, region):
+        """Require a continuous clear interval with a known pose and laser frame."""
+        clear = False
+        if self.pose is not None and self.scan_fresh():
+            x, y, yaw = self.pose
+            c, s = math.cos(yaw), math.sin(yaw)
+            points = self.obstacle_points() @ np.array(((c, s), (-s, c))) + (x, y)
+            clear = not np.any(region.contains(points))
+        if not clear:
+            self.mission.counters.pop('_clear_since', None)
+            return False
+        since = self.mission.counters.setdefault('_clear_since', self.now())
+        return self.now() - since >= self.p['clear_confirm_s']
+
+    def blocked_for(self, blocked):
+        if not blocked:
+            self.mission.counters.pop('_blocked_since', None)
+            return 0.
+        since = self.mission.counters.setdefault('_blocked_since', self.now())
+        return self.now() - since
+
     def call(self, name, client, request):
         if not client.service_is_ready():
             return False
         self.calls[name] = client.call_async(request)
+        if name == 'suspend' and request.data and self.mission is not None:
+            mission = self.mission
+            mission.counters['_suspend_requested'] = True
+
+            def suspended(future):
+                try:
+                    response = future.result()
+                except Exception:  # a failed RPC never granted suspension
+                    return
+                if response and response.success:
+                    mission.counters['_suspended'] = True
+                    if (self.mission is mission
+                            and mission.counters.pop('_resume_on_suspend_reply', False)):
+                        # A delayed True reply may follow the failure's first False
+                        # request. Send False again so the final state is resumed.
+                        self.seed_after_resume = self.call(
+                            'suspend', self.suspend_client, SetBool.Request(data=False))
+            self.calls[name].add_done_callback(suspended)
         return True
 
     def result(self, name):
@@ -325,6 +439,7 @@ class FloorMissionManager(Node):
 
     def release_lease(self):
         self.publish_twist()
+        self.calls.pop('lease', None)  # an old renewal must not block the next preparation
         if self.lease_client.service_is_ready():
             self.lease_client.call_async(SetBool.Request(data=False))
         self.lease_renewed = -math.inf
@@ -337,7 +452,13 @@ class FloorMissionManager(Node):
         return depth_beyond(self.pose, line, stop.car_inward_yaw)
 
     def clearance(self, reverse):
+        # Received scans always carry a timestamp. Preserve the legacy lazy
+        # projection path for callers that directly supply an unreceived scan.
+        if hasattr(self, 'scan_received') and not FloorMissionManager.scan_fresh(self):
+            return 0.
         if self.scan is None:
+            if getattr(self, 'depth_transform', None) is not None and self.depth_fresh():
+                return self._depth_clearances[bool(reverse)]
             return math.inf
         if self.laser_pose is None:
             # Without the laser frame the scan direction is unknown: hold rather than drive blind.
@@ -350,7 +471,10 @@ class FloorMissionManager(Node):
                 scan.ranges, scan.angle_min, scan.angle_increment,
                 HALF_LENGTH, laser_pose=self.laser_pose)
             self._clearance_scan = scan
-        return self._clearances[bool(reverse)]
+        depth = math.inf
+        if getattr(self, 'depth_transform', None) is not None and self.depth_fresh():
+            depth = self._depth_clearances[bool(reverse)]
+        return min(self._clearances[bool(reverse)], depth)
 
     def drive(self):
         """Advance the current maneuver; True once done."""
@@ -361,8 +485,21 @@ class FloorMissionManager(Node):
             self.publish_twist()
             return False
         self.renew_lease()
+        pending = self.maneuver.pending_turn(self.pose)
+        # Round the safety envelope outward to centimetres (default .40 x .36),
+        # conservatively including the specified 0.40 m near-front contact.
+        turn_blocked = pending is not None and (not self.scan_fresh() or sweep_hits(
+            self.obstacle_points(), pending,
+            half_length=math.ceil((.328 + .02 + self.p['turn_margin']) * 100) / 100,
+            half_width=math.ceil((.287 + .02 + self.p['turn_margin']) * 100) / 100,
+            body_half_length=.328, body_half_width=.287))
         linear, angular = self.maneuver.command(
-            self.pose, self.p['tick_period'], self.clearance(self.maneuver.reverse))
+            self.pose, self.p['tick_period'], self.clearance(self.maneuver.reverse),
+            turn_blocked=turn_blocked)
+        if (self.mission.phase == 'ALIGHTING' and (linear or angular)
+                and not self.mission.counters.get('_alight_announced')):
+            self.announce('alight_start')
+            self.mission.counters['_alight_announced'] = True
         self.publish_twist(linear, angular)
         return self.maneuver.phase == DONE
 
@@ -466,6 +603,7 @@ class FloorMissionManager(Node):
 
     def on_scan(self, message):
         self.scan = message
+        self.scan_received = monotonic()
         if self.laser_pose is None:
             try:
                 t = self.tf.lookup_transform(self.p['base_frame'], message.header.frame_id, Time()).transform
@@ -474,6 +612,50 @@ class FloorMissionManager(Node):
             self.laser_pose = (t.translation.x, t.translation.y, yaw_of(t.rotation))
             self.destroy_subscription(self.tf_listener.tf_sub)
             del self.tf_listener.tf_sub  # TransformListener.unregister must not destroy it twice.
+        self._scan_points = scan_points(message.ranges, message.angle_min, message.angle_increment,
+                                        message.range_min, message.range_max, self.laser_pose)
+        # Keep the established bumper convention and libm boundary handling.
+        ranges = np.asarray(message.ranges, dtype=float)
+        valid = np.isfinite(ranges) & (ranges >= message.range_min) & (ranges <= message.range_max)
+        self._clearances = travel_clearances(np.where(valid, ranges, np.inf),
+                                            message.angle_min, message.angle_increment,
+                                            HALF_LENGTH, half_width=.307, laser_pose=self.laser_pose)
+        self._clearance_scan = message
+
+    def on_depth(self, message):
+        if (not self.p['use_depth'] or self.mission is None
+                or self.mission.phase not in DEPTH_PHASES):
+            return
+        if self.depth_transform is None:
+            try:
+                t = self.tf.lookup_transform(self.p['base_frame'], message.header.frame_id, Time()).transform
+            except TransformException:
+                return
+            q = t.rotation
+            x, y, z, w = q.x, q.y, q.z, q.w
+            rotation = np.array(((1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)),
+                                 (2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)),
+                                 (2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y))))
+            self.depth_transform = ((t.translation.x, t.translation.y, t.translation.z), rotation)
+        # Read float32 XYZ directly: preserve field offsets, endian and row padding
+        # without adding a sensor_msgs_py runtime dependency to this package.
+        fields = {f.name: f for f in message.fields}
+        if any(name not in fields or fields[name].datatype != PointField.FLOAT32
+               or fields[name].count != 1 for name in ('x', 'y', 'z')):
+            return
+        dtype = np.dtype({'names': ['x', 'y', 'z'],
+                          'formats': [('>' if message.is_bigendian else '<') + 'f4'] * 3,
+                          'offsets': [fields[name].offset for name in ('x', 'y', 'z')],
+                          'itemsize': message.point_step})
+        cloud = np.ndarray((message.height, message.width), dtype=dtype, buffer=message.data,
+                           strides=(message.row_step, message.point_step))
+        points = np.column_stack([cloud[name].ravel() for name in ('x', 'y', 'z')])
+        self._depth_points = cloud_points_xy(
+            points, self.depth_transform, self.p['depth_min_height'],
+            self.p['depth_max_height'], self.p['depth_max_range'])
+        self._depth_clearances = tuple(strip_clearance(self._depth_points, reverse, HALF_LENGTH)
+                                       for reverse in (False, True))
+        self.depth_received = self.now()
 
     def on_mode(self, message):
         self.mode = 'AUTO' if message.data == 'AUTO' else 'MANUAL'
@@ -575,6 +757,7 @@ class FloorMissionManager(Node):
             handle, Future(), request.floor,
             (pose.position.x, pose.position.y, yaw_of(pose.orientation)),
             request.destination_id, self.current_floor(), started=self.now())
+        self._announced.clear()
         handle.execute()
         self.set_phase('NAV_TO_GOAL' if request.floor == self.current_floor() else 'NAV_TO_HALL',
                        f'{self.mission.start_floor} -> {request.floor} {request.destination_id}'.strip())
@@ -633,7 +816,16 @@ class FloorMissionManager(Node):
             return
         self.get_logger().error(f'Mission failed safe: {code} {detail}')
         self.release_lease()
+        inside = self.floor_state is not None and self.floor_state.zone == FloorState.ZONE_IN_ELEVATOR
+        if not inside and (self.mission.counters.get('_suspended')
+                           or self.mission.counters.get('_suspend_requested')):
+            self.mission.counters['_resume_on_suspend_reply'] = True
+            self.seed_after_resume = self.call('suspend', self.suspend_client, SetBool.Request(data=False))
         self.finish('FAILED', code, detail)
+        try:
+            self.announce('robot_error')
+        except Exception as error:  # announcement transport must never prevent stopping
+            self.get_logger().warning(f'Failure announcement unavailable: {error!r}')
 
     def publish_status(self, force=False):
         m = self.mission
@@ -674,6 +866,9 @@ class FloorMissionManager(Node):
             if response is not None:
                 self.seed_after_resume = False
                 if response and response.success:
+                    if m is not None:
+                        m.counters.pop('_suspended', None)
+                        m.counters.pop('_suspend_requested', None)
                     self.publish_initial_pose()
         if m is None or m.finished:
             self.estop_event = False
@@ -723,6 +918,10 @@ class FloorMissionManager(Node):
     def phase_call_elevator(self):
         m = self.mission
         here = self.building.floor(self.current_floor() or m.start_floor)
+        if (self.pending is not None and self.pending.acked
+                and self.pending.command[0] == ElevatorCommand.CMD_HALL_CALL):
+            self.announce('call')
+            self.announce('waiting')
         if self.door_state() == ElevatorDoorState.OPEN:
             self.pending = None
             self.set_phase('WAIT_DOOR_OPEN', 'car already here')
@@ -739,41 +938,106 @@ class FloorMissionManager(Node):
 
     def phase_wait_door_open(self):
         m = self.mission
-        if self.door_state() == ElevatorDoorState.OPEN:
-            prepared = m.counters.get('_prepared')
-            if not prepared:
-                if 'suspend' not in self.calls and 'lease' not in self.calls:
-                    self.call('suspend', self.suspend_client, SetBool.Request(data=True))
-                    self.call('lease', self.lease_client, SetBool.Request(data=True))
-                    m.counters['_prepared'] = 'pending'
+        opened = self.door_state() == ElevatorDoorState.OPEN
+        prepared = m.counters.get('_prepared')
+        if opened:
+            m.counters.pop('_door_not_open_since', None)
+        elif prepared:
+            m.counters.setdefault('_door_not_open_since', self.now())
+            m.counters.pop('_clear_since', None)
+        # Drain both preparation replies even if the door closes during the RPCs.
+        # RELOCALIZE must not mistake the old suspend(True) reply for resume(False).
+        if prepared == 'pending':
+            for name in ('suspend', 'lease'):
+                response = self.result(name)
+                if response is not None:
+                    m.counters['_' + name + '_ok'] = bool(response and response.success)
+                    if name == 'suspend' and response and response.success:
+                        m.counters['_suspended'] = True
+            if 'suspend' in self.calls or 'lease' in self.calls:
+                self.publish_twist()
+                if self.elapsed() > self.p['door_wait_timeout']:
+                    self.announce('board_cancel')
+                    self.fail('PREPARE_FAILED', 'preparation did not complete')
                 return
-            if prepared == 'pending':
-                if 'suspend' in self.calls or 'lease' in self.calls:
-                    suspend, lease = self.result('suspend'), self.result('lease')
-                    if suspend is not None:
-                        m.counters['_suspend_ok'] = bool(suspend and suspend.success)
-                    if lease is not None:
-                        m.counters['_lease_ok'] = bool(lease and lease.success)
-                    return
-                if not (m.counters.pop('_suspend_ok', False) and m.counters.pop('_lease_ok', False)):
-                    m.counters.pop('_prepared', None)
-                    self.fail('PREPARE_FAILED', 'localization suspend or maneuver lease refused')
-                    return
-                m.counters.pop('_prepared', None)
-                self.lease_renewed = self.now()
-                self.hold_door(self.p['door_open_repeat_board'])
-                floor = self.current_floor()
-                geometry = self.geometry(floor)
-                self.set_phase('BOARDING')
-                self.maneuver = LineManeuver(geometry.car_pose, final_yaw=geometry.car_pose[2],
-                                             limits=self.limits())
+            suspend = m.counters.pop('_suspend_ok', False)
+            lease = m.counters.pop('_lease_ok', False)
+            if not (suspend and lease):
+                self.fail('PREPARE_FAILED', 'localization suspend or maneuver lease refused')
+                return
+            m.counters['_prepared'] = prepared = True
+            self.lease_renewed = self.now()
+        if prepared and not opened:
+            self.publish_twist()
+            self.renew_lease()
+            since = m.counters['_door_not_open_since']
+            if self.now() - since >= self.p['door_cancel_grace']:
+                self.cancel_wait_boarding('door stayed non-OPEN before boarding')
             return
         if self.elapsed() > self.p['door_wait_timeout']:
             if self.count('recalls') > 1:
-                self.fail('DOOR_NOT_OPENED', 'elevator door did not open')
+                self.announce('board_cancel')
+                self.fail('DOOR_NOT_OPENED', 'elevator door or boarding space unavailable')
+            elif prepared:
+                self.cancel_wait_boarding('boarding space wait expired')
             else:
                 self.pending = None
                 self.set_phase('CALL_ELEVATOR', 'calling again')
+            return
+        if not opened:
+            return
+        if not prepared:
+            if ('suspend' not in self.calls and 'lease' not in self.calls
+                    and self.suspend_client.service_is_ready() and self.lease_client.service_is_ready()):
+                self.call('suspend', self.suspend_client, SetBool.Request(data=True))
+                self.call('lease', self.lease_client, SetBool.Request(data=True))
+                m.counters['_prepared'] = 'pending'
+            self.publish_twist()
+            return
+        self.renew_lease()
+        geometry = self.geometry(self.current_floor() or m.start_floor)
+        # The approach from the wait pose counts too: people leaving the car go first.
+        region = boarding_region(geometry, self.p['space_margin'], self.p['wall_margin'],
+                                 approach_from=self.pose)
+        if not self.space_clear(region):
+            self.publish_twist()
+            self.announce('board_space')
+            return
+        self.hold_door(self.p['door_open_repeat_board'])
+        self.set_phase('BOARDING')
+        self.maneuver = LineManeuver(geometry.car_pose, final_yaw=geometry.car_pose[2],
+                                     limits=self.limits())
+
+    def cancel_wait_boarding(self, reason):
+        self.announce('board_cancel')
+        self.release_lease()
+        if self.count('boarding_attempts') >= self.p['max_boarding_attempts']:
+            self.fail('BOARDING_FAILED', reason)
+            return
+        self.pending = None
+        self.mission.counters['_after_relocalize'] = 'CALL_ELEVATOR'
+        self.set_phase('RELOCALIZE', reason)
+
+    def back_out(self, reason, require_open=True):
+        self.publish_twist()
+        if require_open and self.door_state() != ElevatorDoorState.OPEN:
+            if self.mission.phase == 'BOARDING':
+                inside = self.floor_state is not None and self.floor_state.zone == FloorState.ZONE_IN_ELEVATOR
+                if inside:
+                    self.set_phase('IN_CAR_ALIGN', 'door not open for retreat; staying in the car')
+                elif self.elapsed() > self.p['boarding_timeout']:
+                    self.fail('BOARDING_FAILED', 'door not open for safe retreat')
+            return False
+        self.announce('board_cancel')
+        self.hold_door(self.p['door_open_repeat_board'])
+        self.count('boarding_aborts')
+        self.pending = None  # a previous hall ACK cannot acknowledge the next call
+        stop = self.stop_geometry(self.mission.start_floor)
+        # After a partial 180-degree turn, ALIGN first faces into the car so that
+        # reverse travel still leads to the hall. Its sweep is checked as usual.
+        self.set_phase('BACKING_OUT', reason)
+        self.maneuver = LineManeuver(stop.hall_wait_pose, reverse=True, limits=self.limits())
+        return True
 
     def phase_boarding(self):
         m = self.mission
@@ -782,12 +1046,16 @@ class FloorMissionManager(Node):
         front = None if self.pose is None else self.depth(floor, geometry.hall_door) + HALF_LENGTH
         closing = self.door_state() in (ElevatorDoorState.CLOSING, ElevatorDoorState.CLOSED)
         if closing and front is not None and front < 0.:
-            self.count('boarding_aborts')
-            stop = self.stop_geometry(floor)
-            self.set_phase('BACKING_OUT', 'door closing before the threshold')
-            self.maneuver = LineManeuver(stop.hall_wait_pose, reverse=True, limits=self.limits())
+            self.back_out('door closing before the threshold', require_open=False)
             return
         self.drive()
+        blocked = self.maneuver is not None and self.maneuver.blocked
+        duration = self.blocked_for(blocked)
+        if blocked:
+            self.announce('obstacle')
+            if duration >= self.p['board_block_timeout']:
+                self.back_out('boarding continuously blocked')
+                return
         inside = self.floor_state is not None and self.floor_state.zone == FloorState.ZONE_IN_ELEVATOR
         if self.maneuver is not None and self.maneuver.phase in (TURN, DONE) and inside:
             maneuver = self.maneuver
@@ -795,12 +1063,25 @@ class FloorMissionManager(Node):
             self.maneuver = maneuver
             return
         if self.elapsed() > self.p['boarding_timeout']:
-            self.fail('BOARDING_TIMEOUT', 'could not enter the car')
+            self.back_out('boarding timeout')
 
     def phase_backing_out(self):
+        if self.elapsed() > self.p['boarding_timeout']:
+            self.fail('BACK_OUT_TIMEOUT', 'could not return to the hall')
+            return
+        floor = self.mission.start_floor
+        geometry = self.geometry(floor)
+        outside = (self.pose is not None
+                   and self.depth(floor, geometry.hall_door) + HALF_LENGTH <= 0.)
+        if self.door_state() != ElevatorDoorState.OPEN and not outside:
+            self.publish_twist()
+            self.renew_lease()
+            if self.maneuver is not None:
+                self.maneuver.speed = 0.
+            if self.pose is not None and self.depth(floor, geometry.car_door) + HALF_LENGTH > 0.:
+                self.set_phase('IN_CAR_ALIGN', 'door closed during retreat; staying in the car')
+            return
         if not self.drive():
-            if self.elapsed() > self.p['boarding_timeout']:
-                self.fail('BACK_OUT_TIMEOUT', 'could not return to the hall')
             return
         if self.count('boarding_attempts') >= self.p['max_boarding_attempts']:
             self.fail('BOARDING_FAILED', 'door closed before boarding repeatedly')
@@ -810,13 +1091,35 @@ class FloorMissionManager(Node):
         self.set_phase('RELOCALIZE', 'back in the hall')
 
     def phase_in_car_align(self):
+        if self.elapsed() > 2 * self.p['turn_block_timeout'] + 20.:
+            self.publish_twist()
+            if (self.door_state() == ElevatorDoorState.OPEN
+                    and self.current_floor() == self.mission.start_floor):
+                self.back_out('in-car alignment total time exceeded')
+            else:
+                self.fail('ALIGN_TIMEOUT', 'in-car alignment total time exceeded')
+            return
         if self.maneuver is None:
             geometry = self.geometry(self.current_floor() or self.mission.start_floor)
             self.maneuver = LineManeuver(geometry.car_pose, final_yaw=geometry.car_pose[2], limits=self.limits())
         if self.drive():
             self.publish_twist()
             self.set_phase('SELECT_FLOOR')
-        elif self.elapsed() > 20.:
+            return
+        blocked = self.maneuver.blocked
+        duration = self.blocked_for(blocked)
+        if blocked:
+            self.mission.counters.pop('_align_active_since', None)
+            self.announce('board_space')
+            if duration >= self.p['turn_block_timeout']:
+                if (self.door_state() == ElevatorDoorState.OPEN
+                        and self.current_floor() == self.mission.start_floor):
+                    self.back_out('in-car turn continuously blocked')
+                elif duration >= 2 * self.p['turn_block_timeout']:
+                    self.fail('ALIGN_BLOCKED', 'turn obstructed with no safe boarding cancellation')
+            return
+        since = self.mission.counters.setdefault('_align_active_since', self.now())
+        if self.now() - since > 20.:
             self.fail('ALIGN_TIMEOUT', 'could not turn in the car')
 
     def phase_select_floor(self):
@@ -872,6 +1175,9 @@ class FloorMissionManager(Node):
         m = self.mission
         self.renew_lease()
         self.publish_twist()
+        if m.counters.get('_loaded_map') == m.floor:
+            self.start_alighting()
+            return
         if 'load_map' not in self.calls and not m.counters.get('_map_requested'):
             url = str(self.building.map_path(m.floor, self.p['simulation']))
             if self.call('load_map', self.load_map_client, LoadMap.Request(map_url=url)):
@@ -886,46 +1192,123 @@ class FloorMissionManager(Node):
         if response is False or response.result != LoadMap.Response.RESULT_SUCCESS:
             self.fail('MAP_SWITCH_FAILED', f'load_map failed for {m.floor}')
             return
-        stop = self.stop_geometry(m.floor)
+        m.counters['_loaded_map'] = m.floor
+        self.start_alighting()
+
+    def start_alighting(self):
         self.set_phase('ALIGHTING')
-        self.maneuver = LineManeuver(stop.hall_exit_pose, final_yaw=stop.hall_exit_pose[2], limits=self.limits())
+        # Create the maneuver only after the exit corridor is confirmed clear.
+
+    def return_to_car(self, reason, already_in_car=False):
+        self.publish_twist()
+        self.announce('alight_cancel')
+        self.count('alighting_aborts')
+        if self.count('alighting_attempts') > self.p['max_alighting_attempts']:
+            self.fail('ALIGHTING_FAILED', reason)
+            return
+        geometry = self.geometry(self.mission.floor)
+        if not already_in_car:
+            # Only a body in the doorway needs the door held; from the car centre the
+            # door must be allowed to close so the target floor can be pressed again.
+            self.hold_door(self.p['door_open_repeat_exit'])
+        self.set_phase('RETURN_TO_CAR', reason)
+        if already_in_car:
+            self.mission.counters['_return_arrived'] = True
+            self.mission.counters['_return_wait_since'] = self.now()
+        else:
+            self.maneuver = LineManeuver(geometry.car_pose, reverse=True, limits=self.limits())
 
     def phase_alighting(self):
         m = self.mission
         geometry = self.geometry(m.floor)
         if self.pose is not None:
-            front = -self.depth(m.floor, geometry.car_door) + HALF_LENGTH  # past the car door, outward
+            front = -self.depth(m.floor, geometry.car_door) + HALF_LENGTH
             if self.door_state() in (ElevatorDoorState.CLOSING, ElevatorDoorState.CLOSED) and front < 0.:
-                self.count('alighting_aborts')
-                if self.count('alighting_attempts') > 2:
-                    self.fail('ALIGHTING_FAILED', 'door closed before leaving repeatedly')
-                    return
-                self.hold_door(self.p['door_open_repeat_exit'])
-                self.set_phase('RETURN_TO_CAR', 'door closing before the threshold')
-                self.maneuver = LineManeuver(geometry.car_pose, reverse=True, limits=self.limits())
+                self.return_to_car('door closing before the threshold',
+                                   already_in_car=not m.counters.get('_exit_started'))
                 return
             self.rearm_door_open(geometry)
+        self.renew_lease()
+        if not m.counters.get('_exit_started'):
+            if self.elapsed() >= self.p['alight_block_timeout']:
+                self.return_to_car('exit space total wait expired', already_in_car=True)
+                return
+            stop = self.stop_geometry(m.floor)
+            region = exit_region(geometry, stop.hall_exit_pose, self.p['space_margin'], self.p['wall_margin'])
+            clear = self.space_clear(region)
+            # A clear-confirmation interval is still a hold, but not an obstacle.
+            blocked = not clear and '_clear_since' not in m.counters
+            self.blocked_for(blocked)
+            if not clear:
+                self.publish_twist()
+                if blocked:
+                    self.announce('obstacle')
+                return
+            m.counters['_exit_started'] = True
+            m.counters['_exit_started_at'] = self.now()
+            self.maneuver = LineManeuver(stop.hall_exit_pose, final_yaw=stop.hall_exit_pose[2],
+                                         limits=self.limits())
         done = self.drive()
+        blocked = self.maneuver is not None and self.maneuver.blocked
+        duration = self.blocked_for(blocked)
+        if blocked:
+            self.announce('obstacle')
+            if duration >= self.p['alight_block_timeout']:
+                self.return_to_car('alighting continuously blocked')
+                return
         outside = self.floor_state is not None and self.floor_state.zone == FloorState.ZONE_OUTSIDE
         if done and outside:
+            self.announce('alight_done')
             self.release_lease()
             self.set_phase('RELOCALIZE')
-        elif self.elapsed() > self.p['boarding_timeout']:
-            self.fail('ALIGHTING_TIMEOUT', 'could not leave the car')
+        else:
+            self.check_alighting_timeout()
+
+    def check_alighting_timeout(self):
+        if not self.mission.counters.get('_exit_started'):
+            if self.elapsed() >= self.p['alight_block_timeout']:
+                self.return_to_car('exit space total wait expired', already_in_car=True)
+            return
+        # The drive bound starts with the drive, not with the wait for a clear exit.
+        if self.now() - self.mission.counters['_exit_started_at'] > self.p['boarding_timeout']:
+            floor = self.mission.floor
+            hall = self.geometry(floor).hall_door
+            if self.pose is not None and self.depth(floor, hall) + HALF_LENGTH <= 0.:
+                self.fail('ALIGHTING_TIMEOUT', 'could not leave the car')
+            else:
+                self.return_to_car('alighting timeout before clearing the hall door')
 
     def phase_return_to_car(self):
-        if self.drive():
-            if self.door_state() == ElevatorDoorState.OPEN:
-                stop = self.stop_geometry(self.mission.floor)
-                self.set_phase('ALIGHTING', 'door open again')
-                self.maneuver = LineManeuver(stop.hall_exit_pose, final_yaw=stop.hall_exit_pose[2],
-                                             limits=self.limits())
-            elif self.elapsed() > 15.:
-                if self.p['use_door_open_button'] and self.count('return_open_press') <= 2:
-                    self.hold_door(self.p['door_open_repeat_exit'])
-                    self.mission.phase_since = self.now()
-                else:
-                    self.fail('DOOR_NOT_REOPENED', 'waiting in the car')
+        m = self.mission
+        arrived = m.counters.get('_return_arrived') or (
+            self.maneuver is not None and self.maneuver.phase == DONE)
+        if not arrived:
+            if self.elapsed() > self.p['boarding_timeout']:
+                self.fail('RETURN_BLOCKED', 'return-to-car drive timeout')
+                return
+            done = self.drive()
+            blocked = self.maneuver is not None and self.maneuver.blocked
+            duration = self.blocked_for(blocked)
+            if blocked:
+                self.announce('obstacle')
+                if duration >= self.p['alight_block_timeout']:
+                    self.fail('RETURN_BLOCKED', 'return to car continuously blocked')
+                    return
+            if not done:
+                return
+        m.counters['_return_arrived'] = True
+        self.publish_twist()
+        self.renew_lease()
+        since = m.counters.setdefault('_return_wait_since', self.now())
+        if self.door_state() == ElevatorDoorState.OPEN:
+            self.start_alighting()
+        elif self.now() - since > 15.:
+            if self.p['use_door_open_button'] and self.count('return_open_press') <= 2:
+                self.hold_door(self.p['door_open_repeat_exit'])
+                m.counters['_return_wait_since'] = self.now()
+            else:
+                self.pending = None
+                self.set_phase('SELECT_FLOOR', 'requesting target floor again after canceled exit')
 
     def rearm_door_open(self, geometry):
         """A slow exit outlasts the repeats: extend them once more, not every second."""
@@ -969,6 +1352,8 @@ class FloorMissionManager(Node):
             if response is False or not response.success:
                 self.fail('RESUME_FAILED', 'localization did not resume')
                 return
+            m.counters.pop('_suspended', None)
+            m.counters.pop('_suspend_requested', None)
             m.counters['_relocalize'] = 'seed'
         elif step == 'seed':
             if self.localization.get('state') == 'WAITING_INITIAL_POSE' and self.publish_initial_pose():

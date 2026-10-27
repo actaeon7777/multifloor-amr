@@ -150,3 +150,51 @@ def test_rf_status_board_merges_presence_and_device_status():
     assert any('nRF24' in text for text in board.report(now, live=True)['problems'])
     assert board.level(now + 4., live=False) == ERROR  # Beacon faults persist.
     assert any('0x311' in text for _, text in board.problems(now + 4., live=True))
+
+
+@pytest.mark.parametrize('flag', [
+    'is_extended_id', 'is_remote_frame', 'is_error_frame', 'is_fd', None,
+])
+def test_handle_ignores_foreign_ids_and_non_classic_frames(flag):
+    message = frame(encode_event(PRESENCE), 100.)
+    if flag is None:
+        message.arbitration_id = 0x201
+    else:
+        setattr(message, flag, True)
+    link = ElevatorLink()
+    assert link.handle(message, 100.) is None
+    assert (link.received, link.stale, link.invalid) == (0, 0, 0)
+    assert link.last_error == '' and link.last_error_at is None
+
+
+@pytest.mark.parametrize('stamp,valid', [
+    (99.5, True), (99.499, False), (100.019, True), (100.021, False),
+    (0., False), (-1., False), (float('nan'), False), (float('inf'), False),
+])
+def test_handle_kernel_timestamp_window(stamp, valid):
+    link = ElevatorLink(max_frame_age=.5)
+    result = link.handle(frame(encode_event(PRESENCE), stamp), 100.)
+    assert result == ((PRESENCE, stamp) if valid else None)
+    assert (link.received, link.stale, link.invalid) == (1, int(not valid), 0)
+
+
+def test_handle_matches_poll_records_bytes_counters_and_decode_errors():
+    records = [PRESENCE, CommandStatus(0x19, STATUS_COMPLETED, 0, 0x21, 1),
+               LinkStatus(1, 10, 2, 3, 4), DeviceStatus(0x44, 0x60, 3000, 1)]
+    messages = [frame(encode_event(records[0]), 100.)] + [
+        frame(encode_diagnostic(record), 100., can_id=ELEVATOR_DIAG_CAN_ID)
+        for record in records[1:]]
+    corrupt = bytearray(encode_event(PRESENCE))
+    corrupt[-1] ^= 0xff
+    messages += [frame(bytes(corrupt), 100.), frame(b'', 100.),
+                 frame(encode_event(PRESENCE), 99.), frame(encode_event(PRESENCE), 101.)]
+    direct, polled = ElevatorLink(), ElevatorLink(FakeBus(messages))
+    actual = [result for message in messages if (result := direct.handle(message, 100.))]
+    assert actual == polled.poll(100.) == [(record, 100.) for record in records]
+    assert encode_event(actual[0][0]) == messages[0].data
+    for (record, _), message in zip(actual[1:], messages[1:]):
+        assert encode_diagnostic(record) == message.data
+    for link in (direct, polled):
+        assert (link.received, link.stale, link.invalid) == (8, 2, 2)
+        assert link.last_error and link.last_error_at == 100.
+    assert direct.last_error == polled.last_error

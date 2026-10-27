@@ -185,6 +185,7 @@ class SharedState:
         self.floor_grids = {}
         self.floor_errors = {}
         self.scan_stamp = None
+        self.last_snapshot_at = float('-inf')
         # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
         # Encoded by the camera driver; this process never decodes or re-encodes images.
         self.camera = None
@@ -762,8 +763,39 @@ class SharedState:
                     return '이 웹에서 실행한 취소 가능한 목표가 없습니다.'
             return None
 
+    def layer_png(self, name):
+        """PNG bytes and version of a costmap layer, encoded outside the lock.
+
+        Encoding under the lock on a cache miss made costmap and state
+        callbacks wait for the whole compress (2026-10-27). The cells are
+        copied under the lock and the result is cached only if the grid is
+        still the same object at the same version.
+        """
+        with self.lock:
+            grid = self.grids.get(name)
+            if grid is None:
+                return None, None
+            png, version = grid.cached_png, grid.version
+            raw = None if png is not None else grid.data.tobytes()
+        if png is None:
+            png = grid.render(raw)
+            with self.lock:
+                if self.grids.get(name) is grid and grid.version == version:
+                    grid.png = png
+        return png, version
+
+    def display_wanted(self, now, window=2.):
+        """True while a full (non-kiosk) state client polled within ``window`` s.
+
+        The bridge skips display-only work such as the scan transform when
+        nobody is looking; the kiosk never shows the scan.
+        """
+        return now - self.last_snapshot_at <= window
+
     def snapshot(self, kiosk=False):
         with self.lock:
+            if not kiosk:
+                self.last_snapshot_at = time.monotonic()
             # Writers replace whole entries (set_state), never mutate them, so
             # one level of copying is enough for the per-call edits below. A
             # deepcopy of the 3,240-point scan at 5 Hz per client was 30 % of
@@ -982,12 +1014,7 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                     self.respond(error.status, dict(error=str(error)))
             elif path.startswith('/api/layers/') and path.endswith('.png'):
                 name = path.removeprefix('/api/layers/').removesuffix('.png')
-                with shared.lock:
-                    grid = shared.grids.get(name)
-                    if grid:
-                        png, version = grid.png, grid.version
-                    else:
-                        png = None
+                png, version = shared.layer_png(name)
                 if png is None:
                     self.respond(404, dict(error='아직 레이어 데이터가 없습니다.'))
                 else:

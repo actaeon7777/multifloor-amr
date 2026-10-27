@@ -351,3 +351,56 @@ def test_estop_needs_a_new_lb_press():
     finally:
         mux.destroy_node()
         rclpy.shutdown()
+
+
+def test_mux_callbacks_republish_only_changes_and_the_heartbeat_always():
+    from geometry_msgs.msg import Twist
+    from std_msgs.msg import String
+
+    from amr_control.control_mux import ControlMux
+
+    rclpy.init()
+    mux = ControlMux()
+    sent = []
+    mux.publisher.publish = lambda message: sent.append((message.linear.x, message.angular.z))
+
+    def auto(v):
+        message = Twist()
+        message.linear.x = v
+        mux.on_auto_command(message)
+
+    def joy(lb, linear=0.):
+        message = Joy()
+        message.axes = [0.] * 6
+        message.axes[1] = linear
+        message.buttons = [0] * 15
+        message.buttons[6] = lb
+        mux.on_joy(message)
+
+    try:
+        auto(.1)
+        assert sent == [(pytest.approx(.1), 0.)]
+        auto(.1)
+        auto(.1)
+        mux.on_time_health(String(data='{}'))
+        assert len(sent) == 1  # identical output: wait for the heartbeat
+        mux.publish_heartbeat()
+        mux.publish_heartbeat()
+        assert len(sent) == 3 and sent[-1] == (pytest.approx(.1), 0.)
+        auto(.15)
+        assert len(sent) == 4 and sent[-1] == (pytest.approx(.15), 0.)
+        joy(lb=0)  # an observed release arms manual input; output unchanged
+        assert len(sent) == 4
+        joy(lb=1)  # LB takeover: mode changes, the zero goes out at once
+        assert len(sent) == 5 and sent[-1] == (0., 0.) and mux.gate.mode == 'MANUAL'
+        joy(lb=1)
+        assert len(sent) == 5
+        time.sleep(.15)  # mode_stop_duration: zero output right after the takeover
+        joy(lb=1)
+        manual = Twist()
+        manual.linear.x = .5  # joy_teleop's /cmd_vel_manual while LB is held
+        mux.on_command(manual)
+        assert len(sent) == 6 and sent[-1][0] > 0.
+    finally:
+        mux.destroy_node()
+        rclpy.shutdown()

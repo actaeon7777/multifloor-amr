@@ -23,6 +23,20 @@ from amr_control.time_guard import ClockMonitor
 from amr_can_bridge.telemetry import TELEMETRY_IDS, ImuPairer, WheelOdometry, decode_frame, positive
 
 
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
+
+
 class CanTelemetry(Node):
     def __init__(self, bus_factory=None, **kwargs):
         super().__init__('can_telemetry', **kwargs)
@@ -290,26 +304,49 @@ class CanTelemetry(Node):
 
 
 def main(args=None):
-    stop = Event()
+    # Signals only complete the future and wake the executor. Keep the ROS
+    # context alive until close() has finished sending shutdown stop frames.
     previous = {}
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    node = None
+    node = executor = None
     try:
+        executor = spin_executor()
+        stopped = executor.create_future()
+
+        def request_stop(*_):
+            if not stopped.done():
+                stopped.set_result(None)
+                executor.wake()
+
         for signum in (signal.SIGINT, signal.SIGTERM):
-            previous[signum] = signal.signal(signum, lambda *_: stop.set())
+            previous[signum] = signal.signal(signum, request_stop)
         node = CanTelemetry()
-        while rclpy.ok() and not stop.is_set():
-            rclpy.spin_once(node, timeout_sec=.2)  # 1 Hz health timer only
+        executor.add_node(node)
+        # Return to Python regularly: the C++ wait does not dispatch Python signals.
+        while rclpy.ok() and not stopped.done():
+            executor.spin_until_future_complete(stopped, timeout_sec=.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as error:
         rclpy.logging.get_logger('can_telemetry').error(str(error))
         raise SystemExit(1)
     finally:
-        if node is not None:
-            node.close()
-            node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
+        try:
+            try:
+                if executor is not None:
+                    executor.shutdown()
+                    if node is not None:
+                        executor.remove_node(node)
+            finally:
+                if node is not None:
+                    try:
+                        node.close()
+                    finally:
+                        node.destroy_node()
+        finally:
+            try:
+                if rclpy.ok():
+                    rclpy.shutdown()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)

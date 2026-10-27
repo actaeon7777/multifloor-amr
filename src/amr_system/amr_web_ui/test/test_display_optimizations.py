@@ -230,3 +230,35 @@ def test_http11_handler_frames_multiple_responses_without_sockets(monkeypatch):
     assert bodies[0]['scan']['points'] == bodies[1]['scan']['points'] == [[1.234, -2.345, 5]]
     assert bodies[1]['scan']['age'] >= bodies[0]['scan']['age']
     assert bodies[2] == shared.floors_info()
+
+
+def test_layer_png_encodes_outside_the_lock_and_caches_only_the_same_version(monkeypatch):
+    shared = SharedState(preview=True)
+    grid = Grid(2, 1, 1., [0, 0, 0], [0, 100], costmap=True)
+    shared.grids['local_costmap'] = grid
+    seen = []
+    original = Grid.render
+
+    def render(self, raw=None):
+        seen.append(shared.lock._is_owned())
+        return original(self, raw)
+
+    monkeypatch.setattr(Grid, 'render', render)
+    png, version = shared.layer_png('local_costmap')
+    assert seen == [False] and version == 1 and png == grid.cached_png
+    assert shared.layer_png('local_costmap') == (png, 1) and seen == [False]  # cached
+    assert shared.layer_png('missing') == (None, None)
+
+    # A costmap update between the copy and the cache write must not be cached
+    # under the old version, but the stale image is still returned for it.
+    grid.refresh()
+
+    def render_and_update(self, raw=None):
+        image = original(self, raw)
+        grid.refresh()
+        return image
+
+    monkeypatch.setattr(Grid, 'render', render_and_update)
+    stale, version = shared.layer_png('local_costmap')
+    assert version == 2 and grid.version == 3 and grid.cached_png is None
+    assert Image.open(io.BytesIO(stale)).size == (2, 1)

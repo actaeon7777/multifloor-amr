@@ -143,6 +143,7 @@ def test_scan_fragment_is_reused_per_stamp_and_reset_reacquires(monkeypatch):
     msg.ranges = [1.23456, float('inf'), 2.34567]
     msg.intensities = [12.9, 40., float('nan')]
     WebBridge.on_scan(bridge, msg)
+    bridge.shared.snapshot()  # a full-state client is watching
     WebBridge.update_scan(bridge)
     points = bridge.shared.state['scan']['points']
     assert points == [[1.235, 0., 12], [2.346, 0., None]]
@@ -176,3 +177,26 @@ def test_scan_fragment_is_reused_per_stamp_and_reset_reacquires(monkeypatch):
     WebBridge.on_scan(bridge, msg)
     WebBridge.update_scan(bridge)
     assert bridge.shared.state['scan'] is not None and len(calls) == 3
+
+
+def test_scan_is_transformed_only_while_a_full_state_client_polls():
+    from sensor_msgs.msg import LaserScan
+
+    bridge = SimpleNamespace(shared=SharedState(), pending_scan=None)
+    bridge.transform = lambda frame, stamp: None
+    msg = LaserScan()
+    msg.header.frame_id = 'map'
+    msg.range_min, msg.range_max = .1, 10.
+    msg.ranges = [1.]
+    WebBridge.on_scan(bridge, msg)
+    WebBridge.update_scan(bridge)
+    assert bridge.shared.state['scan'] is None and bridge.pending_scan is not None
+    bridge.shared.snapshot(kiosk=True)  # the kiosk never shows the scan
+    WebBridge.update_scan(bridge)
+    assert bridge.shared.state['scan'] is None
+    bridge.shared.snapshot()
+    WebBridge.update_scan(bridge)
+    assert bridge.shared.state['scan']['points'] == [[1., 0., None]]
+    assert bridge.pending_scan is None
+    assert bridge.shared.display_wanted(bridge.shared.last_snapshot_at + 2.)
+    assert not bridge.shared.display_wanted(bridge.shared.last_snapshot_at + 2.01)

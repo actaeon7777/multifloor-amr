@@ -155,7 +155,11 @@ class WebBridge(Node):
         self.subscriptions_list.append(self.create_subscription(
             CompressedImage, '/camera/color/image_raw/compressed',
             lambda m: self.shared.update_camera(bytes(m.data), m.format), QoSProfile(depth=1)))
-        self.create_timer(.05, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        steady = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(.05, self.tick, clock=steady)
+        # server_is_ready() walks the ROS graph; twice per 50 ms tick was 6 % of
+        # this process on the Jetson. Goal sending re-checks directly.
+        self.create_timer(1., self.update_ready, clock=steady)
 
     def set_state(self, **values):
         with self.shared.lock:
@@ -286,9 +290,15 @@ class WebBridge(Node):
                 if time.monotonic()-received > 2:
                     self.pending_vectors.pop(name, None)
 
+    def update_ready(self):
+        self.set_state(action_ready=self.client.server_is_ready(),
+                       floor_action_ready=bool(self.floor_client and self.floor_client.server_is_ready()))
+
     def update_scan(self):
         if self.pending_scan is None:
             return
+        if not self.shared.display_wanted(time.monotonic()):
+            return  # Display only: nobody polled the full state lately.
         msg, received = self.pending_scan
         stamp = (msg.header.frame_id, msg.header.stamp.sec, msg.header.stamp.nanosec)
         with self.shared.lock:
@@ -610,8 +620,6 @@ class WebBridge(Node):
                 self.request_clock_reset()
         if self.reset_requested or self.seen_epoch != self.shared.connection_epoch:
             self.reset_transport()
-        self.set_state(action_ready=self.client.server_is_ready(),
-                       floor_action_ready=bool(self.floor_client and self.floor_client.server_is_ready()))
         self.update_robot()
         self.update_vectors()
         self.update_scan()

@@ -7,7 +7,6 @@ stopped, then (0, 0) until the STM32 drive gate opens.
 import json
 from math import isfinite
 import signal
-from threading import Event
 from time import monotonic, time
 import uuid
 
@@ -42,6 +41,20 @@ STATE_DETAIL = {
 }
 ARMING_SLOW_DETAIL = ('STM32 주행 준비가 늦어지고 있습니다. '
                       'ODrive 연결·오류 상태를 확인하세요.')
+
+
+def spin_executor():
+    """Spin with rclpy's EventsExecutor when available.
+
+    The default executor rebuilds its wait set in Python on every cycle; on
+    the Jetson that was about half of each Python node's CPU (2026-10-23).
+    """
+    try:
+        from rclpy.experimental import EventsExecutor
+        return EventsExecutor()
+    except ImportError:  # older rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        return SingleThreadedExecutor()
 
 
 class CmdVelToCan(Node):
@@ -292,18 +305,27 @@ class CmdVelToCan(Node):
 
 
 def main(args=None):
-    # Keep the ROS context alive during shutdown so stop frames and previews can
-    # finish. SIGINT/SIGTERM request exit; they do not send from a signal handler.
-    stop_requested = Event()
-    previous_handlers = {}
+    # Signals only complete the future and wake the executor. Keep the ROS
+    # context alive until close() has finished sending shutdown stop frames.
+    previous = {}
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    node = None
+    node = executor = None
     try:
+        executor = spin_executor()
+        stopped = executor.create_future()
+
+        def request_stop(*_):
+            if not stopped.done():
+                stopped.set_result(None)
+                executor.wake()
+
         for signum in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[signum] = signal.signal(signum, lambda *_: stop_requested.set())
+            previous[signum] = signal.signal(signum, request_stop)
         node = CmdVelToCan()
-        while rclpy.ok() and not stop_requested.is_set():
-            rclpy.spin_once(node, timeout_sec=0.05)
+        executor.add_node(node)
+        # Return to Python regularly: the C++ wait does not dispatch Python signals.
+        while rclpy.ok() and not stopped.done():
+            executor.spin_until_future_complete(stopped, timeout_sec=.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except CanInterfaceError as error:
@@ -311,13 +333,21 @@ def main(args=None):
         raise SystemExit(1)
     finally:
         try:
-            if node is not None:
-                try:
-                    node.close()
-                finally:
-                    node.destroy_node()
+            try:
+                if executor is not None:
+                    executor.shutdown()
+                    if node is not None:
+                        executor.remove_node(node)
+            finally:
+                if node is not None:
+                    try:
+                        node.close()
+                    finally:
+                        node.destroy_node()
         finally:
-            if rclpy.ok():
-                rclpy.shutdown()
-            for signum, handler in previous_handlers.items():
-                signal.signal(signum, handler)
+            try:
+                if rclpy.ok():
+                    rclpy.shutdown()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)

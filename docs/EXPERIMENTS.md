@@ -33,6 +33,24 @@
   원자료 `reports/profile/20261025_201213_after_opt.csv`, `pyspy_*_after.txt`.
 - 다음(동작 변경, 실차 시험 필요): control_mux 중복 /cmd_vel 발행, cmd_vel_to_can·elevator_can_link `spin_once` 루프,
   web_ui 20 Hz 틱의 `server_is_ready`, READY 증거 평가 주기, 라이다 빔 수.
+- **정정(2026-10-27)**: 당시 `profile_nodes.py`는 같은 이름의 PID를 모두 한 표본 목록에 넣어 평균했다. 0 %짜리 실행기 PID가
+  섞인 web_ui는 반으로, lifecycle_manager(두 개)는 반으로, gnome-shell(5개)은 1/5로 희석됐고, py-spy 명령행(출력 파일명에 노드 이름)이
+  노드로 잡혔다. 같은 시각의 PID 합으로 다시 집계하면(`profile_nodes.py --summarize`, 처음 5 s 제외):
+  web_ui 26.9→19.6 %, lifecycle_manager 10.6→9.7 %, gnome-shell 0.4→21.6 %(후측정 때 화면이 떠 있었음), 나머지 노드는 위 수치와 같다.
+  위 "파이썬 노드 합계 135→96 %"는 web_ui를 실제 값으로 바꾸면 약 149→106 %다. 스크립트는 이제 PID별 통계와 노드별 합을 함께 내고
+  측정 도구 프로세스를 제외한다.
+
+## 2026-10-27 · CPU 최적화 2차 (동작 소폭 변경, 실차 미검증)
+
+- control_mux: 조이스틱·auto·time_health·estop 콜백은 출력(v, w, 모드)이 바뀔 때만 즉시 발행하고, 20 Hz 타이머는 항상 발행(하류 watchdog
+  기준). AUTO 주행 중 /cmd_vel이 약 60~80 Hz에서 20 Hz가 된다. LB 인계·E-stop 차단·새 명령은 그대로 즉시 나간다.
+- bt_navigator `bt_loop_duration` 10→20 ms: BT tick·피드백이 100→50 Hz. navigation_manager 피드백 역직렬화도 절반.
+- web_ui: `server_is_ready()`를 20 Hz 틱에서 빼고 1 Hz 타이머로(목표 전송 직전 재확인은 그대로). 스캔 변환은 최근 2 s 안에 전체 상태를
+  조회한 클라이언트가 있을 때만(키오스크는 스캔을 안 보므로 제외). costmap PNG 인코딩을 공유 잠금 밖에서 하고 버전이 같을 때만 캐시.
+- cmd_vel_to_can·can_telemetry·elevator_can_link: `rclpy.spin_once` 루프를 EventsExecutor로, 엘리베이터 링크의 10 ms 폴링 타이머를
+  수신 스레드로(Codex Worker `tools/orchestration/tasks/opt2_can_executor.md`).
+- `scripts/build_ros.sh`: `-j2`·`--executor sequential`·`nice`, 실차 스택이 떠 있으면 거부, 시험은 도메인 160·localhost.
+- 실차 전·후 비교는 같은 경로에서 `scripts/profile_nodes.py`로 한다(기준: 위 10-25 후측정의 PID 합 재집계).
 
 ## 2026-10-25 · 깊이 장애물의 전역 우회 경로 연결
 

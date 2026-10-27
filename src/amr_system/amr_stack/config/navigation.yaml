@@ -427,7 +427,10 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_footprint
     odom_topic: /odometry/filtered
-    bt_loop_duration: 10
+    # 20 ms (50 Hz) instead of the 10 ms default: the BT only relays the 20 Hz
+    # controller result, and 100 Hz ticks plus 100 Hz feedback were 13 % of a
+    # Jetson core in bt_navigator and half of navigation_manager's (2026-10-27).
+    bt_loop_duration: 20
     default_server_timeout: 100
     wait_for_service_timeout: 1000
     navigators:

@@ -21,12 +21,12 @@ from rclpy.parameter import Parameter
 from std_msgs.msg import String
 
 from amr_can_bridge import cmd_vel_to_can
+from executor_test_helpers import assert_test_domain, run_main_sigterm
 
 
 @pytest.fixture
 def ros_context():
-    assert os.environ.get('ROS_DOMAIN_ID') == '174'
-    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    assert_test_domain('174')
     rclpy.init()
     yield
     rclpy.shutdown()
@@ -247,6 +247,7 @@ def test_tx_rate_must_keep_the_stm32_gate_open(ros_context, monkeypatch):
 
 @pytest.mark.parametrize('flags', [None, '0x280'])
 def test_startup_interface_failure_exits_cleanly(monkeypatch, tmp_path, capfd, flags):
+    assert_test_domain('174')
     from amr_can_bridge import can_sender
     monkeypatch.setattr(can_sender, 'NET_CLASS_PATH', tmp_path)
     interface = tmp_path / 'can0'
@@ -262,3 +263,13 @@ def test_startup_interface_failure_exits_cleanly(monkeypatch, tmp_path, capfd, f
     assert 'LIVE CAN TX' not in text
     assert 'CAN TX failed' not in text
     assert 'can0' in text
+
+
+def test_main_sigterm_closes_sender_with_shutdown_stops(monkeypatch):
+    assert_test_domain('174')
+    monkeypatch.setattr(cmd_vel_to_can, 'CanSender', FakeSender)
+    node_class = cmd_vel_to_can.CmdVelToCan
+    node = run_main_sigterm(
+        monkeypatch, cmd_vel_to_can, 'CmdVelToCan',
+        lambda: node_class(parameter_overrides=[Parameter('require_estop_status', value=False)]))
+    assert node.sender.closed_with == node.stop_count == 5

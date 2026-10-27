@@ -65,6 +65,11 @@ class ControlMux(Node):
             String, '~/mode', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self.last_mode = None
+        # Input callbacks republish only when the output changes; the timer is
+        # the 20 Hz heartbeat downstream watchdogs rely on. Joy, auto, estop
+        # and time_health callbacks each publishing made ~80 Hz of identical
+        # /cmd_vel on the Jetson (2026-10-27).
+        self.last_output = None
         self.joy_subscription = self.create_subscription(
             Joy, '/joy', self.on_joy,
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
@@ -77,7 +82,7 @@ class ControlMux(Node):
         )
         # Timeouts must still run if ROS simulation time stops or jumps.
         self.timer = self.create_timer(
-            1.0 / rate, self.publish_command, clock=Clock(clock_type=ClockType.STEADY_TIME),
+            1.0 / rate, self.publish_heartbeat, clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
         self.get_logger().info(
             'AUTO by default, with or without a joystick. Pressing LB takes over (MANUAL) and '
@@ -117,7 +122,16 @@ class ControlMux(Node):
         self.estop.receive(message.data)
         self.publish_command()
 
-    def publish_command(self):
+    def publish_heartbeat(self):
+        self.publish_command(force=True)
+
+    def publish_command(self, force=False):
+        """Publish the gate output; without ``force`` only when it changed.
+
+        A change is a new (linear, angular) pair or a new mode: a takeover or
+        an E-stop block republishes its zero at once, identical values wait
+        for the heartbeat.
+        """
         linear, angular = self.gate.output(monotonic())
         if self.require_time_health and self.gate.auto_enabled and not self.time_health.healthy():
             linear = angular = 0.
@@ -130,10 +144,13 @@ class ControlMux(Node):
             linear = angular = 0.
             self.gate.auto_command = self.gate.auto_time = None
             self.gate.manual.stop('estop_not_ready')
-        message = Twist()
-        message.linear.x = linear
-        message.angular.z = angular
-        self.publisher.publish(message)
+        output = (linear, angular, self.gate.mode)
+        if force or output != self.last_output:
+            self.last_output = output
+            message = Twist()
+            message.linear.x = linear
+            message.angular.z = angular
+            self.publisher.publish(message)
         self.publish_status()
 
     def publish_status(self):

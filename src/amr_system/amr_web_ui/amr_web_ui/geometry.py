@@ -70,9 +70,20 @@ class Grid:
     def png(self, value):
         self._png = value
 
-    def render(self):
+    @property
+    def cached_png(self):
+        """The encoded PNG if one exists for the current version, else None."""
+        return self._png
+
+    def render(self, raw=None):
+        """Encode ``raw`` cells (default: a copy of the current data) as PNG.
+
+        Callers holding a lock take ``data.tobytes()`` under it and encode
+        outside: the compress is the slow part and needs no shared state.
+        """
         size = (self.info['width'], self.info['height'])
-        raw = self.data.tobytes()
+        if raw is None:
+            raw = self.data.tobytes()
         if self.costmap:
             image = Image.frombytes('P', size, raw)
             image.putpalette(COST_PALETTE)

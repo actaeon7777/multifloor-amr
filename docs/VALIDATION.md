@@ -65,7 +65,7 @@ CMAKE_BUILD_PARALLEL_LEVEL=2 MAKEFLAGS=-j2 \
 source scripts/env.sh
 ```
 
-`scripts/build_ros.sh`는 빌드 뒤 단위 시험과 격리 ROS 통합 시험(CAN dry-run)까지 실행한다. 시험 로그와 JUnit은 새 폴더에 보관한다.
+`scripts/build_ros.sh`는 위 제한(`-j2`, `--executor sequential`, `nice`)을 기본으로 적용하고 빌드 뒤 단위 시험과 격리 ROS 통합 시험(CAN dry-run, 도메인 160·localhost)까지 실행한다. 실차 스택이 떠 있으면 시작하지 않는다. `--no-rosdep`, `--build-only`, `--packages-select <pkg…>`로 줄일 수 있다. 시험 로그와 JUnit은 새 폴더에 보관한다.
 
 ### 단위·HTTP
 

@@ -14,13 +14,16 @@ from zoneinfo import ZoneInfo
 from .common import (COMMANDS, MAX_MESSAGE, MAX_SUMMARY, PROTOCOL_VERSION, REQUEST_ID,
                      LOCAL_COMMAND_PATHS, valid_command_payload, HttpClient, base_url, dumps, identifier, loads, positive, read_token)
 from .summary import summarize
+from .spool_reader import read_spool, quarantine
+from .common import MAX_EVENT_IMAGE, event_id
 
 LOG = logging.getLogger(__name__)
 
 
 class Agent:
     def __init__(self, server_url, token, robot_id='amr-01', local_url='http://127.0.0.1:8080',
-                 rate=5, timeout=1.5, reconnect_max=10, stop=None):
+                 rate=5, timeout=1.5, reconnect_max=10, stop=None, spool_dir='~/amr_data/events/queue'):
+        self.spool_dir = Path(spool_dir).expanduser()
         self.server_url = base_url(server_url)
         self.local_url = base_url(local_url, local=True)
         self.robot_id = identifier(robot_id)
@@ -130,9 +133,64 @@ class Agent:
             self.execute(command, time.monotonic() - started)
         return summary is not None
 
+    def upload_events(self):
+        pending = read_spool(self.spool_dir)
+        if not pending:
+            return
+        headers = {'Authorization': 'Bearer ' + self.token}
+        status, _, body = self.http.request(self.server_url + '/api/agent/events',
+            dict(protocol=PROTOCOL_VERSION, robot_id=self.robot_id, session_id=self.session_id,
+                 events=[event for _, event in pending]), headers, timeout=self.timeout)
+        if status != 200:
+            if 400 <= status < 500 and status not in (408, 429):
+                for path, _ in pending:
+                    quarantine(path, f'Host rejected events: HTTP {status}')
+            raise ConnectionError(f'Host rejected events: HTTP {status}')
+        reply = loads(body)
+        if not isinstance(reply, dict):
+            raise ValueError('Invalid event acknowledgement')
+        accepted, wanted = reply.get('accepted'), reply.get('want_images')
+        if not isinstance(accepted, list) or not isinstance(wanted, list):
+            raise ValueError('Invalid event acknowledgement')
+        for id in accepted + wanted:
+            event_id(id)
+        ids = {event['id'] for _, event in pending}
+        if not set(wanted) <= set(accepted) <= ids:
+            raise ValueError('Mismatched event acknowledgement')
+        image_sent = False
+        for path, event in pending:
+            if event['id'] not in accepted:
+                continue
+            if event['id'] in wanted:
+                if not event['image_path']:
+                    raise ValueError('Host requested an undeclared image')
+                if image_sent:
+                    continue
+                image = Path(event['image_path'])
+                try:
+                    with image.open('rb') as stream:
+                        data = stream.read(MAX_EVENT_IMAGE + 1)
+                except (FileNotFoundError, PermissionError, IsADirectoryError) as exc:
+                    LOG.warning('Skipping unreadable event image %s: %s', event['id'], type(exc).__name__)
+                    path.unlink(missing_ok=True)
+                    continue
+                if len(data) > MAX_EVENT_IMAGE:
+                    LOG.warning('Skipping event image over 400 KiB: %s', event['id'])
+                else:
+                    image_sent = True
+                    status, _, _ = self.http.request(
+                        self.server_url + '/api/agent/images/' + event['id'], data,
+                        dict(headers, **{'Content-Type': 'image/jpeg'}), timeout=self.timeout)
+                    if status != 204:
+                        if 400 <= status < 500 and status not in (408, 429):
+                            quarantine(path, f'Host rejected event image: HTTP {status}')
+                        raise ConnectionError(f'Host rejected event image: HTTP {status}')
+            path.unlink(missing_ok=True)
+
     def run(self):
         failures, was_online, previous_local = 0, False, None
         last_metrics_log = 0.
+        upload_failures, next_upload = 0, 0.
         while not self.stop.is_set():
             started = time.monotonic()
             try:
@@ -154,6 +212,18 @@ class Agent:
                                 str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__, self.exchange_metrics)
                 was_online = False
                 delay = min(self.reconnect_max, self.interval * 2 ** min(failures, 8))
+            # Event failures must never change state/command exchange backoff.
+            if was_online and not self.stop.is_set() and time.monotonic() >= next_upload:
+                try:
+                    self.upload_events()
+                except Exception as exc:
+                    upload_failures += 1
+                    if upload_failures == 1:
+                        LOG.warning('Event upload unavailable (%s); state exchange continues', exc)
+                    next_upload = time.monotonic() + min(
+                        self.reconnect_max, self.interval * 2 ** min(upload_failures, 8))
+                else:
+                    upload_failures, next_upload = 0, 0.
             self.stop.wait(delay)
 
 
@@ -163,6 +233,7 @@ def main(args=None):
     parser.add_argument('--token-file', required=True)
     parser.add_argument('--robot-id', default='amr-01')
     parser.add_argument('--local-url', default='http://127.0.0.1:8080')
+    parser.add_argument('--spool-dir', default='~/amr_data/events/queue')
     parser.add_argument('--rate', type=float, default=5)
     parser.add_argument('--timeout', type=float, default=1.5)
     parser.add_argument('--log-file', type=Path, help='Diagnostic file; defaults to diagnostics/remote_client under the working directory')
@@ -178,7 +249,7 @@ def main(args=None):
     LOG.info('Remote client diagnostic log: %s', log_file)
     try:
         agent = Agent(options.server_url, read_token(options.token_file), options.robot_id,
-                      options.local_url, options.rate, options.timeout)
+                      options.local_url, options.rate, options.timeout, spool_dir=options.spool_dir)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
     for signum in (signal.SIGINT, signal.SIGTERM):

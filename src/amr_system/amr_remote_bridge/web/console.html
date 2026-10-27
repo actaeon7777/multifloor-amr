@@ -8,8 +8,19 @@
   <script src="/console.js" defer></script>
 </head>
 <body>
-  <header><h1>AMR 중앙 관제</h1><p>로봇 상태와 배송·순찰 현황</p><span id="connection" role="status">연결 중…</span></header>
-  <main><p id="empty">연결된 로봇을 기다리고 있습니다.</p><div id="robots" aria-label="로봇 목록"></div></main>
+  <header><h1>AMR 중앙 관제</h1><p>로봇 상태와 배송·순찰 현황</p><button id="sound-toggle" type="button" aria-pressed="false">알림음 켜기</button> <span id="connection" role="status">연결 중…</span></header>
+  <main><p id="empty">연결된 로봇을 기다리고 있습니다.</p><div id="robots" aria-label="로봇 목록"></div>
+    <section id="event-section" aria-labelledby="event-heading">
+      <div class="event-heading"><h2 id="event-heading">감지 기록</h2>
+        <div class="event-filters" aria-label="기록 필터">
+          <button id="events-all" type="button" aria-pressed="true">전체</button>
+          <button id="events-security" type="button" aria-pressed="false">감지만</button>
+        </div>
+      </div>
+      <p id="event-status" role="status">기록을 불러오는 중…</p>
+      <ol id="events" aria-label="최근 감지 기록"></ol>
+    </section>
+  </main>
   <footer>정지는 최대 수 초 지연될 수 있는 소프트웨어 정지이며, 비상 정지(E-stop)가 아닙니다.</footer>
 </body>
 </html>

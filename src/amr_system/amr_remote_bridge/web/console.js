@@ -145,3 +145,168 @@ async function poll() {
 }
 poll();
 setInterval(poll, 1000);
+
+
+const eventRows = new Map();
+const seenEvents = new Set();
+let eventCursor = 0;
+let eventsInitialized = false;
+let eventPolling = false;
+let securityOnly = false;
+let eventFilterVersion = 0;
+let loadedFilterVersion = -1;
+let visibleEvents = '';
+const eventOrder = (a, b) => b.wall_time - a.wall_time || b.id.localeCompare(a.id);
+let soundEnabled = false;
+let audioContext;
+let titleTimer;
+const normalTitle = document.title;
+const soundToggle = document.querySelector('#sound-toggle');
+try { soundEnabled = localStorage.getItem('amr-event-sound') === 'on'; } catch (_) {}
+function updateSoundToggle() {
+  soundToggle.textContent = soundEnabled ? '알림음 끄기' : '알림음 켜기';
+  soundToggle.setAttribute('aria-pressed', String(soundEnabled));
+  soundToggle.title = soundEnabled && (!audioContext || audioContext.state !== 'running') ?
+    '화면을 클릭하면 알림음이 활성화됩니다.' : '';
+}
+function unlockAudio() {
+  if (!soundEnabled) return;
+  try {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (!Audio) return;
+    if (!audioContext) audioContext = new Audio();
+    audioContext.resume().then(updateSoundToggle).catch(() => {});
+  } catch (_) {}
+}
+soundToggle.addEventListener('click', () => {
+  soundEnabled = !soundEnabled;
+  try { localStorage.setItem('amr-event-sound', soundEnabled ? 'on' : 'off'); } catch (_) {}
+  if (soundEnabled) unlockAudio();
+  else {
+    clearInterval(titleTimer);
+    document.title = normalTitle;
+    if (audioContext) audioContext.suspend().catch(() => {});
+  }
+  updateSoundToggle();
+});
+document.addEventListener('pointerdown', unlockAudio);
+document.addEventListener('keydown', unlockAudio);
+updateSoundToggle();
+function alertEvent() {
+  if (!soundEnabled) return;
+  clearInterval(titleTimer);
+  let flashes = 0;
+  titleTimer = setInterval(() => {
+    document.title = ++flashes % 2 ? '감지 알림 · AMR 중앙 관제' : normalTitle;
+    if (flashes >= 10) { clearInterval(titleTimer); document.title = normalTitle; }
+  }, 500);
+  if (!audioContext || audioContext.state !== 'running') return;
+  for (let n = 0; n < 3; n++) {
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    const start = audioContext.currentTime + n * 0.25;
+    oscillator.frequency.value = 880;
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(0.12, start + 0.01);
+    gain.gain.linearRampToValueAtTime(0, start + 0.13);
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start(start);
+    oscillator.stop(start + 0.15);
+    oscillator.onended = () => { oscillator.disconnect(); gain.disconnect(); };
+  }
+}
+function renderEvents() {
+  const list = document.querySelector('#events');
+  const rows = [...eventRows.values()].sort(eventOrder).slice(0, 50);
+  document.querySelector('#event-status').textContent = rows.length ? '최근 기록 · 2초마다 확인' : '감지 기록이 없습니다.';
+  // seq is a change cursor, not visible content or event chronology.
+  const signature = JSON.stringify(rows.map(e => [e.id, e.wall_time, e.robot_id, e.floor,
+    e.text, e.severity, e.has_image]));
+  if (signature === visibleEvents) return;
+  visibleEvents = signature;
+  list.replaceChildren(...rows.map(e => {
+    const row = element('li', undefined, 'event-row');
+    const copy = element('div', undefined, 'event-copy');
+    const date = new Date(e.wall_time * 1000);
+    const time = date.toLocaleTimeString('ko-KR', {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    copy.append(element('p', `${time} · ${e.robot_id} · ${e.floor || '—'}`, 'event-meta'),
+      element('p', e.text, 'event-text'));
+    const severity = {info: '정보', warn: '주의', alert: '경보'}[e.severity] || '정보';
+    row.append(copy, element('span', severity, `badge ${e.severity === 'alert' ? 'danger' : e.severity === 'info' ? 'safe' : ''}`));
+    if (e.has_image && /^[0-9a-f]{32}$/.test(e.id)) {
+      const link = element('a', undefined, 'event-image');
+      link.href = `/api/events/${e.id}/image.jpg`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.setAttribute('aria-label', `${e.robot_id} 감지 이미지 크게 보기`);
+      const image = element('img');
+      image.src = link.href;
+      image.alt = '감지 스냅숏';
+      image.loading = 'lazy';
+      link.append(image);
+      row.append(link);
+    }
+    return row;
+  }));
+}
+for (const [id, only] of [['events-all', false], ['events-security', true]]) {
+  document.querySelector('#' + id).addEventListener('click', () => {
+    if (securityOnly === only) return;
+    securityOnly = only;
+    eventFilterVersion++;
+    document.querySelector('#events-all').setAttribute('aria-pressed', String(!only));
+    document.querySelector('#events-security').setAttribute('aria-pressed', String(only));
+    document.querySelector('#event-status').textContent = '기록을 불러오는 중…';
+    pollEvents();
+  });
+}
+async function pollEvents() {
+  if (eventPolling) return;
+  eventPolling = true;
+  const filterVersion = eventFilterVersion;
+  const kindQuery = securityOnly ? '&kind_prefix=security.' : '';
+  try {
+    const latestResponse = await fetch('/api/events/latest_seq', {cache: 'no-store', signal: timeoutSignal(2000)});
+    if (!latestResponse.ok) throw new Error('events');
+    const latest = await latestResponse.json();
+    if (filterVersion !== eventFilterVersion) return;
+    const reload = filterVersion !== loadedFilterVersion;
+    if (eventsInitialized && !reload && latest.latest_seq === eventCursor) {
+      renderEvents();
+      return;
+    }
+    // A replaced database starts a new cursor history.
+    if (latest.latest_seq < eventCursor) {
+      eventCursor = 0; eventsInitialized = false; eventRows.clear(); seenEvents.clear();
+    }
+    const response = await fetch(`/api/events?after=${reload ? 0 : eventCursor}&limit=200${kindQuery}`, {cache: 'no-store', signal: timeoutSignal(2000)});
+    if (!response.ok) throw new Error('events');
+    const body = await response.json();
+    if (filterVersion !== eventFilterVersion) return;
+    if (reload) eventRows.clear();
+    let alert = false;
+    for (const e of body.events) {
+      if (eventsInitialized && !reload && !seenEvents.has(e.id) && e.kind.startsWith('security.')) alert = true;
+      seenEvents.add(e.id);
+      eventRows.set(e.id, e);
+    }
+    // Keep only the latest 50; IDs remain remembered to avoid alerts on delayed images.
+    const ordered = [...eventRows.values()].sort(eventOrder);
+    for (const e of ordered.slice(50)) eventRows.delete(e.id);
+    eventCursor = body.latest_seq;
+    loadedFilterVersion = filterVersion;
+    eventsInitialized = true;
+    renderEvents();
+    if (alert) alertEvent();
+  } catch (_) {
+    if (filterVersion === eventFilterVersion) {
+      document.querySelector('#event-status').textContent = '감지 기록 연결 끊김 · 다시 시도 중';
+    }
+  } finally {
+    eventPolling = false;
+    if (filterVersion !== eventFilterVersion) pollEvents();
+  }
+}
+pollEvents();
+setInterval(pollEvents, 2000);

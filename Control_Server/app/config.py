@@ -11,6 +11,9 @@ class Settings:
     token_file: Path = Path.home() / '.config/amr_remote_bridge/token'
     slack_env: Path = Path.home() / '.config/amr_remote_bridge/slack.env'
     slack_rooms: Path = Path.home() / '.config/amr_remote_bridge/slack_rooms.json'
+    data_dir: Path = Path(__file__).resolve().parents[1] / 'data'
+    max_events: int = 5000
+    max_image_bytes: int = 1024**3
     robot_id: str = 'amr-01'
     stale_after: float = 2
     command_timeout: float = 3
@@ -22,6 +25,9 @@ class Settings:
     def from_env(cls):
         defaults = cls()
         return cls(
+            data_dir=Path(os.environ.get('AMR_DATA_DIR', defaults.data_dir)).expanduser(),
+            max_events=int(os.environ.get('AMR_MAX_EVENTS', defaults.max_events)),
+            max_image_bytes=int(os.environ.get('AMR_MAX_IMAGE_BYTES', defaults.max_image_bytes)),
             token_file=Path(os.environ.get('AMR_TOKEN_FILE', defaults.token_file)).expanduser(),
             slack_env=Path(os.environ.get('AMR_SLACK_ENV', defaults.slack_env)).expanduser(),
             slack_rooms=Path(os.environ.get('AMR_SLACK_ROOMS', defaults.slack_rooms)).expanduser(),
@@ -39,4 +45,8 @@ class Settings:
             positive(value)
         if type(self.max_robots) is not int or self.max_robots < 1:
             raise ValueError('AMR_MAX_ROBOTS must be a positive integer')
+        if type(self.max_events) is not int or self.max_events < 1:
+            raise ValueError('AMR_MAX_EVENTS must be a positive integer')
+        if type(self.max_image_bytes) is not int or self.max_image_bytes < 0:
+            raise ValueError('AMR_MAX_IMAGE_BYTES must be a nonnegative integer')
         return read_token(self.token_file)

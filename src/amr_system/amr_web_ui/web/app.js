@@ -23,7 +23,7 @@
   const missionLabels = window.AMRMissionLabels || {};  // transit.js
   const terminal = new Set(['SUCCEEDED', 'CANCELED', 'FAILED', 'REJECTED']);
   const navigationLabels = {IDLE:'목적지 선택', WAITING_NAV2:'주행 준비 중',
-    RUNNING:'이동 중', STOPPING:'주행 종료 처리 중', MANUAL:'수동 조작 중', OVERRIDDEN:'수동 조작으로 중단됨', ESTOP:'E-stop으로 중단됨',
+    HELD:'관리자 정지', RUNNING:'이동 중', STOPPING:'주행 종료 처리 중', MANUAL:'수동 조작 중', OVERRIDDEN:'수동 조작으로 중단됨', ESTOP:'E-stop으로 중단됨',
     SUCCEEDED:'도착했습니다', CANCELED:'주행 취소됨', FAILED:'이동하지 못했습니다', UNKNOWN:'로봇 연결 대기'};
   const details = {IDLE:'지도에서 이동할 위치를 터치하세요.',
     WAITING_NAV2:'목표까지의 주행을 준비하고 있습니다.', RUNNING:'선택한 목적지로 이동하고 있습니다.',
@@ -187,6 +187,15 @@
         (status === 'UNKNOWN' && s.tf_error ? s.tf_error : details[status] || '');
       if (connected && localized() && s.localization.tracking_warning) {
         $('nav-detail').textContent += ` 위치 추적 경고: ${s.localization.tracking_warning}`;
+      }
+    }
+    if (connected && !s.estop?.error && s.estop?.state !== 'ESTOP' && s.mode !== 'MANUAL') {
+      if (s.hold?.held) {
+        $('nav-status').textContent = '관리자 정지';
+        $('nav-detail').textContent = '중앙 관제에서 해제한 뒤 목적지를 다시 지정하세요.';
+      } else if (goal?.origin === 'return_home' && ['SENDING','ACCEPTED','CANCELING'].includes(goal.status)) {
+        $('nav-status').textContent = '관리자 호출로 복귀 중';
+        $('nav-detail').textContent = `${goal.floor} ${goal.room}호`;
       }
     }
     $('nav-status-icon').className = 'nav-status-icon ' +

@@ -43,6 +43,7 @@ def spin_executor():
         return SingleThreadedExecutor()
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
+from amr_control.operator_hold import HOLD_DETAIL, held_value
 from amr_control.time_guard import HealthLease, SessionOrder
 
 OVERRIDE_DETAIL = ('수동 조작(LB)으로 자율주행을 중단했습니다. '
@@ -105,6 +106,7 @@ class NavigationManager(Node):
         self.time_health = HealthLease()
         self.require_estop = self.declare_parameter('require_estop', False).value
         self.estop = HealthLease()
+        self.held = False
         self.localization_order = SessionOrder()
         self.localization_is_ready = False
         self.localization_detail = '위치 준비 상태를 기다립니다.'
@@ -152,6 +154,8 @@ class NavigationManager(Node):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             callback_group=self.group)
         self.create_subscription(String, '/system/time_health', self.on_time_health,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL), callback_group=self.group)
+        self.create_subscription(String, '/operator/hold', self.on_operator_hold,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL), callback_group=self.group)
         self.create_subscription(String, '/estop/status', self.on_estop_status,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL), callback_group=self.group)
@@ -225,6 +229,26 @@ class NavigationManager(Node):
         if request is not None:
             self.get_logger().warning('E-stop observed; aborting navigation goal')
             self.finish(request, 'ESTOP', detail=ESTOP_DETAIL)
+
+    def on_operator_hold(self, message):
+        held = held_value(message.data)
+        if held is None:
+            return
+        self.held = held
+        if not held and self.terminal_status == 'HELD':
+            self.terminal_status = 'IDLE'
+        self.reconcile()
+
+    def enforce_operator_hold(self):
+        if not self.held:
+            return
+        # Preserve a granted elevator lease so its safe-cancel can finish.
+        if self.run is not None:
+            self.run.stopping = True
+        if self.run is not None or self.desired is not None:
+            self.stop_output()
+        if self.desired is not None:
+            self.finish(self.desired, 'HELD', detail=HOLD_DETAIL)
 
     def on_localization_status(self, message):
         try:
@@ -336,6 +360,8 @@ class NavigationManager(Node):
             self.maneuver_command = None
             self.stop_output()
             response.success, response.message = True, 'maneuver lease released'
+        elif self.held:
+            response.success, response.message = False, HOLD_DETAIL
         elif self.mode != 'AUTO':
             response.success, response.message = False, 'manual takeover is active (MANUAL)'
         elif not self.estop_ready():
@@ -357,6 +383,9 @@ class NavigationManager(Node):
             self.maneuver_command = None
 
     def on_goal(self, goal):
+        if self.held:
+            self.get_logger().warning(HOLD_DETAIL)
+            return GoalResponse.REJECT
         if self.mode != 'AUTO':
             self.get_logger().warning('Rejecting goal: manual takeover is active (MANUAL)')
             return GoalResponse.REJECT
@@ -406,6 +435,9 @@ class NavigationManager(Node):
         return CancelResponse.ACCEPT
 
     def on_topic_goal(self, pose):
+        if self.held:
+            self.get_logger().warning(HOLD_DETAIL)
+            return
         if self.mode != 'AUTO':
             self.get_logger().warning('Ignoring /goal_pose: manual takeover is active (MANUAL)')
             return
@@ -436,7 +468,7 @@ class NavigationManager(Node):
 
     def permitted(self):
         run = self.run
-        return (self.localization_ready() and self.mode == 'AUTO' and self.estop_ready()
+        return (not self.held and self.localization_ready() and self.mode == 'AUTO' and self.estop_ready()
                 and run is not None and run.handle is not None
                 and not run.stopping and self.desired is run.request
                 and not run.request.finished and not run.request.handle.is_cancel_requested)
@@ -476,6 +508,9 @@ class NavigationManager(Node):
         self.terminal_status = status
 
     def send(self, request):
+        if self.held:
+            self.enforce_operator_hold()
+            return
         if not self.enforce_localization_readiness():
             return
         goal = deepcopy(request.handle.request)
@@ -555,6 +590,7 @@ class NavigationManager(Node):
     def reconcile(self):
         self.enforce_auto_mode()
         self.enforce_estop()
+        self.enforce_operator_hold()
         ready = self.enforce_localization_readiness()
         now = monotonic()
         run = self.run
@@ -577,7 +613,7 @@ class NavigationManager(Node):
                     run.cancel_future = run.handle.cancel_goal_async()
             # In particular, a fast OFF/ON never starts a second backend goal here.
         elif (ready and self.desired is not None and self.mode == 'AUTO' and now >= self.quiet_until
-              and self.estop_ready()
+              and self.estop_ready() and not self.held
               and not self.desired.handle.is_cancel_requested and self.backend.server_is_ready()):
             self.send(self.desired)
         self.publish_status()
@@ -589,7 +625,8 @@ class NavigationManager(Node):
             if self.run is not None and self.run.stopping:
                 status = 'STOPPING'
             else:
-                status = 'MANUAL' if self.mode != 'AUTO' else self.terminal_status
+                status = ('HELD' if self.held and not self.estop_stopped() else
+                          'MANUAL' if self.mode != 'AUTO' else self.terminal_status)
         elif self.run is not None and self.run.stopping:
             status = 'STOPPING'
         elif self.permitted():

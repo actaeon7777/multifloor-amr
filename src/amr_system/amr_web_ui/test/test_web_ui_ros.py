@@ -477,3 +477,85 @@ def test_estop_status_follows_the_bridge_without_approval():
         for node in (bridge, fake):
             node.destroy_node()
         rclpy.shutdown()
+
+
+def test_operator_stop_sending_resume_and_return_home_over_http():
+    from types import SimpleNamespace
+    assert os.environ.get('ROS_DOMAIN_ID') == '193'
+    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    rclpy.init()
+    shared = SharedState()
+    bridge, manager, scene = WebBridge(shared), NavigationManager(), Scene()
+    executor = SingleThreadedExecutor()
+    for node in (bridge, manager, scene):
+        executor.add_node(node)
+    server = create_http_server(shared, Path(__file__).resolve().parents[1]/'web', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def until(predicate):
+        end = time.monotonic()+8
+        while not predicate():
+            assert time.monotonic() < end, shared.snapshot()
+            executor.spin_once(timeout_sec=.01)
+
+    def post(kind, request_id, **values):
+        req = Request(f'http://127.0.0.1:{server.server_port}/api/{kind}',
+            data=json.dumps(dict(request_id=request_id, **values)).encode(),
+            headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
+        with urlopen(req, timeout=2) as response:
+            assert response.status == 202
+            return json.load(response)
+
+    try:
+        scene.mode_pub.publish(String(data='AUTO'))
+        until(lambda: shared.readiness_error('goal') is None and 'map' in shared.grids)
+        # A late reader must receive the startup false sample without a new change.
+        holds = []
+        scene.create_subscription(String, '/operator/hold', lambda m: holds.append(json.loads(m.data)),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        until(lambda: holds)
+        assert holds[-1]['held'] is False
+        floor = SimpleNamespace(real_enabled=True, rooms={'401': SimpleNamespace(goal=(2., 3., 0.))})
+        shared.building = SimpleNamespace(home=SimpleNamespace(floor='4F', room='401'),
+            floors={'4F': floor}, floor=lambda _name: floor)
+        shared.state['floor'] = dict(floor='4F', zone=1, confidence='CONFIRMED')
+        pose = dict(x=2., y=3., yaw=0., map_version=shared.grids['map'].version)
+        post('goal', 'hold_sending_goal', **pose)
+        bridge.process_command(shared.commands.get_nowait())
+        assert shared.state['goal']['status'] == 'SENDING'
+        stopped = post('stop', 'operator_stop_001')
+        assert stopped['canceled'] == 'hold_sending_goal'
+        until(lambda: holds[-1]['held'] and shared.state['goal']['status'] in ('FAILED', 'CANCELED', 'REJECTED'))
+        until(lambda: manager.run is None and manager.last_status == 'HELD')
+        with pytest.raises(HTTPError) as error:
+            post('goal', 'hold_refused_goal', **pose)
+        assert error.value.code == 409
+        assert post('stop', 'operator_stop_001') == stopped
+        post('resume', 'operator_resume_001')
+        until(lambda: not holds[-1]['held'] and not manager.held and shared.state['pending_request'] is None)
+        count = len(scene.runs)
+        assert manager.desired is None
+        post('goal', 'before_home_goal', **pose)
+        until(lambda: len(scene.runs) > count and shared.state['goal']['status'] == 'ACCEPTED')
+        reply = post('return_home', 'operator_home_001')
+        assert reply['home'] == dict(floor='4F', room='401')
+        until(lambda: shared.state['goal']['request_id'] == 'operator_home_001'
+              and shared.state['goal']['status'] == 'ACCEPTED')
+        assert shared.state['goal']['origin'] == 'return_home'
+        assert shared.state['goal']['kind'] == 'goal'
+        assert shared.snapshot()['task'] == '복귀 중 (401호)'
+        until(lambda: manager.permitted())
+        scene.succeed()
+        until(lambda: shared.state['goal']['status'] == 'SUCCEEDED')
+        assert shared.snapshot()['task'] == '대기'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        executor.shutdown()
+        scene.action.destroy()
+        manager.server.destroy()
+        for node in (bridge, manager, scene):
+            node.destroy_node()
+        rclpy.shutdown()

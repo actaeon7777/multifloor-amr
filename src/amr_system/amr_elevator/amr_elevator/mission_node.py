@@ -55,6 +55,7 @@ from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
+from amr_control.operator_hold import HOLD_DETAIL, held_value
 from amr_control.time_guard import HealthLease
 from amr_elevator.announcements import ANNOUNCEMENTS
 from amr_elevator.clearance import (
@@ -195,6 +196,7 @@ class FloorMissionManager(Node):
         self.tf_listener = TransformListener(self.tf, self, spin_thread=False)
         self.mode = 'MANUAL'
         self.estop = HealthLease()
+        self.held = False
         self.estop_event = False
         self.localization = {}
         self.sequence = 0
@@ -224,6 +226,7 @@ class FloorMissionManager(Node):
         if p['use_depth']:
             self.create_subscription(PointCloud2, p['depth_topic'], self.on_depth, qos_profile_sensor_data)
         self.create_subscription(String, 'control_mux/mode', self.on_mode, latched)
+        self.create_subscription(String, '/operator/hold', self.on_operator_hold, latched)
         self.create_subscription(String, 'estop/status', self.on_estop, latched)
         self.create_subscription(String, 'localization/status', self.on_localization, latched)
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose', callback_group=self.group)
@@ -726,7 +729,18 @@ class FloorMissionManager(Node):
 
     # Action ---------------------------------------------------------------------
 
+    def on_operator_hold(self, message):
+        held = held_value(message.data)
+        if held is None:
+            return
+        self.held = held
+        if held and self.mission is not None and not self.mission.finished:
+            self.cancel()
+
     def on_goal(self, request):
+        if self.held:
+            self.get_logger().warning(HOLD_DETAIL)
+            return GoalResponse.REJECT
         if self.mode != 'AUTO':
             self.get_logger().warning('Rejecting floor mission: manual takeover is active (MANUAL)')
             return GoalResponse.REJECT
@@ -795,8 +809,9 @@ class FloorMissionManager(Node):
                                             message=message or json.dumps({'timings': m.timings}))
         if outcome == 'SUCCEEDED':
             m.handle.succeed()
-        elif outcome == 'CANCELED':
+        elif outcome == 'CANCELED' and m.handle.is_cancel_requested:
             m.handle.canceled()
+        # A topic hold follows cancel cleanup without an action CANCELING transition.
         else:
             m.handle.abort()
         m.phase, m.detail, m.phase_since = outcome if outcome != 'FAILED' else 'FAILED_SAFE', \
@@ -882,7 +897,7 @@ class FloorMissionManager(Node):
             self.estop_event = False
             return
         self.retry_door_open()
-        if m.handle.is_cancel_requested:
+        if m.handle.is_cancel_requested or self.held:
             self.cancel()
             return
         if self.mode != 'AUTO':

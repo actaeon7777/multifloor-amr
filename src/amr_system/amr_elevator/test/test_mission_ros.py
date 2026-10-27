@@ -1088,3 +1088,35 @@ def test_late_suspend_reply_after_prepare_failure_resumes_again_and_seeds(ros, m
     assert ros.spin(1., lambda: ros.calls['localization/suspend'].count(False) == 2)
     assert ros.spin(1., lambda: len(ros.initial_poses) == 2)
     assert node.mission.finished and not node.mission.counters.get('_suspended')
+
+
+def test_operator_hold_cancels_boarding_and_rejects_new_missions(ros):
+    node = manager(ros)
+    publisher = ros.peer.create_publisher(String, '/operator/hold', LATCHED)
+    assert ros.spin(3., lambda: publisher.get_subscription_count() > 0)
+    ros.floor_state()
+    ros.spin(.3)
+    handle = send(ros, '5F', '502')
+    assert handle.accepted
+    keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
+    assert ros.spin(3., lambda: ros.commands)
+    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
+        location=ElevatorBeacon.LOCATION_HALL, floor_code=4, ack_sequence=ros.commands[0].sequence))
+    ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    assert ros.spin(4., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
+    publisher.publish(String(data=json.dumps(dict(held=True, reason='central', stamp=time.time(), sequence=1))))
+    result = handle.get_result_async()
+    assert ros.spin(3., result.done)
+    # Topic cancellation has no action CANCELING transition, so the transport aborts;
+    # mission cleanup, door protection and terminal phase follow action cancel.
+    assert result.result().status == GoalStatus.STATUS_ABORTED
+    assert result.result().result.error_code == 'CANCELED'
+    assert node.held and ros.statuses[-1]['phase'] == 'CANCELED'
+    assert ros.calls['navigation/maneuver_lease'][-1] is False
+    assert ros.spin(1., lambda: ros.calls['localization/suspend'][-1] is False)
+    assert not send(ros, '4F', '402').accepted
+    publisher.publish(String(data=json.dumps(dict(held=False, reason='central', stamp=time.time(), sequence=2))))
+    assert ros.spin(1., lambda: not node.held)
+    assert node.mission.finished
+    assert send(ros, '4F', '402').accepted
+    keep_alive.cancel()

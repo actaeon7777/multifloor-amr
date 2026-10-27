@@ -587,7 +587,7 @@ class NavigationStartup(Node):
     def goal_in_progress(self):
         # MANUAL (LB held) still counts: the operator may drive at any moment.
         return self.nav_status not in ('IDLE', 'SUCCEEDED', 'CANCELED', 'FAILED', 'ESTOP',
-                                       'OVERRIDDEN')
+                                       'OVERRIDDEN', 'HELD')
 
     def on_suspend(self, request, response):
         """Pause verification inside the elevator car; resuming waits for /initialpose.

@@ -229,3 +229,17 @@ def _broken(raw, mutate):
 def test_invalid_configs_are_rejected(raw, mutate, message):
     with pytest.raises(FloorConfigError, match=message):
         parse_floor_config(_broken(raw, mutate))
+
+
+def test_home_valid_and_missing(raw):
+    config = parse_floor_config(raw)
+    assert (config.home.floor, config.home.room) == ('4F', '401')
+    without = copy.deepcopy(raw)
+    without.pop('home')
+    assert parse_floor_config(without).home is None
+
+
+@pytest.mark.parametrize('home', [{'floor': '4F', 'room': '999'}, {'floor': '9F', 'room': '401'}, {}])
+def test_home_must_reference_existing_room(raw, home):
+    with pytest.raises(ValueError, match='home'):
+        parse_floor_config(dict(raw, home=home))

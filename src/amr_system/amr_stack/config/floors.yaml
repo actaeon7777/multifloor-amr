@@ -1,3 +1,5 @@
+# Central console return-home destination.
+home: {floor: "4F", room: "401"}
 # 층·지도·장면·엘리베이터 지점 설정 (층간 이동). 설명: docs/ELEVATOR.md
 #
 # 지도를 교체할 때는 이 파일만 고친다. 파서: amr_stack/floor_config.py

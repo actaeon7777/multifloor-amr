@@ -36,7 +36,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   // Same-floor goals only need the loaded map; a startup floor stays ASSUMED until the hall beacon is heard.
   const floorConfirmed = s => ['BEACON','CONFIRMED'].includes(s?.floor?.confidence);
   function readyForGoal(s) {
-    return Boolean(s?.mode === 'AUTO' && !(s.estop?.required && s.estop.error) && s.estop?.state !== 'ESTOP' &&
+    return Boolean(!s?.hold?.held && s?.mode === 'AUTO' && !(s.estop?.required && s.estop.error) && s.estop?.state !== 'ESTOP' &&
       !MISSION_ACTIVE.has(s.floor_mission?.phase) && s?.localization?.ready && (s.localization.age == null || s.localization.age < 2) &&
       s.action_ready && s.floor?.floor && (floorConfirmed(s) || s.floor.confidence === 'ASSUMED') && s.floor.zone !== 2 &&
       !s.tf_error && !s.localization_reset_pending && !s.pending_request);
@@ -52,10 +52,11 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     if (!s || fetchFailed || stateAgeMs > 3000) return 'connection';
     if ((s.estop?.required && s.estop.error) || s.estop?.state === 'ESTOP') return 'estop';
     if (s.mode === 'MANUAL') return 'manual';
+    if (s.hold?.held) return 'held';
     const active = ACTIVE.has(s.goal?.status);
     if (active && (s.goal.kind === 'floor_goal' || MISSION_ACTIVE.has(s.floor_mission?.phase))) return 'transit';
     if (active || startPending) return 'driving';
-    if (TERMINAL.has(s.goal?.status) && s.goal.room && ownedRequestIds.includes(s.goal.request_id) &&
+    if (s.goal?.origin !== 'return_home' && TERMINAL.has(s.goal?.status) && s.goal.room && ownedRequestIds.includes(s.goal.request_id) &&
         s.goal.request_id !== s.acknowledged_request) return 'arrived';
     return readyForGoal(s) ? 'idle' : 'localizing';
   }
@@ -238,7 +239,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     <main class="body"><div id="screen"></div><div id="sheet" class="scrim" hidden></div>
       <div id="connection" class="scrim connection-overlay" role="status" hidden><div class="sheet"><h2>연결 대기</h2></div></div>
       <div id="toast" role="status" hidden></div></main>`;
-  const stopButton = () => `<div class="stopwrap"><button id="stop" data-action="stop" class="btn stop">${icon('stop')}정지</button><p>정지하면 배송이 취소됩니다</p></div>`;
+  const stopButton = () => `<div id="stop-wrap" class="stopwrap"><button id="stop" data-action="stop" class="btn stop">${icon('stop')}정지</button><p>정지하면 배송이 취소됩니다</p></div>`;
   const mapStage = () => '<div class="stage"><canvas id="map" aria-label="현재 층 지도"></canvas></div>';
   const mapLegend = '<div class="legend"><span><i style="background:#3264f5"></i>로봇</span><span><i style="background:#3264f5;border-radius:3px;height:5px"></i>남은 경로</span><span><i style="background:#1f8f73"></i>배송지</span></div>';
   function floorButtons(adminMode=false) {
@@ -256,18 +257,20 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   const templates = {
     idle:() => idleTemplate(false), localizing:() => idleTemplate(true),
     driving:() => `<div class="drive"><section class="card mapcard"><div class="head"><b id="map-floor"></b></div>${mapStage()}${mapLegend}</section>
-      <aside class="card side"><div><div class="label accent">배송 중</div><h1><span id="drive-room"></span>로<br>배송 중</h1></div>
+      <aside class="card side"><div><div id="drive-label" class="label accent">배송 중</div><h1><span id="drive-room"></span><span id="drive-wording">로<br>배송 중</span></h1></div>
       <div class="progress"><div class="row"><span class="muted">진행률</span><strong><span id="progress-value">0</span><small>%</small></strong></div><div class="bar"><span id="progress-fill"></span></div></div>
       <div class="kv"><div><span>남은 거리</span><b><span id="remaining">—</span><small>m</small></b></div><div id="eta-box" hidden><span>예상 도착</span><b id="eta"></b></div></div>
       <div class="notice">${icon('alert')}통로를 비워 주세요</div>${stopButton()}</aside></div>`,
     transit:() => `<div class="transit"><section id="steps" class="card steps"></section><div class="transit-main">
       <section class="card now-card"><div class="lift"><div id="lift-floor" class="disp"></div><div class="doors"><span></span><span></span></div><div class="bot"></div></div>
       <div><div id="step-number" class="label"></div><h2 id="phase-title"></h2><p id="phase-detail"></p><div class="notice">${icon('lift')}호출 버튼은 로봇이 자동으로 누릅니다</div></div></section>
-      <aside class="card side"><div><div class="label accent">배송지</div><h1 id="transit-destination"></h1></div><div class="kv"><div><span>경과</span><b id="elapsed"></b></div></div>${stopButton()}</aside></div></div>`,
+      <aside class="card side"><div><div id="transit-label" class="label accent">배송지</div><h1 id="transit-destination"></h1></div><div class="kv"><div><span>경과</span><b id="elapsed"></b></div></div>${stopButton()}</aside></div></div>`,
     arrived:() => `<div id="result" class="full ok"><div class="inner"><span id="result-icon" class="big"></span><div><div id="result-label" class="label"></div><h1 id="result-title"></h1>
       <p id="result-detail" class="one-line"></p><button id="ack" data-action="ack" class="btn ok"></button><div id="result-foot" class="foot"></div></div></div>`,
     estop:() => `<div class="full bad"><div class="inner"><span class="big">${icon('stop')}</span><div><div class="label">비상 정지</div><h1>비상 정지 상태</h1><p id="estop-detail"></p>
       <ol><li>주변 안전 확인</li><li>비상 정지 버튼을 돌려서 해제</li><li>배송지 다시 선택</li></ol></div></div></div>`,
+    held:() => `<div class="full warn held"><div class="inner"><span class="big">${icon('hand')}</span><div><div class="label">관리자 정지</div><h1>관리자 정지 중</h1>
+      <p>관리자가 로봇을 잠시 정지했습니다. 해제될 때까지 기다려 주세요.</p></div></div></div>`,
     manual:() => `<div class="full warn"><div class="inner"><span class="big">${icon('hand')}</span><div><div class="label">수동 조작</div><h1>수동 조작 중</h1>
       <p>관리자가 조이스틱으로 조작하고 있습니다.<br>진행 중이던 배송은 취소되었습니다.</p><div class="foot">수동 조작이 끝나면 배송지를 선택할 수 있습니다</div></div></div></div>`,
     admin:() => `<div class="admin-grid"><section class="card mapcard"><div class="head"><span><b>위치 지정</b> · 누른 곳이 위치, 끈 방향이 로봇 방향</span><span id="map-floor"></span></div>${mapStage()}
@@ -286,9 +289,9 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       RELOCALIZE:'위치 확인 중', NAV_TO_GOAL:`${roomLabel(state.goal?.room)}로 배송 중`}[phase] || '승강장 이동 중';
   }
   function renderTop(base) {
-    const labels = {idle:'정상', arrived:'정상', driving:'배송 중', transit:'층간 이동', localizing:'준비 중', estop:'비상 정지', manual:'수동 조작'};
-    setText('status-label', labels[base] || '준비 중');
-    setClass('status-pill', `pill ${base === 'estop' ? 'bad' : ['manual','localizing'].includes(base) ? 'warn' : ''}`);
+    const labels = {idle:'정상', arrived:'정상', driving:'배송 중', transit:'층간 이동', localizing:'준비 중', estop:'비상 정지', manual:'수동 조작', held:'관리자 정지'};
+    setText('status-label', ['driving','transit'].includes(base) && state.goal?.origin === 'return_home' ? '관리자 호출로 복귀 중' : labels[base] || '준비 중');
+    setClass('status-pill', `pill ${base === 'estop' ? 'bad' : ['manual','held','localizing'].includes(base) ? 'warn' : ''}`);
     const location = base === 'arrived' && state.goal?.status === 'SUCCEEDED' ? `${roomLabel(state.goal.room)} 앞` :
       base === 'transit' ? '엘리베이터 앞' : base === 'localizing' ? '위치 확인 중' : base === 'driving' ? '복도' : '현재 위치';
     setText('where', `${floorLabel(currentFloor())} · ${location}`);
@@ -308,7 +311,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   }
   function render() {
     if (document.hidden) return;
-    if (ACTIVE.has(state?.goal?.status) && (admin || pin !== null)) {
+    if (!state?.hold?.held && ACTIVE.has(state?.goal?.status) && (admin || pin !== null)) {
       admin = false; token = null; tokenUntil = 0; pin = null; adminPose = null; gesture = null;
     }
     const base = selectScreen(state, {fetchFailed, stateAgeMs:now()-lastStateAt, startPending:Boolean(flow.pending), ownedRequestIds:owned});
@@ -323,6 +326,8 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       if ($('map')) { mapObserver.observe($('map')); bindMap(); }
     }
     const goal = flow.pending?.payload || state?.goal || {};
+    const returning = goal.origin === 'return_home';
+    setHidden('stop-wrap', returning);
     const cf = currentFloor();
     if (cf !== adminFloor) { adminFloor = cf; adminPose = null; gesture = null; mapCamera = null; }
     setText('map-floor', floorLabel(cf)); setText('mini-floor', floorLabel(cf));
@@ -340,6 +345,8 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       }
     } else if (screen === 'driving') {
       const p = flow.pending ? {percent:0, remaining:null, eta:''} : progress;
+      setText('drive-label', returning ? '관리자 호출로 복귀 중' : '배송 중');
+      setHidden('drive-wording', returning);
       setText('drive-room', roomLabel(goal.room) || '배송지');
       const percent = Math.floor(p?.percent || 0);
       setText('progress-value', percent); setWidth('progress-fill', `${percent}%`);
@@ -352,6 +359,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       setHTML('steps', steps.map((t, i) => `<div class="step ${i+1 < step ? 'done' : i+1 === step ? 'now' : ''}"><span class="n">${i+1 < step ? '✓' : i+1}</span>${esc(t)}</div>`).join(''));
       setText('step-number', `${step} / 6`); setText('phase-title', phaseHeadline(phase));
       setText('phase-detail', step === 3 ? '탑승이 끝날 때까지 출입문 앞을 비워 주세요.' : '통로를 비워 주세요');
+      setText('transit-label', returning ? '관리자 호출로 복귀 중' : '배송지');
       setText('transit-destination', destination); setText('lift-floor', floorLabel(cf));
       const elapsed = Math.max(0, Math.floor(Number.isFinite(state.floor_mission?.elapsed) ? state.floor_mission.elapsed : (now()-(started.get(goal.request_id) ?? now()))/1000));
       setText('elapsed', `${Math.floor(elapsed/60)}:${String(elapsed%60).padStart(2,'0')}`);
@@ -400,7 +408,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   function updateControls() {
     document.querySelectorAll('[data-room]').forEach(b => { const disabled = !canStart(); if (b.disabled !== disabled) b.disabled = disabled; });
     setDisabled('depart', !canStart());
-    setDisabled('admin-button', !online() || busy || ACTIVE.has(state?.goal?.status) || Boolean(flow.pending));
+    setDisabled('admin-button', !online() || busy || (!state?.hold?.held && ACTIVE.has(state?.goal?.status)) || Boolean(flow.pending));
     setDisabled('stop', !online() || flow.stopping || flow.pending?.stopRequested || (!flow.pending &&
       (!ACTIVE.has(state?.goal?.status) || state?.goal?.status === 'CANCELING')));
     setDisabled('ack', !online() || busy);
@@ -455,7 +463,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
         break;
       }
       case 'admin':
-        if (!online() || busy || ACTIVE.has(state?.goal?.status) || flow.pending) break;
+        if (!online() || busy || (!state?.hold?.held && ACTIVE.has(state?.goal?.status)) || flow.pending) break;
         selection = null; lastAdminInput = now();
         if (state.kiosk?.pin_required && !token) pin = '';
         else admin = true;

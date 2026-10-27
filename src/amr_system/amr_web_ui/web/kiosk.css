@@ -177,3 +177,5 @@ button:disabled{cursor:default;opacity:.45}.rooms.locked .room:disabled{opacity:
 .pin-pad button[data-pin="지우기"]{font-size:20px}.pin-sheet .btn{height:68px}
 .admin .gear{color:#fff}.admin .where b{max-width:225px}
 .now-card>div:last-child{min-width:0}.now-card h2{overflow-wrap:break-word}
+
+.full.held p { max-width: 32em; }

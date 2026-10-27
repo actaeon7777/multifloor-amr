@@ -2,7 +2,7 @@
 import json
 import math
 
-from .server import ScanPoints, delivery_announcement
+from .server import ScanPoints, delivery_announcement, ACTIVE_GOALS
 
 import numpy as np
 import queue
@@ -89,6 +89,10 @@ class WebBridge(Node):
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
         self.announcement_pub = self.create_publisher(String, '/robot/announcement', 10)
         self.shared.announce = self.announce
+        self.hold_pub = self.create_publisher(String, '/operator/hold',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.hold_pub.publish(String(data=json.dumps(dict(
+            held=False, reason='', stamp=time.time(), sequence=0))))
         self.goal_handle = None
         self.goal_id = None
         self.pending_scan = None
@@ -430,6 +434,7 @@ class WebBridge(Node):
             self.goal_handle = None
             self.set_state(goal=dict(x=pose[0], y=pose[1], yaw=pose[2], request_id=request_id,
                                      kind=kind, status='SENDING',
+                                     **({'origin': command['origin']} if command.get('origin') else {}),
                                      **({key: command[key] for key in ('floor', 'room')}
                                         if command.get('room') else {})))
             with self.shared.lock:
@@ -527,7 +532,8 @@ class WebBridge(Node):
         self.goal_id = request_id
         self.goal_handle = None
         self.set_state(goal=dict(x=pose[0], y=pose[1], yaw=pose[2], request_id=request_id, kind='floor_goal',
-                                 floor=floor, room=room, status='SENDING'))
+                                 floor=floor, room=room, status='SENDING',
+                                 **({'origin': command['origin']} if command.get('origin') else {})))
         with self.shared.lock:
             self.shared.telemetry.begin_journey(request_id)
         goal = NavigateToFloorPose.Goal(floor=floor, destination_id=room)
@@ -577,8 +583,12 @@ class WebBridge(Node):
         try:
             handle = future.result()
             if not handle.accepted:
-                self.goal_state(request_id, status='REJECTED')
-                self.shared.complete(request_id, 'REJECTED', '목표가 거절되었습니다.')
+                # A hold that lands before the goal request makes the manager reject it; that
+                # is the operator's stop, not a robot error (delivery_announcement keys on '관리자').
+                held = self.shared.state['hold']['held']
+                detail = '관리자가 원격으로 정지해 목표가 거절되었습니다.' if held else '목표가 거절되었습니다.'
+                self.goal_state(request_id, status='REJECTED', **({'error_message': detail} if held else {}))
+                self.shared.complete(request_id, 'REJECTED', detail)
                 return
             if self.goal_id == request_id:
                 self.goal_handle = handle
@@ -586,6 +596,7 @@ class WebBridge(Node):
             self.shared.complete(request_id, 'ACCEPTED', '목표가 접수되었습니다.')
             handle.get_result_async().add_done_callback(
                 lambda f: (self.on_floor_result if floor else self.on_result)(request_id, f))
+            self.cancel_operator_goal()
         except Exception as error:
             self.goal_state(request_id, status='FAILED')
             self.shared.complete(request_id, 'FAILED', f'목표 전송 실패: {error}')
@@ -626,6 +637,46 @@ class WebBridge(Node):
             self.shared.complete(request_id, 'FAILED', str(error))
             self.goal_state(goal_id, status='ACCEPTED')
 
+    def cancel_operator_goal(self):
+        with self.shared.lock:
+            goal = self.shared.state.get('goal') or {}
+            goal_id = goal.get('request_id')
+            # Keep SENDING targets until their action response arrives, even after resume.
+            self.shared.cancel_goal_ids.intersection_update({goal_id} if goal_id else set())
+            if goal.get('status') not in ACTIVE_GOALS:
+                self.shared.cancel_goal_ids.discard(goal_id)
+                return
+            if (goal_id not in self.shared.cancel_goal_ids or goal.get('status') != 'ACCEPTED'
+                    or self.goal_id != goal_id or self.goal_handle is None):
+                return
+            self.goal_state(goal_id, status='CANCELING')
+            future = self.goal_handle.cancel_goal_async()
+            future.add_done_callback(lambda f: self.on_operator_cancel_response(goal_id, f))
+
+    def on_operator_cancel_response(self, goal_id, future):
+        try:
+            accepted = bool(future.result().goals_canceling)
+        except Exception:
+            accepted = False
+        if not accepted:
+            with self.shared.lock:
+                goal = self.shared.state.get('goal') or {}
+                if goal.get('request_id') == goal_id and goal.get('status') == 'CANCELING':
+                    self.goal_state(goal_id, status='ACCEPTED')
+
+    def poll_operator_commands(self):
+        with self.shared.lock:
+            while self.shared.operator_commands:
+                command = self.shared.operator_commands.popleft()
+                if command['hold'] is not None:
+                    self.hold_pub.publish(String(data=json.dumps(command['hold'])))
+                if command['kind'] != 'return_home':
+                    self.shared.complete(command['request_id'], 'SUCCEEDED')
+            self.cancel_operator_goal()
+            command = self.shared.next_return_command()
+            if command:
+                self.process_command(command)
+
     def tick(self):
         if self.clock_monitor.observe(self.get_clock().now().nanoseconds/1e9, time.monotonic(),
                                       self.get_parameter('use_sim_time').value):
@@ -638,12 +689,14 @@ class WebBridge(Node):
         self.update_scan()
         self.update_grid_origins()
         self.poll_set_floor()
+        self.poll_operator_commands()
         if self.pending_relocalize and time.monotonic()-self.pending_relocalize[2] > 5:
             future, request_id, _received = self.pending_relocalize
             self.pending_relocalize = None
             future.cancel()
             self.shared.complete(request_id, 'FAILED', '자동 위치 찾기 응답이 지연됩니다. 상태를 확인해 주세요. 자동 재전송하지 않습니다.')
         try:
-            self.process_command(self.shared.commands.get_nowait())
+            with self.shared.lock:
+                self.process_command(self.shared.commands.get_nowait())
         except queue.Empty:
             pass

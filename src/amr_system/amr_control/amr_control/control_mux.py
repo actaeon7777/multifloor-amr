@@ -26,6 +26,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Joy
 from std_msgs.msg import String
 
+from amr_control.operator_hold import OperatorHold
 from amr_control.control_gate import ControlGate
 from amr_control.time_guard import HealthLease
 
@@ -43,6 +44,11 @@ class ControlMux(Node):
         parameters = {key: self.declare_parameter(key, value).value
                       for key, value in defaults.items()}
         self.gate = ControlGate(**parameters)
+        # Backstop behind navigation_manager/mission_node, which stop themselves on a hold.
+        # No maneuver needs time to finish (the mission abandons at once), so no grace by default.
+        self.operator_hold = OperatorHold(self.declare_parameter('hold_grace', 0.0).value)
+        self.create_subscription(String, '/operator/hold', self.on_operator_hold,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.require_time_health = self.declare_parameter('require_time_health', False).value
         self.time_health = HealthLease()
         self.create_subscription(String, '/system/time_health', self.on_time_health,
@@ -122,6 +128,10 @@ class ControlMux(Node):
         self.estop.receive(message.data)
         self.publish_command()
 
+    def on_operator_hold(self, message):
+        self.operator_hold.receive(message.data, monotonic())
+        self.publish_command()
+
     def publish_heartbeat(self):
         self.publish_command(force=True)
 
@@ -137,6 +147,11 @@ class ControlMux(Node):
             linear = angular = 0.
             self.gate.auto_command = self.gate.auto_time = None
             self.gate.auto_reason = 'time_data_invalid'
+        # Operator hold: only AUTO is gated; LB manual driving remains available.
+        if self.gate.auto_enabled and self.operator_hold.blocking(monotonic()):
+            linear = angular = 0.
+            self.gate.auto_command = self.gate.auto_time = None
+            self.gate.auto_reason = 'operator_hold'
         self.estop_blocked = self.require_estop and not self.estop.healthy()
         if self.estop_blocked:
             # After an E-stop, motion resumes only from commands sent once READY:

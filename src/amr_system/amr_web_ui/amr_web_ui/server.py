@@ -31,7 +31,7 @@ KIOSK_STATE_KEYS = frozenset((
     'preview', 'connection_epoch', 'mode', 'navigation', 'action_ready', 'floor_action_ready',
     'floor', 'floor_mission', 'goal', 'notice', 'pending_request', 'localization',
     'localization_reset_pending', 'robot', 'global_path', 'tf_error', 'estop', 'telemetry',
-    'acknowledged_request', 'kiosk', 'map_version'))
+    'acknowledged_request', 'kiosk', 'map_version', 'hold', 'task'))
 ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'ARMING', 'READY', 'BYPASS'}
 ESTOP_STM32_KEYS = ('raw', 'debounced', 'latched', 'inhibit', 'odrv_idle', 'bus_off', 'odrv_hb_ok',
                     'drive_enabled', 'stopped', 'trip_count', 'release_count', 'reset_rejected', 'sequence')
@@ -59,7 +59,7 @@ DEVICE_RESULT_NAMES = {0x00: 'PRESSED', 0x01: 'DUPLICATE', 0x81: 'WRONG_DEVICE',
 def delivery_announcement(goal, before):
     """/robot/announcement key for a kiosk delivery (a goal with a room) leaving ``before``."""
     status = goal.get('status')
-    if not goal.get('room') or status == before:
+    if goal.get('origin') == 'return_home' or not goal.get('room') or status == before:
         return None
     if status == 'ACCEPTED' and before == 'SENDING':
         return 'delivery_start'
@@ -70,9 +70,45 @@ def delivery_announcement(goal, before):
     # A floor_goal failure is already announced by the elevator mission; an E-stop or LB
     # takeover (navigation_manager ESTOP_DETAIL / OVERRIDE_DETAIL) is not a robot error.
     if (status in ('FAILED', 'REJECTED') and goal.get('kind') == 'goal'
-            and not str(goal.get('error_message', '')).startswith(('E-stop', '수동 조작'))):
+            and not str(goal.get('error_message', '')).startswith(('E-stop', '수동 조작', '관리자'))):
         return 'robot_error'
     return None
+
+
+def task_summary(state):
+    """One Korean task line, shared by the console and kiosk snapshots."""
+    estop = state.get('estop') or {}
+    if estop.get('error') or estop.get('state') == 'ESTOP':
+        return '비상 정지'
+    if (state.get('hold') or {}).get('held'):
+        return '관리자 정지'
+    if state.get('mode') == 'MANUAL':
+        return '수동 조작'
+    goal = state.get('goal') or {}
+    status, room = goal.get('status'), goal.get('room')
+    if status in ACTIVE_GOALS:
+        if goal.get('origin') == 'return_home':
+            text = f'복귀 중 ({room}호)'
+        else:
+            text = f'{room}호 배송 중' if room else '지정 위치로 이동 중'
+        phase = (state.get('floor_mission') or {}).get('phase') or goal.get('phase')
+        labels = {
+            'NAV_TO_HALL': '엘리베이터 홀 이동', 'CALL_ELEVATOR': '호출', 'WAIT_DOOR_OPEN': '호출',
+            'BOARDING': '탑승', 'BACKING_OUT': '탑승', 'IN_CAR_ALIGN': '탑승', 'SELECT_FLOOR': '탑승',
+            'RIDING': '이동', 'SWITCH_MAP': '이동', 'ALIGHTING': '하차', 'RETURN_TO_CAR': '하차',
+            'RELOCALIZE': '하차', 'NAV_TO_GOAL': '목적지 이동'}
+        if phase in labels:
+            text += ' · ' + labels[phase]
+        return text + (' (취소 중)' if status == 'CANCELING' else '')
+    if (room and status in TERMINAL_GOALS and goal.get('origin') != 'return_home'
+            and (not state.get('acknowledged_request')
+                 or goal.get('request_id') != state.get('acknowledged_request'))):
+        if status == 'SUCCEEDED':
+            return f'{room}호 도착 · 수령 대기'
+        return '배송 취소됨' if status == 'CANCELED' else f'{room}호 배송 실패'
+    if not (state.get('localization') or {}).get('ready'):
+        return '위치 확인 필요'
+    return '대기'
 
 
 def _typed(source, keys):
@@ -166,6 +202,11 @@ class SharedState:
     def __init__(self, preview=False, kiosk_pin=''):
         self.lock = threading.RLock()
         self.commands = queue.Queue(maxsize=32)
+        # Safety commands must not be refused by the ordinary bounded queue.
+        self.operator_commands = deque()
+        self.hold_sequence = 0
+        self.cancel_goal_ids = set()
+        self.pending_return = None
         self.announce = None  # ros_bridge: announce(key, goal) publishes /robot/announcement
         self.grids = {}
         self.grid_versions = {}
@@ -209,7 +250,7 @@ class SharedState:
         # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
         # Encoded by the camera driver; this process never decodes or re-encodes images.
         self.camera = None
-        self.state = dict(preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
+        self.state = dict(hold=dict(held=False, since=None, reason=''), preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
                           action_ready=False, robot=None, amcl=None, scan=None,
                           global_path=None, local_path=None, footprint=None,
                           goal=None, notice=None, velocity=None, tf_error=None, pending_request=None,
@@ -280,7 +321,8 @@ class SharedState:
                 raise ApiError(409, '현재 완료된 배송만 확인할 수 있습니다.')
             first = self.state.get('acknowledged_request') != request_id
             self.state['acknowledged_request'] = request_id
-            if first and self.announce and goal.get('room') and goal.get('status') == 'SUCCEEDED':
+            if (first and self.announce and goal.get('origin') != 'return_home'
+                    and goal.get('room') and goal.get('status') == 'SUCCEEDED'):
                 self.announce('received', goal)
             return dict(acknowledged=request_id)
 
@@ -627,6 +669,7 @@ class SharedState:
     def reset_connection(self, reason):
         """Invalidate display/request state; never replay a command after restart."""
         with self.lock:
+            self.cancel_pending_return(reason)
             self.connection_epoch += 1
             self.scan_stamp = None
             self.telemetry.reset()
@@ -701,7 +744,7 @@ class SharedState:
     def floors_info(self):
         with self.lock:
             if self.building is None:
-                return dict(floors=[], default_floor=None, current_floor=None, simulation=self.simulation)
+                return dict(floors=[], default_floor=None, current_floor=None, simulation=self.simulation, home=None)
             floors = []
             for floor in sorted(self.building.floors.values(), key=lambda f: f.level):
                 try:
@@ -715,7 +758,9 @@ class SharedState:
                     rooms=[dict(id=r.room_id, x=r.goal[0], y=r.goal[1], yaw=r.goal[2])
                            for r in sorted(floor.rooms.values(), key=lambda r: r.room_id)]))
             return dict(floors=floors, default_floor=self.building.default_floor,
-                        current_floor=self.current_floor(), simulation=self.simulation)
+                        current_floor=self.current_floor(), simulation=self.simulation,
+                        home=(dict(floor=self.building.home.floor, room=self.building.home.room)
+                              if getattr(self.building, 'home', None) else None))
 
     def begin_localization_reset(self):
         with self.lock:
@@ -732,6 +777,8 @@ class SharedState:
         """Shared admission check, repeated on the ROS executor before side effects."""
         with self.lock:
             if self.state['preview']:
+                if kind in ('goal', 'floor_goal') and self.state['hold']['held']:
+                    return '관리자가 원격으로 정지했습니다. 중앙 관제에서 해제해야 출발할 수 있습니다.'
                 return None
             pending = self.state['pending_request']
             if pending and pending['request_id'] != request_id:
@@ -740,6 +787,8 @@ class SharedState:
                 estop = self.estop_error()
                 if estop:
                     return estop
+                if self.state['hold']['held']:
+                    return '관리자가 원격으로 정지했습니다. 중앙 관제에서 해제해야 출발할 수 있습니다.'
                 if self.state['mode'] == 'MANUAL':
                     return ('수동 조작(LB) 중이라 자율주행 명령을 받을 수 없습니다. '
                             'LB를 놓은 뒤 목적지를 다시 지정하세요.')
@@ -862,6 +911,7 @@ class SharedState:
                                      and localization['age'] < 2
                                      and not result['localization_reset_pending']
                                      and (not self.require_time_health or self.time_health.healthy(now)))
+        result['task'] = task_summary(result)
         return {key: value for key, value in result.items() if key in KIOSK_STATE_KEYS} if kiosk else result
 
     def estop_snapshot(self, now):
@@ -885,6 +935,8 @@ class SharedState:
         request_id = payload.get('request_id', '')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ApiError(400, '요청 ID가 필요합니다.')
+        if kind in ('stop', 'resume', 'return_home'):
+            return self.operator_request(kind, request_id)
         if kind not in ('goal', 'initialpose', 'cancel', 'relocalize', 'set_floor'):
             raise ApiError(400, '지원하지 않는 명령입니다.')
         pose = validate_pose(payload) if kind in ('goal', 'initialpose') else None
@@ -932,7 +984,9 @@ class SharedState:
                     occupancy = grid.cell(pose[0], pose[1])
                     if occupancy < 0 or occupancy >= 65:
                         raise ApiError(422, '벽이나 미확인 영역입니다. 이동 가능한 공간을 선택해 주세요.')
-            if not self.state['preview']:
+            if kind in ('goal', 'floor_goal'):
+                self.cancel_pending_return('새 목적지가 요청되어 복귀를 취소했습니다.')
+            if not self.state['preview'] or kind in ('goal', 'floor_goal'):
                 error = self.readiness_error(kind)
                 if error:
                     raise ApiError(409, error)
@@ -958,6 +1012,115 @@ class SharedState:
             while len(self.requests) > 256:
                 self.requests.popitem(last=False)
             return {k: v for k, v in record.items() if k != 'signature'}
+
+    def cancel_pending_return(self, detail):
+        if self.pending_return:
+            request_id = self.pending_return['request_id']
+            self.pending_return = None
+            self.complete(request_id, 'CANCELED', detail)
+
+    def set_hold(self, held):
+        if self.state['hold']['held'] == held:
+            return None
+        self.state['hold'] = dict(held=held, since=time.time() if held else None, reason='central')
+        self.hold_sequence += 1
+        return dict(held=held, reason='central', stamp=time.time(), sequence=self.hold_sequence)
+
+    def operator_request(self, kind, request_id):
+        with self.lock:
+            signature = (kind,)
+            old = self.requests.get(request_id)
+            if old:
+                if old['signature'] != signature:
+                    raise ApiError(409, '같은 요청 ID에 다른 명령을 사용할 수 없습니다.')
+                return dict(old['response'])
+            home = getattr(self.building, 'home', None)
+            if kind == 'return_home' and home is None:
+                raise ApiError(404, '복귀 지점이 설정되지 않았습니다.')
+            response = dict(request_id=request_id)
+            if kind in ('stop', 'return_home'):
+                self.cancel_pending_return('새 관리자 명령으로 복귀를 취소했습니다.')
+                # Drop goals not yet sent, including a stop followed quickly by resume.
+                retained = []
+                while not self.commands.empty():
+                    command = self.commands.get_nowait()
+                    if command['kind'] in ('goal', 'floor_goal'):
+                        self.complete(command['request_id'], 'CANCELED', '관리자 명령으로 취소했습니다.')
+                    else:
+                        retained.append(command)
+                for command in retained:
+                    self.commands.put_nowait(command)
+                goal = self.state.get('goal') or {}
+                canceled = goal.get('request_id') if goal.get('status') in ACTIVE_GOALS else None
+                if canceled:
+                    self.cancel_goal_ids.add(canceled)
+                if kind == 'stop':
+                    response['canceled'] = canceled
+            event = self.set_hold(kind == 'stop')
+            if kind == 'return_home':
+                response['home'] = dict(floor=home.floor, room=home.room)
+                self.pending_return = dict(request_id=request_id, home=home, started=time.monotonic())
+            else:
+                response['held'] = kind == 'stop'
+            self.requests[request_id] = dict(request_id=request_id, kind=kind, status='QUEUED',
+                                             signature=signature, response=response)
+            while len(self.requests) > 256:
+                self.requests.popitem(last=False)
+            self.state['pending_request'] = dict(request_id=request_id, kind=kind)
+            if self.state['preview']:
+                if kind == 'return_home':
+                    pose = self.building.floor(home.floor).rooms[home.room].goal
+                    goal_kind = 'goal' if self.current_floor() == home.floor else 'floor_goal'
+                    self.state['goal'] = dict(request_id=request_id, kind=goal_kind, origin='return_home',
+                        floor=home.floor, room=home.room, x=pose[0], y=pose[1], yaw=pose[2], status='PREVIEW')
+                    self.pending_return = None
+                self.complete(request_id, 'PREVIEW')
+            else:
+                self.operator_commands.append(dict(kind=kind, request_id=request_id, hold=event))
+            return dict(response)
+
+    def next_return_command(self, now=None):
+        """Poll on the executor; dispatch only after cancellation and readiness settle."""
+        with self.lock:
+            pending = self.pending_return
+            if pending is None:
+                return None
+            now = time.monotonic() if now is None else now
+            home, request_id = pending['home'], pending['request_id']
+            kind = 'goal' if self.current_floor() == home.floor else 'floor_goal'
+            goal = self.state.get('goal') or {}
+            # The hold release travels on a topic and the goal on an action: give the
+            # managers time to see held=false, or they reject the goal.
+            error = ('이전 목표의 종료를 기다리고 있습니다.' if goal.get('status') in ACTIVE_GOALS
+                     else '관리자 정지 해제를 기다리고 있습니다.'
+                     if now - pending['started'] < .5 or self.state.get('navigation') == 'HELD'
+                     else self.readiness_error(kind, request_id))
+            command = None
+            if not error:
+                try:
+                    if self.current_floor() is None:
+                        raise ApiError(409, '현재 층 정보가 없습니다.')
+                    grid = self.floor_grid(home.floor) if kind == 'floor_goal' else self.grids.get('map')
+                    if grid is None:
+                        raise ApiError(409, '지도를 기다리고 있습니다.')
+                    floor = self.building.floor(home.floor)
+                    if kind == 'floor_goal' and not (self.simulation or floor.real_enabled):
+                        raise ApiError(409, f'{home.floor}은 실차 층간 이동이 꺼져 있습니다.')
+                    pose = floor.rooms[home.room].goal
+                    if not 0 <= grid.cell(pose[0], pose[1]) < 65:
+                        raise ApiError(422, '벽이나 미확인 영역입니다. 이동 가능한 공간을 선택해 주세요.')
+                    command = dict(kind=kind, request_id=request_id, pose=pose, map_version=grid.version,
+                                   floor=home.floor, room=home.room, origin='return_home')
+                except ApiError as exc:
+                    error = str(exc)
+            if now - pending['started'] >= 30:
+                self.pending_return = None
+                self.complete(request_id, 'FAILED', '복귀를 시작하지 못했습니다: ' + (error or '출발 대기 시간 초과'))
+                return None
+            if command:
+                self.pending_return = None
+                self.state['pending_request'] = dict(request_id=request_id, kind=kind)
+            return command
 
     def complete(self, request_id, status, detail=''):
         with self.lock:
@@ -1086,7 +1249,8 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
                          '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
                          '/api/set_floor': 'set_floor', '/api/acknowledge': 'acknowledge',
-                         '/api/kiosk/unlock': 'kiosk/unlock'}
+                         '/api/kiosk/unlock': 'kiosk/unlock', '/api/stop': 'stop',
+                         '/api/resume': 'resume', '/api/return_home': 'return_home'}
                 kind = kinds.get(self.path)
                 if self.headers.get('X-AMR-Client') == 'kiosk':
                     shared.check_kiosk_request(kind, payload, self.headers.get('X-AMR-Kiosk-Token'))

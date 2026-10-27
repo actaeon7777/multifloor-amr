@@ -414,3 +414,37 @@ test('gear stays disabled through start and active delivery; incoming goal close
   assert.equal(b.elements.get('app').className,'app');assert.equal(b.elements.get('status-label').textContent,'배송 중');
   assert(b.elements.get('stop'));assert.equal(b.elements.get('admin-button').disabled,true);
 });
+
+test('operator hold follows manual and precedes every goal screen', () => {
+  for (const status of ['SENDING','ACCEPTED','CANCELING','SUCCEEDED']) {
+    const s = ready({hold:{held:true}, goal:goal(status,{kind:'floor_goal'})});
+    assert.equal(K.selectScreen(s,own),'held');
+    assert.equal(K.selectScreen({...s,mode:'MANUAL'},own),'manual');
+    assert.equal(K.selectScreen({...s,estop:{state:'ESTOP'}},own),'estop');
+    assert.equal(K.readyForGoal(s),false);
+  }
+});
+test('return home never needs a receipt and task remains server supplied', () => {
+  for (const status of ['SUCCEEDED','FAILED','REJECTED','CANCELED']) {
+    const s = ready({goal:goal(status,{origin:'return_home'}),task:'서버에서 전달한 작업'});
+    assert.equal(K.selectScreen(s,own),'idle');
+    assert.equal(K.selectScreen({...s,localization:{ready:false}},own),'localizing');
+    assert.equal(s.task,'서버에서 전달한 작업');
+  }
+  assert.equal(K.task_summary,undefined);
+  assert.equal(K.taskSummary,undefined);
+});
+test('held admin remains reachable and return home hides delivery stop', async () => {
+  const b=browserFixture();await b.settle();
+  b.setState(ready({hold:{held:true},kiosk:{pin_required:false},goal:goal()}));await b.poll();
+  assert.equal(b.elements.get('status-label').textContent,'관리자 정지');
+  assert.equal(b.elements.get('admin-button').disabled,false);
+  await b.click('action','admin');
+  assert.equal(b.elements.get('app').className,'app admin');
+  for(const kind of ['goal','floor_goal']) {
+    b.setState(ready({goal:goal('ACCEPTED',{kind,origin:'return_home'})}));await b.poll();
+    assert.equal(b.elements.get('status-label').textContent,'관리자 호출로 복귀 중');
+    assert.equal(b.elements.get('stop-wrap').hidden,true);
+    assert.equal(b.elements.get(kind==='goal'?'drive-label':'transit-label').textContent,'관리자 호출로 복귀 중');
+  }
+});

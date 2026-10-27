@@ -22,7 +22,7 @@ def shared():
         floors[name] = SimpleNamespace(rooms={room: SimpleNamespace(goal=(1., 1., .5))}, real_enabled=True)
         state.floor_grids[name] = Grid(4, 4, 1., [0., 0., 0.], [0]*16)
         state.floor_grids[name].version = int(name[0]) * 2**40
-    state.building = SimpleNamespace(floors=floors, floor=lambda name: floors[name])
+    state.building = SimpleNamespace(home=SimpleNamespace(floor='4F', room='402'), floors=floors, floor=lambda name: floors[name])
     state.grids['map'] = Grid(4, 4, 1., [0., 0., 0.], [0]*16)
     state.grids['map'].version = 17
     state.state['floor'] = dict(floor='4F', zone=1, confidence='BEACON')
@@ -96,7 +96,7 @@ def test_light_snapshot_uses_same_freshness_and_skips_heavy_parts(shared, http, 
                         goal=dict(request_id='goal_001', status='ACCEPTED', feedback_received_at=98.))
     expected = set('preview connection_epoch mode navigation action_ready floor_action_ready floor '
                    'floor_mission goal notice pending_request localization localization_reset_pending '
-                   'robot global_path tf_error estop telemetry acknowledged_request kiosk map_version'.split())
+                   'robot global_path tf_error estop telemetry acknowledged_request kiosk map_version hold task'.split())
     with http(shared) as request:
         full = request('/api/state')[1]
         assert full['kiosk'] == {'pin_required': True} and full['acknowledged_request'] is None
@@ -475,3 +475,276 @@ def test_acknowledged_delivery_announces_received_once(shared, http):
         shared.state['goal'] = dict(request_id='delivery_002', status='FAILED', room='401')
         assert request('/api/acknowledge', {'request_id': 'delivery_002'})[0] == 202
     assert calls == [('received', '401')]
+
+
+@pytest.mark.parametrize('preview', [True, False])
+def test_operator_hold_http_idempotency_and_local_persistence(shared, http, preview):
+    shared.state.update(preview=preview, goal=dict(request_id='old_goal_001', status='SENDING'))
+    with http(shared) as request:
+        for kind in ('stop', 'resume', 'return_home'):
+            assert request('/api/'+kind, {'request_id': 'central_001'})[0] == 403
+            assert request('/api/'+kind, {'request_id': 'bad'}, kiosk=False)[0] == 400
+        status, body, _ = request('/api/stop', {'request_id': 'central_stop'}, kiosk=False)
+        assert (status, body) == (202, dict(request_id='central_stop', held=True, canceled='old_goal_001'))
+        held = dict(shared.state['hold'])
+        assert held['held'] and held['since'] > 0 and held['reason'] == 'central'
+        assert request('/api/stop', {'request_id': 'central_stop'}, kiosk=False)[1] == body
+        assert request('/api/resume', {'request_id': 'central_stop'}, kiosk=False)[0] == 409
+        assert request('/api/stop', {'request_id': 'central_stop_again'}, kiosk=False)[0] == 202
+        assert shared.state['hold'] == held and shared.hold_sequence == 1
+        for endpoint in ('/api/state', '/api/kiosk/state'):
+            snapshot = request(endpoint)[1]
+            assert snapshot['hold'] == held and snapshot['task'] == '관리자 정지'
+        shared.reset_connection('synthetic link reset')
+        assert shared.state['hold'] == held
+        status, body, _ = request('/api/resume', {'request_id': 'central_resume'}, kiosk=False)
+        assert (status, body) == (202, dict(request_id='central_resume', held=False))
+        assert request('/api/resume', {'request_id': 'central_resume'}, kiosk=False)[1] == body
+        assert shared.state['hold'] == dict(held=False, since=None, reason='central')
+        assert shared.state['goal'] is None and shared.commands.empty()
+
+
+def make_ready(shared):
+    shared.state.update(preview=False, mode='AUTO', action_ready=True, floor_action_ready=True,
+        robot=dict(received_at=time.monotonic()), tf_error=None,
+        localization=dict(ready=True, stamp=time.time(), received_at=time.monotonic()))
+
+
+@pytest.mark.parametrize('preview', [True, False])
+@pytest.mark.parametrize('home_floor,home_room,kind', [('4F', '402', 'goal'), ('3F', '302', 'floor_goal')])
+def test_return_home_http_uses_room_goal_and_same_id(shared, http, preview, home_floor, home_room, kind):
+    shared.building.home = SimpleNamespace(floor=home_floor, room=home_room)
+    make_ready(shared)
+    shared.state['preview'] = preview
+    shared.state['hold'] = dict(held=True, since=time.time(), reason='central')
+    shared.state['goal'] = dict(request_id='previous_goal', status='ACCEPTED')
+    with http(shared) as request:
+        payload = dict(request_id='return_home_001')
+        status, body, _ = request('/api/return_home', payload, kiosk=False)
+        assert (status, body) == (202, dict(request_id=payload['request_id'], home=dict(floor=home_floor, room=home_room)))
+        assert request('/api/return_home', payload, kiosk=False)[1] == body
+        assert not shared.state['hold']['held']
+        if preview:
+            goal = shared.state['goal']
+            assert shared.pending_return is None and shared.commands.empty()
+        else:
+            assert 'previous_goal' in shared.cancel_goal_ids
+            assert shared.next_return_command() is None
+            shared.state['goal']['status'] = 'CANCELED'
+            # The hold release and the goal race otherwise: dispatch waits 0.5 s after the request.
+            assert shared.next_return_command() is None and shared.pending_return is not None
+            goal = shared.next_return_command(now=shared.pending_return['started'] + 1)
+            assert shared.pending_return is None
+            assert goal['map_version'] == (shared.grids['map'].version if kind == 'goal'
+                                           else shared.floor_grids[home_floor].version)
+        assert goal['request_id'] == payload['request_id'] and goal['origin'] == 'return_home'
+        assert (goal['kind'], goal['floor'], goal['room']) == (kind, home_floor, home_room)
+
+
+def test_return_missing_home_and_timeout(shared, http):
+    shared.state['preview'] = False
+    with http(shared) as request:
+        home = shared.building.home
+        shared.building.home = None
+        assert request('/api/return_home', dict(request_id='missing_home'), kiosk=False)[:2] == (
+            404, {'error': '복귀 지점이 설정되지 않았습니다.'})
+        shared.building.home = home
+        assert request('/api/return_home', dict(request_id='timeout_home'), kiosk=False)[0] == 202
+        assert shared.next_return_command() is None
+        assert shared.next_return_command(shared.pending_return['started']+30.) is None
+        assert shared.pending_return is None and shared.state['pending_request'] is None
+        assert shared.state['notice']['status'] == 'FAILED'
+        assert shared.state['notice']['detail'] == '복귀를 시작하지 못했습니다: 제어 모드 수신을 기다리고 있습니다.'
+
+
+@pytest.mark.parametrize('new_kind', ['stop', 'return_home', 'goal'])
+def test_pending_return_superseded(shared, new_kind):
+    make_ready(shared)
+    shared.request('return_home', dict(request_id='old_return'))
+    payload = pose(shared, request_id='new_command') if new_kind == 'goal' else dict(request_id='new_command')
+    shared.request(new_kind, payload)
+    assert shared.requests['old_return']['status'] == 'CANCELED'
+    assert (shared.pending_return or {}).get('request_id') == ('new_command' if new_kind == 'return_home' else None)
+
+
+def test_stop_works_when_normal_queue_full_and_discards_queued_goals(shared):
+    make_ready(shared)
+    for i in range(32):
+        shared.commands.put_nowait(dict(kind='goal', request_id=f'queued_{i:03d}'))
+    shared.request('stop', dict(request_id='stop_full_queue'))
+    assert shared.commands.empty() and shared.state['hold']['held']
+    shared.complete('stop_full_queue', 'SUCCEEDED')
+    assert shared.readiness_error('goal').startswith('관리자가')
+    shared.request('resume', dict(request_id='resume_full_queue'))
+    assert shared.commands.empty()
+
+
+@pytest.mark.parametrize('changes,expected', [
+    ({'estop': {'error': 'fault'}, 'hold': {'held': True}}, '비상 정지'),
+    ({'estop': {'state': 'ESTOP'}}, '비상 정지'),
+    ({'hold': {'held': True}, 'mode': 'MANUAL'}, '관리자 정지'),
+    ({'mode': 'MANUAL'}, '수동 조작'),
+    ({'goal': {'status': 'ACCEPTED', 'origin': 'return_home', 'room': '401'}}, '복귀 중 (401호)'),
+    ({'goal': {'status': 'ACCEPTED', 'origin': 'return_home', 'room': '401'}, 'floor_mission': {'phase': 'RIDING'}}, '복귀 중 (401호) · 이동'),
+    ({'goal': {'status': 'CANCELING', 'room': '402'}, 'floor_mission': {'phase': 'NAV_TO_HALL'}}, '402호 배송 중 · 엘리베이터 홀 이동 (취소 중)'),
+    ({'goal': {'status': 'SENDING', 'room': '402'}}, '402호 배송 중'),
+    ({'goal': {'status': 'ACCEPTED'}}, '지정 위치로 이동 중'),
+    ({'goal': {'status': 'CANCELING'}}, '지정 위치로 이동 중 (취소 중)'),
+    ({'goal': {'status': 'SUCCEEDED', 'room': '402', 'request_id': 'done'}}, '402호 도착 · 수령 대기'),
+    ({'goal': {'status': 'FAILED', 'room': '402', 'request_id': 'done'}}, '402호 배송 실패'),
+    ({'goal': {'status': 'REJECTED', 'room': '402', 'request_id': 'done'}}, '402호 배송 실패'),
+    ({'goal': {'status': 'CANCELED', 'room': '402', 'request_id': 'done'}}, '배송 취소됨'),
+    ({'goal': {'status': 'SUCCEEDED', 'room': '402', 'request_id': 'done'}, 'acknowledged_request': 'done'}, '대기'),
+    ({'goal': {'status': 'SUCCEEDED', 'origin': 'return_home', 'room': '401'}}, '대기'),
+    ({'localization': None}, '위치 확인 필요'),
+    ({}, '대기'),
+])
+def test_task_summary(changes, expected):
+    from amr_web_ui.server import task_summary
+    state = dict(mode='AUTO', localization=dict(ready=True)) | changes
+    before = json.dumps(state)
+    assert task_summary(state) == expected
+    assert json.dumps(state) == before
+
+
+def test_operator_announcement_suppression_and_acknowledge(shared, http):
+    from amr_web_ui.server import delivery_announcement
+    assert delivery_announcement(dict(room='401', kind='goal', status='FAILED',
+        error_message='관리자가 원격으로 정지했습니다.'), 'ACCEPTED') is None
+    for status in ('ACCEPTED', 'SUCCEEDED', 'CANCELED', 'FAILED', 'REJECTED'):
+        assert delivery_announcement(dict(room='401', kind='goal', origin='return_home', status=status), 'SENDING') is None
+    calls = []
+    shared.announce = lambda *args: calls.append(args)
+    shared.state['goal'] = dict(room='401', origin='return_home', status='SUCCEEDED', request_id='home_done')
+    with http(shared) as request:
+        assert request('/api/acknowledge', dict(request_id='home_done'))[0] == 202
+    assert not calls
+
+
+@pytest.fixture
+def operator_bridge(shared):
+    """Exercise real bridge callbacks using futures, without creating any ROS node."""
+    pytest.importorskip('rclpy')
+    from concurrent.futures import Future
+    from types import MethodType
+    from amr_web_ui.ros_bridge import WebBridge
+    from builtin_interfaces.msg import Time
+    bridge = SimpleNamespace(shared=shared, goal_id=None, goal_handle=None, emitted=[], announcements=[], sent=[])
+    for name in ('process_command', 'send_floor_goal', 'on_goal_response', 'on_result', 'on_floor_result',
+                 'goal_state', 'cancel_operator_goal', 'on_operator_cancel_response', 'poll_operator_commands'):
+        setattr(bridge, name, MethodType(getattr(WebBridge, name), bridge))
+    bridge.set_state = lambda **kw: shared.state.update(kw)
+    bridge.announce = lambda *args: bridge.announcements.append(args)
+    bridge.hold_pub = SimpleNamespace(publish=lambda m: bridge.emitted.append(json.loads(m.data)))
+    bridge.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=Time))
+    bridge.on_feedback = lambda *_args: None
+
+    def send_goal(goal, **_kwargs):
+        response, result = Future(), Future()
+        cancellations = []
+
+        def cancel():
+            future = Future()
+            cancellations.append(future)
+            future.set_result(SimpleNamespace(goals_canceling=[1]))
+            return future
+        handle = SimpleNamespace(accepted=True, get_result_async=lambda: result, cancel_goal_async=cancel)
+        bridge.sent.append(SimpleNamespace(goal=goal, response=response, result=result,
+                                          handle=handle, cancellations=cancellations))
+        return response
+    bridge.client = bridge.floor_client = SimpleNamespace(server_is_ready=lambda: True, send_goal_async=send_goal)
+    make_ready(shared)
+    return bridge
+
+
+@pytest.mark.parametrize('floor,room', [('4F', '402'), ('3F', '302')])
+def test_stop_sending_goal_cancels_same_handle_even_after_resume(shared, operator_bridge, floor, room):
+    bridge = operator_bridge
+    version = shared.grids['map'].version if floor == '4F' else shared.floor_grids[floor].version
+    shared.request('goal', pose(shared, floor=floor, room=room, map_version=version))
+    bridge.process_command(shared.commands.get_nowait())
+    assert shared.state['goal']['status'] == 'SENDING'
+    shared.request('stop', dict(request_id='stop_sending'))
+    shared.request('resume', dict(request_id='resume_sending'))
+    bridge.poll_operator_commands()
+    assert [m['held'] for m in bridge.emitted] == [True, False]
+    assert [m['sequence'] for m in bridge.emitted] == [1, 2]
+    sent = bridge.sent[0]
+    assert not sent.cancellations
+    sent.response.set_result(sent.handle)
+    assert len(sent.cancellations) == 1 and shared.state['goal']['status'] == 'CANCELING'
+    bridge.poll_operator_commands()
+    assert len(sent.cancellations) == 1
+
+
+@pytest.mark.parametrize('floor,room', [('4F', '402'), ('3F', '302')])
+def test_return_dispatch_after_old_goal_terminal_without_ros_node(shared, operator_bridge, floor, room):
+    from action_msgs.msg import GoalStatus
+    bridge = operator_bridge
+    shared.request('goal', pose(shared))
+    bridge.process_command(shared.commands.get_nowait())
+    old = bridge.sent[0]
+    old.response.set_result(old.handle)
+    shared.building.home = SimpleNamespace(floor=floor, room=room)
+    shared.request('return_home', dict(request_id='bridge_return_home'))
+    bridge.poll_operator_commands()
+    assert len(old.cancellations) == 1 and len(bridge.sent) == 1
+    old.result.set_result(SimpleNamespace(status=GoalStatus.STATUS_CANCELED,
+                                        result=SimpleNamespace(error_code=0, error_msg='')))
+    bridge.poll_operator_commands()
+    assert len(bridge.sent) == 1  # still inside the 0.5 s hold-release settle time
+    shared.pending_return['started'] -= 1
+    bridge.poll_operator_commands()
+    assert len(bridge.sent) == 2
+    goal = shared.state['goal']
+    assert goal['request_id'] == 'bridge_return_home' and goal['origin'] == 'return_home'
+    assert goal['status'] == 'SENDING' and goal['room'] == room and goal['floor'] == floor
+    home = bridge.sent[-1]
+    home.response.set_result(home.handle)
+    assert not bridge.announcements
+    result = SimpleNamespace(error_code=0, error_msg='') if floor == '4F' else SimpleNamespace(
+        success=True, error_code='', message='')
+    home.result.set_result(SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED, result=result))
+    assert shared.state['goal']['status'] == 'SUCCEEDED'
+    assert not bridge.announcements
+
+
+def test_hold_snapshot_precedence_and_return_deadline_without_http(shared):
+    make_ready(shared)
+    shared.request('stop', dict(request_id='snapshot_hold'))
+    shared.complete('snapshot_hold', 'SUCCEEDED')
+    for kiosk in (False, True):
+        snapshot = shared.snapshot(kiosk=kiosk)
+        assert snapshot['hold']['held'] and snapshot['task'] == '관리자 정지'
+    shared.state['mode'] = 'MANUAL'
+    assert shared.readiness_error('goal').startswith('관리자가')
+    shared.require_estop = True
+    assert not shared.readiness_error('goal').startswith('관리자가')
+    shared.require_estop = False
+    shared.request('return_home', dict(request_id='timeout_without_http'))
+    started = shared.pending_return['started']
+    assert shared.next_return_command(started+29.) is None
+    assert shared.pending_return
+    assert shared.next_return_command(started+30.) is None
+    assert shared.pending_return is None
+    assert shared.state['notice']['status'] == 'FAILED'
+    assert shared.state['notice']['detail'].startswith('복귀를 시작하지 못했습니다: 수동 조작')
+
+
+def test_home_floors_info_default_and_configured():
+    from amr_stack.floor_config import load_floor_config
+    shared = SharedState(preview=True)
+    assert shared.floors_info()['home'] is None
+    from pathlib import Path
+    stack = Path(__file__).resolve().parents[2] / 'amr_stack'
+    shared.set_building(load_floor_config(stack / 'config/floors.yaml', package_root=stack), simulation=True)
+    assert shared.floors_info()['home'] == dict(floor='4F', room='401')
+
+
+def test_preview_hold_also_blocks_new_goal_without_ros(shared):
+    from amr_web_ui.server import ApiError
+    shared.request('stop', dict(request_id='preview_hold'))
+    with pytest.raises(ApiError, match='관리자가'):
+        shared.request('goal', pose(shared))
+    shared.request('resume', dict(request_id='preview_release'))
+    assert shared.request('goal', pose(shared))['status'] == 'PREVIEW'

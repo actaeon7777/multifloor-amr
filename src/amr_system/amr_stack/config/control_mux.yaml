@@ -3,6 +3,9 @@
 # manual_holdoff after the last LB sample: AUTO again, manual is ignored.
 control_mux:
   ros__parameters:
+    # Operator hold (/operator/hold) blocks AUTO output after this many seconds; the
+    # elevator mission abandons at once on a hold, so this backstop needs no grace.
+    hold_grace: 0.0
     deadman_button: 6
     auto_timeout: 0.50      # seconds; stop without falling back to manual
     manual_holdoff: 0.50    # seconds after the last LB-held /joy before AUTO; >= joy_timeout

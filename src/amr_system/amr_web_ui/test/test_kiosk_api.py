@@ -781,3 +781,62 @@ def test_stop_during_elevator_segment_is_deferred_until_the_corridor(shared):
     response = shared.request('stop', dict(request_id='stop_at_hall'))
     assert response['pending'] is False and response['canceled'] == 'ride_goal_01'
     assert shared.state['hold']['held']
+
+
+def test_kiosk_exit_signals_only_the_launcher(shared, http, monkeypatch, tmp_path):
+    import os
+    import signal
+    import subprocess
+    from amr_web_ui import server
+    killed = []
+    monkeypatch.setattr(server.os, 'kill', lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setenv('XDG_RUNTIME_DIR', str(tmp_path))
+    pid_file = tmp_path/f'amr-kiosk-{os.getuid()}.pid'
+    monkeypatch.setattr(server, 'kiosk_browser_pid', lambda: None)
+    with http(shared) as request:
+        assert request('/api/kiosk/exit', {})[0:2] == (409, {'error': '키오스크 화면을 찾지 못했습니다.'})
+        pid_file.write_text(f'{os.getpid()}\n')  # A reused PID that is not the launcher.
+        assert request('/api/kiosk/exit', {})[0] == 409
+        script = tmp_path/'kiosk/launch.sh'
+        script.parent.mkdir()
+        script.write_text('sleep 30\n')
+        launcher = subprocess.Popen(['bash', str(script)])
+        try:
+            pid_file.write_text(f'{launcher.pid}\n')
+            shared.kiosk_pin = '1234'
+            assert request('/api/kiosk/exit', {})[0:2] == (403, {'error': '관리 모드 잠금을 먼저 해제하세요.'})
+            token = request('/api/kiosk/unlock', {'pin': '1234'})[1]['token']
+            assert request('/api/kiosk/exit', {}, headers={'X-AMR-Kiosk-Token': token})[0:2] == (
+                202, {'closing': True})
+            assert killed == [(launcher.pid, signal.SIGTERM)]
+        finally:
+            monkeypatch.undo()
+            launcher.kill()
+            launcher.wait()
+
+
+def test_kiosk_exit_falls_back_to_orphaned_browser(shared, http, monkeypatch, tmp_path):
+    import signal
+    from amr_web_ui import server
+    killed = []
+    monkeypatch.setattr(server.os, 'kill', lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(server, 'kiosk_launcher_pid', lambda: None)
+    monkeypatch.setattr(server, 'kiosk_browser_pid', lambda: 4321)
+    with http(shared) as request:
+        assert request('/api/kiosk/exit', {})[0:2] == (202, {'closing': True})
+    assert killed == [(4321, signal.SIGTERM)]
+
+
+def test_kiosk_browser_pid_skips_child_processes(tmp_path):
+    from amr_web_ui.server import kiosk_browser_pid
+    for pid, argv in [('10', ['chrome', '--type=renderer', '--class=amr-kiosk']),
+                      ('11', ['chrome', '--class=amr-kiosk-probe']), ('self', ['x']), ('13', ['bash', '-c', '--class=amr-kiosk']),
+                      
+                      ('12', ['/s/chrome', '--user-data-dir=/p/amr-kiosk', '--class=amr-kiosk', 'http://k'])]:
+        (tmp_path/pid).mkdir()
+        (tmp_path/pid/'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+    assert kiosk_browser_pid(tmp_path) == 12
+    (tmp_path/'12'/'cmdline').write_bytes(b'/s/chrome --user-data-dir=/p/amr-kiosk --class=amr-kiosk http://k\0')
+    assert kiosk_browser_pid(tmp_path) == 12  # Chromium's rewritten process title.
+    (tmp_path/'12'/'cmdline').unlink()
+    assert kiosk_browser_pid(tmp_path) is None

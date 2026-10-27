@@ -214,7 +214,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       body = {...body, map_version:version};
     }
     const headers = {'Content-Type':'application/json', 'X-AMR-Request':'1', 'X-AMR-Client':'kiosk'};
-    const privileged = ['initialpose','relocalize','set_floor'].includes(kind);
+    const privileged = ['initialpose','relocalize','set_floor','kiosk/exit'].includes(kind);
     if (privileged && state?.kiosk?.pin_required && token) headers['X-AMR-Kiosk-Token'] = token;
     const response = await fetch(`/api/${kind}`, {method:'POST', headers, body:JSON.stringify(body), signal:AbortSignal.timeout(5000)});
     const result = await response.json();
@@ -279,7 +279,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <div class="block"><h3>지정 위치 적용</h3><p>지도에서 지정한 위치·방향으로 위치를 다시 잡습니다.</p><button id="apply-pose" data-action="apply-pose" class="btn primary">${icon('locate')}적용</button></div>
       <div class="block"><h3>마지막 위치로 시작</h3><p id="last-pose"></p><button id="apply-last" data-action="apply-last" class="btn ghost">${icon('history')}적용</button></div>
       <div class="block"><h3>현재 층 변경</h3><p>층 정보가 실제와 다를 때만 변경하세요.</p><div id="admin-floors" class="seg"></div></div>
-      <button data-action="exit" class="exit">관리 모드 종료</button></aside></div>`,
+      <div class="exits"><button id="close-kiosk" data-action="close-kiosk" class="exit">키오스크 닫기</button><button data-action="exit" class="exit">관리 모드 종료</button></div></aside></div>`,
   };
   function phaseHeadline(phase) {
     return {NAV_TO_HALL:'승강장 이동 중', CALL_ELEVATOR:'엘리베이터 호출 중', WAIT_DOOR_OPEN:'문 열림 대기',
@@ -412,6 +412,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     setDisabled('stop', !online() || flow.stopping || flow.pending?.stopRequested || (!flow.pending &&
       (!ACTIVE.has(state?.goal?.status) || state?.goal?.status === 'CANCELING')));
     setDisabled('ack', !online() || busy);
+    setDisabled('close-kiosk', !online() || busy);
     const info = floorInfo(currentFloor())?.map, bitmap = maps.get(currentFloor());
     const mapReady = info && bitmap?.version === info.version && state?.map_version != null;
     setDisabled('apply-pose', adminBlocked() || !adminPose || !mapReady || adminPose.map_version !== info?.version);
@@ -483,6 +484,14 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
         break;
       }
       case 'exit': leaveAdmin(); break;
+      case 'close-kiosk':
+        if (!online() || busy) break;
+        busy = true; render();
+        // The server signals scripts/kiosk/launch.sh, which closes this browser.
+        try { await post('kiosk/exit', {}); }
+        catch (e) { toast(e.message); }
+        finally { busy = false; render(); }
+        break;
       case 'apply-pose':
         if (adminPose && !$('apply-pose').disabled) {
           const {x,y,yaw} = adminPose;

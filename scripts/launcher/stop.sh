@@ -12,5 +12,9 @@ if [[ ${1:-} != --yes ]]; then
     fi
 fi
 # SIGTERM lets launch.sh close Chromium and restore the screen-lock settings.
+# The icon's kiosk runs as amr-kiosk (start.sh); a terminal one is matched by path.
+systemctl --user stop amr-kiosk.service 2>/dev/null || true
 pkill -f "$ws/scripts/kiosk/launch.sh" || true
+# A kiosk Chromium whose launcher already died.
+pkill -f -- '^/snap/chromium/[^ ]*/chrome .*--class=amr-kiosk( |$)' || true
 systemctl --user stop amr-agent.service amr-web.service amr-stack.service

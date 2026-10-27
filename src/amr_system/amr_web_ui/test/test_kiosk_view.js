@@ -251,6 +251,14 @@ test('PIN unlock and initialpose use kiosk headers; token stays in memory and 40
   assert.match(JSON.parse(requests[1].options.body).request_id,/^[A-Za-z0-9_-]{8,80}$/);
   assert.equal(b.storage,'[]');assert.equal(b.elements.get('app').className,'app');assert.equal(b.elements.get('toast').textContent,'토큰 만료');
 });
+test('admin close-kiosk asks the server with the admin token',async()=>{
+  const b=browserFixture();await b.settle();b.draw();
+  await b.click('action','admin');await b.click('pin','1');await b.click('action','unlock');
+  await b.click('action','close-kiosk');
+  const req=b.requests.find(r=>r.url==='/api/kiosk/exit');assert(req,'kiosk exit request');
+  assert.equal(req.options.method,'POST');assert.equal(req.options.headers['X-AMR-Client'],'kiosk');
+  assert.equal(req.options.headers['X-AMR-Kiosk-Token'],'memory-only');assert.equal(req.options.body,'{}');
+});
 test('PIN-free admin warns, uses saved pose, and exits after five idle minutes',async()=>{
   const b=browserFixture();b.setState(ready({kiosk:{pin_required:false},localization:{ready:true,age:0,last_pose:{x:2,y:3,yaw:1,saved_at:1700000000}}}));
   await b.settle();await b.poll();b.draw();await b.click('action','admin');

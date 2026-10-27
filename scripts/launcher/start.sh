@@ -32,4 +32,9 @@ sleep 3
 systemctl --user --quiet is-active amr-stack.service || [[ -n $(manual_stack) ]] ||
     fail '차량 스택이 시작 직후 종료되었습니다.
 journalctl --user-unit amr-stack -n 50 으로 확인하세요.'
-exec "$ws/scripts/kiosk/launch.sh"
+# Desktop-icon processes carry DING's AppArmor label (desktop-icons-ng), and the
+# Chromium snap refuses signals from it, so launch.sh could never close its
+# browser. Run the kiosk from the user manager, which is unconfined.
+systemctl --user --quiet is-active amr-kiosk.service ||
+    exec systemd-run --user --quiet --collect --unit=amr-kiosk \
+        --description='AMR kiosk (키오스크)' "$ws/scripts/kiosk/launch.sh"

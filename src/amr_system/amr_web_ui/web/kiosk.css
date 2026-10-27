@@ -152,6 +152,7 @@ svg.i{width:28px;height:28px;fill:none;stroke:currentColor;stroke-width:2;stroke
 .seg button{height:60px;border-radius:12px;border:1.5px solid var(--line);font-size:20px;font-weight:700}
 .seg button.on{border-color:var(--accent);color:var(--accent);background:var(--tint)}
 .exit{margin-top:auto;height:64px;border-radius:16px;border:1.5px solid var(--line);font-size:20px;font-weight:700}
+.exits{margin-top:auto;display:grid;grid-template-columns:1fr 1fr;gap:12px}.exits .exit{margin-top:0}
 
 /* Live data slots keep the approved 1280 × 853 layout stable. */
 #screen{height:100%;min-height:0}

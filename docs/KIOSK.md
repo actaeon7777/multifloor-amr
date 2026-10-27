@@ -9,10 +9,17 @@ Jetson의 가로 터치 화면에서 사용하는 배송 화면이다. 웹 주�
 로그인한 데스크톱의 터미널에서 `scripts/kiosk/launch.sh`를 실행한다.
 `AMR_WEB_PORT=8080`으로 포트를 지정할 수 있다. 실행기는 웹 응답을 최대 약 2분 기다린 뒤
 별도 Chromium 프로필 `~/snap/chromium/common/amr-kiosk`로 연다.
-`curl`, `flock`, `gsettings`, `xwininfo`, Python 3, libX11, Snap Chromium이 필요하다.
-전체화면 요청은 창이 1920×1280이 될 때까지 0.5초 간격으로 최대 1분 반복한다.
+`curl`, `flock`, `gsettings`, `xwininfo`·`xprop`(x11-utils), Python 3, libX11, Snap Chromium이 필요하다.
+Chromium 자체의 `--kiosk` 전체화면은 약 0.1초 뒤 일반 창으로 풀리므로(2026-10-28 측정), 실행기가
+브라우저가 떠 있는 동안 창 상태(`_NET_WM_STATE_FULLSCREEN`)를 처음 30초는 0.5초, 이후 2초 간격으로 확인해 풀리면 다시 요청한다.
 
-종료는 키보드 `Alt+F4`, 또는 실행한 터미널에서 `Ctrl+C`를 누른다.
+종료는 관리 모드의 **키오스크 닫기**(화면만 닫고 로봇은 계속 켜져 있음), 키보드 `Alt+F4`, 또는 실행한 터미널에서 `Ctrl+C`.
+**키오스크 닫기**는 서버가 실행기 PID 파일(`$XDG_RUNTIME_DIR/amr-kiosk-<UID>.pid`)의 `launch.sh`에 SIGTERM을 보내는 방식이라
+실행기가 없으면 `--class=amr-kiosk` Chromium을 직접 닫는다. 로봇 PC 자신(loopback)에서 보낸 요청만 받고, PIN이 있으면 관리 모드 토큰이 필요하다.
+바탕화면 "AMR 시작" 아이콘은 키오스크를 사용자 서비스 `amr-kiosk`(systemd-run)로 띄운다. 바탕화면 아이콘(DING)에서 바로 실행한 프로세스는
+AppArmor 라벨 `desktop-icons-ng`를 물려받는데 Chromium snap이 이 라벨이 보내는 종료 신호를 거부해서, 실행기가 브라우저를 닫지 못하고 멈췄기 때문이다(2026-10-28 확인).
+"AMR 종료"는 `systemctl --user stop amr-kiosk`로 닫는다.
+실행기를 새로 띄울 때 실행기 없이 남은 키오스크 Chromium이 있으면 먼저 닫는다(남아 있으면 새 실행이 기존 창에 주소만 넘기고 끝나 전체화면 감시·키오스크 닫기가 동작하지 않는다).
 실행 중 화면 꺼짐·잠금을 해제하고 정상 종료·종료 신호 처리 때 이전 값을 복원한다.
 강제 종료(SIGKILL)·전원 차단은 복원을 실행할 수 없으므로 GNOME 설정을 확인한다.
 브라우저 종료는 배송 취소가 아니다. 배송 취소에는 화면의 **정지**를 누른다.

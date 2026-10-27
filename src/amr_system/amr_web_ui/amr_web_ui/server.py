@@ -4,6 +4,7 @@ from array import array
 from collections import OrderedDict, deque
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import math
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import signal
 import threading
 import time
 from urllib.parse import urlsplit
@@ -174,6 +176,33 @@ class ApiError(Exception):
         self.status = status
 
 
+def kiosk_launcher_pid():
+    """PID of the running scripts/kiosk/launch.sh (it writes the file), else None."""
+    path = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / f'amr-kiosk-{os.getuid()}.pid'
+    try:
+        pid = int(path.read_text())
+        argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    except (OSError, ValueError):
+        return None
+    # A stale file can name a reused PID; signal only the launcher itself.
+    return pid if any(arg.endswith(b'/kiosk/launch.sh') for arg in argv) else None
+
+
+def kiosk_browser_pid(proc=Path('/proc')):
+    """Main process of a kiosk Chromium (``--class=amr-kiosk``) left without its launcher."""
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # Chromium rewrites its process title: one space-separated string.
+            argv = (entry/'cmdline').read_bytes().replace(b'\0', b' ').split()
+        except OSError:
+            continue
+        if argv and argv[0].endswith(b'/chrome') and b'--class=amr-kiosk' in argv and not any(arg.startswith(b'--type=') for arg in argv):
+            return int(entry.name)
+    return None
+
+
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
 
@@ -315,7 +344,7 @@ class SharedState:
                     valid = False
                 if not valid:
                     raise ApiError(403, '키오스크에서는 등록된 호실로만 보낼 수 있습니다.')
-            elif kind in ('initialpose', 'relocalize', 'set_floor'):
+            elif kind in ('initialpose', 'relocalize', 'set_floor', 'kiosk/exit'):
                 self._prune_kiosk_tokens(time.monotonic())
                 if self.kiosk_pin and token not in self.kiosk_tokens:
                     raise ApiError(403, '관리 모드 잠금을 먼저 해제하세요.')
@@ -1285,7 +1314,8 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
                          '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
                          '/api/set_floor': 'set_floor', '/api/acknowledge': 'acknowledge',
-                         '/api/kiosk/unlock': 'kiosk/unlock', '/api/stop': 'stop',
+                         '/api/kiosk/unlock': 'kiosk/unlock', '/api/kiosk/exit': 'kiosk/exit',
+                         '/api/stop': 'stop',
                          '/api/resume': 'resume', '/api/return_home': 'return_home'}
                 kind = kinds.get(self.path)
                 if self.headers.get('X-AMR-Client') == 'kiosk':
@@ -1294,6 +1324,19 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                     raise ApiError(404, 'Not found')
                 if kind == 'kiosk/unlock':
                     self.respond(200, shared.unlock_kiosk(payload))
+                elif kind == 'kiosk/exit':
+                    if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                        raise ApiError(403, '로봇 화면에서만 닫을 수 있습니다.')
+                    # SIGTERM lets launch.sh close Chromium and restore the screen-lock settings;
+                    # without a launcher, close the orphaned browser itself.
+                    pid = kiosk_launcher_pid() or kiosk_browser_pid()
+                    if pid is None:
+                        raise ApiError(409, '키오스크 화면을 찾지 못했습니다.')
+                    self.respond(202, dict(closing=True))
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 elif kind == 'acknowledge':
                     self.respond(202, shared.acknowledge(payload))
                 else:

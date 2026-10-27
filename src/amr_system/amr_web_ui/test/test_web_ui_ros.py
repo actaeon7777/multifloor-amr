@@ -559,3 +559,74 @@ def test_operator_stop_sending_resume_and_return_home_over_http():
         for node in (bridge, manager, scene):
             node.destroy_node()
         rclpy.shutdown()
+
+
+def test_patrol_topics_http_ack_and_kiosk_lock():
+    """Opt-in topic contract using a status publisher and command recorder only."""
+    assert os.environ.get('ROS_DOMAIN_ID') == '193'
+    assert os.environ.get('ROS_LOCALHOST_ONLY') == '1'
+    rclpy.init()
+    shared = SharedState()
+    source = Node('web_ui_patrol_stub')
+    qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    status_pub = source.create_publisher(String, '/patrol/status', qos)
+    status = dict(active=False, phase='IDLE', route=None, routes=['4F_full'], index=0, total=12)
+    status_pub.publish(String(data=json.dumps(status)))  # retained for the late bridge subscriber
+    bridge = WebBridge(shared)
+    manager = NavigationManager()
+    scene = Scene()
+    executor = SingleThreadedExecutor()
+    for node in (bridge, manager, scene, source):
+        executor.add_node(node)
+    commands = []
+
+    def on_command(message):
+        command = json.loads(message.data)
+        commands.append(command)
+        active = command['command'] == 'start'
+        status.update(active=active, phase='NAV' if active else 'ABORTED', route='4F_full',
+                      index=1, last_command=dict(request_id=command['request_id'], accepted=True, detail='ack'))
+        status_pub.publish(String(data=json.dumps(status)))
+
+    source.create_subscription(String, '/patrol/command', on_command, 10)
+    server = create_http_server(shared, '/nonexistent', port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def until(predicate):
+        deadline = time.monotonic()+8
+        while not predicate():
+            assert time.monotonic() < deadline, shared.snapshot()
+            executor.spin_once(timeout_sec=.01)
+
+    def post(kind, request_id, **values):
+        req = Request(f'http://127.0.0.1:{server.server_port}/api/{kind}',
+                      data=json.dumps(dict(request_id=request_id, **values)).encode(),
+                      headers={'Content-Type': 'application/json', 'X-AMR-Request': '1'})
+        with urlopen(req, timeout=2) as response:
+            assert response.status == 202
+
+    try:
+        scene.mode_pub.publish(String(data='AUTO'))
+        until(lambda: shared.state['patrol']['routes'] == ['4F_full']
+              and shared.readiness_error('goal') is None)
+        until(lambda: bridge.patrol_pub.get_subscription_count() > 0)
+        post('patrol/start', 'ros_patrol_start', route='4F_full')
+        until(lambda: shared.requests['ros_patrol_start']['status'] == 'SUCCEEDED')
+        assert commands == [dict(command='start', route='4F_full', request_id='ros_patrol_start')]
+        assert shared.snapshot(kiosk=True)['patrol']['active']
+        assert '야간 순찰 중' in shared.readiness_error('goal')
+        post('patrol/stop', 'ros_patrol_stop')
+        until(lambda: shared.requests['ros_patrol_stop']['status'] == 'SUCCEEDED')
+        assert commands[-1] == dict(command='stop', request_id='ros_patrol_stop')
+        assert not shared.patrol_active() and shared.state['pending_request'] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+        executor.shutdown()
+        scene.action.destroy()
+        manager.server.destroy()
+        for node in (bridge, manager, scene, source):
+            node.destroy_node()
+        rclpy.shutdown()

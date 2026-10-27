@@ -33,7 +33,7 @@ KIOSK_STATE_KEYS = frozenset((
     'preview', 'connection_epoch', 'mode', 'navigation', 'action_ready', 'floor_action_ready',
     'floor', 'floor_mission', 'goal', 'notice', 'pending_request', 'localization',
     'localization_reset_pending', 'robot', 'global_path', 'tf_error', 'estop', 'telemetry',
-    'acknowledged_request', 'kiosk', 'map_version', 'hold', 'task'))
+    'acknowledged_request', 'kiosk', 'map_version', 'hold', 'task', 'patrol'))
 ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'ARMING', 'READY', 'BYPASS'}
 ESTOP_STM32_KEYS = ('raw', 'debounced', 'latched', 'inhibit', 'odrv_idle', 'bus_off', 'odrv_hb_ok',
                     'drive_enabled', 'stopped', 'trip_count', 'release_count', 'reset_rejected', 'sequence')
@@ -85,6 +85,20 @@ HOLD_DEFER_PHASES = frozenset(('BOARDING', 'BACKING_OUT', 'IN_CAR_ALIGN', 'SELEC
                                'SWITCH_MAP', 'ALIGHTING', 'RETURN_TO_CAR', 'RELOCALIZE'))
 
 
+PATROL_PHASES = {'IDLE', 'NAV', 'DWELL', 'RETURN', 'DONE', 'ABORTED'}
+PATROL_LABELS = {'NAV': '이동', 'DWELL': '관측', 'RETURN': '복귀'}
+PATROL_DELIVERY_ERROR = '야간 순찰 중에는 배송을 받을 수 없습니다. 중앙 관제에서 순찰을 정지하세요.'
+
+
+def patrol_active(patrol):
+    if not isinstance(patrol, dict) or patrol.get('active') is not True:
+        return False
+    age = patrol.get('age')
+    if 'received_at' in patrol:
+        age = time.monotonic() - patrol['received_at']
+    return type(age) in (int, float) and 0 <= age < 3
+
+
 def task_summary(state):
     """One Korean task line, shared by the console and kiosk snapshots."""
     estop = state.get('estop') or {}
@@ -94,6 +108,11 @@ def task_summary(state):
         return '관리자 정지'
     if state.get('mode') == 'MANUAL':
         return '수동 조작'
+    patrol = state.get('patrol') or {}
+    if patrol_active(patrol):
+        text = (f"순찰 {patrol.get('route') or ''} {patrol.get('index', 0)}/{patrol.get('total', 0)}"
+                f" · {PATROL_LABELS.get(patrol.get('phase'), '이동')}")
+        return text + (' · 하차 후 정지 예정' if (state.get('hold') or {}).get('pending') else '')
     goal = state.get('goal') or {}
     status, room = goal.get('status'), goal.get('room')
     if status in ACTIVE_GOALS:
@@ -243,6 +262,7 @@ class SharedState:
         self.commands = queue.Queue(maxsize=32)
         # Safety commands must not be refused by the ordinary bounded queue.
         self.operator_commands = deque()
+        self.pending_patrol = {}  # request_id -> monotonic publish time
         self.hold_sequence = 0
         self.cancel_goal_ids = set()
         self.pending_return = None
@@ -289,7 +309,7 @@ class SharedState:
         # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
         # Encoded by the camera driver; this process never decodes or re-encodes images.
         self.camera = None
-        self.state = dict(hold=dict(held=False, since=None, reason='', pending=False), preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
+        self.state = dict(hold=dict(held=False, since=None, reason='', pending=False), preview=preview, patrol=dict(active=False, phase='IDLE', routes=[]), floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
                           action_ready=False, robot=None, amcl=None, scan=None,
                           global_path=None, local_path=None, footprint=None,
                           goal=None, notice=None, velocity=None, tf_error=None, pending_request=None,
@@ -344,7 +364,7 @@ class SharedState:
                     valid = False
                 if not valid:
                     raise ApiError(403, '키오스크에서는 등록된 호실로만 보낼 수 있습니다.')
-            elif kind in ('initialpose', 'relocalize', 'set_floor', 'kiosk/exit'):
+            elif kind in ('initialpose', 'relocalize', 'set_floor', 'kiosk/exit', 'patrol_start', 'patrol_stop'):
                 self._prune_kiosk_tokens(time.monotonic())
                 if self.kiosk_pin and token not in self.kiosk_tokens:
                     raise ApiError(403, '관리 모드 잠금을 먼저 해제하세요.')
@@ -511,6 +531,56 @@ class SharedState:
 
     def mission_active(self):
         return (self.state.get('floor_mission') or {}).get('phase') in FLOOR_MISSION_ACTIVE
+
+    def patrol_active(self):
+        return patrol_active(self.state.get('patrol'))
+
+    def update_patrol(self, text):
+        try:
+            value = json.loads(text, parse_constant=lambda _s: None)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(value, dict):
+            return False
+        patrol = dict(active=False, phase='IDLE', routes=[])
+        patrol.update(_typed(value, dict(active=bool, route=str, floor=str, phase=str,
+            index=int, total=int, detail=str, started_at=(int, float), elapsed_s=(int, float),
+            stamp=(int, float))))
+        if patrol['phase'] not in PATROL_PHASES:
+            patrol['phase'] = 'IDLE'
+        for key in ('route', 'floor', 'started_at'):
+            patrol.setdefault(key, None)
+        if isinstance(value.get('detail'), str):
+            patrol['detail'] = value['detail'][:300]
+        if isinstance(value.get('routes'), list):
+            patrol['routes'] = [v for v in value['routes'] if isinstance(v, str)
+                                and re.fullmatch(r'[A-Za-z0-9_-]{1,32}', v)]
+        patrol['skipped'] = ([v for v in value['skipped'] if type(v) is int and v >= 0][:1024]
+                             if isinstance(value.get('skipped'), list) else [])
+        ack = value.get('last_command')
+        patrol['last_command'] = None
+        if isinstance(ack, dict) and isinstance(ack.get('request_id'), str) and type(ack.get('accepted')) is bool:
+            patrol['last_command'] = dict(request_id=ack['request_id'][:80], accepted=ack['accepted'],
+                detail=ack['detail'][:300] if isinstance(ack.get('detail'), str) else '')
+        patrol['received_at'] = time.monotonic()
+        with self.lock:
+            self.state['patrol'] = patrol
+        return True
+
+    def poll_patrol(self):
+        """Called on executor ticks; HTTP acceptance is not the node acknowledgement."""
+        with self.lock:
+            ack = (self.state.get('patrol') or {}).get('last_command') or {}
+            now = time.monotonic()
+            for request_id, started in list(self.pending_patrol.items()):
+                if ack.get('request_id') == request_id and type(ack.get('accepted')) is bool:
+                    self.complete(request_id, 'SUCCEEDED' if ack['accepted'] else 'FAILED',
+                                  ack.get('detail', ''))
+                elif now - started >= 3:
+                    self.complete(request_id, 'FAILED', '순찰 노드가 응답하지 않습니다.')
+                else:
+                    continue
+                del self.pending_patrol[request_id]
 
     def update_floor_mission(self, text):
         """/floor_mission/status; only typed, whitelisted fields reach the browser."""
@@ -709,6 +779,11 @@ class SharedState:
         """Invalidate display/request state; never replay a command after restart."""
         with self.lock:
             self.cancel_pending_return(reason)
+            self.pending_patrol.clear()
+            self.operator_commands = deque(c for c in self.operator_commands
+                                           if c['kind'] not in ('patrol_start', 'patrol_stop'))
+            self.state['patrol'] = dict(active=False, phase='IDLE',
+                                       routes=list((self.state.get('patrol') or {}).get('routes', [])))
             self.connection_epoch += 1
             self.scan_stamp = None
             self.telemetry.reset()
@@ -815,6 +890,8 @@ class SharedState:
     def readiness_error(self, kind, request_id=None):
         """Shared admission check, repeated on the ROS executor before side effects."""
         with self.lock:
+            if kind in ('goal', 'floor_goal') and self.patrol_active():
+                return PATROL_DELIVERY_ERROR
             if self.state['preview']:
                 if kind in ('goal', 'floor_goal') and self.state['hold']['held']:
                     return '관리자가 원격으로 정지했습니다. 중앙 관제에서 해제해야 출발할 수 있습니다.'
@@ -943,6 +1020,10 @@ class SharedState:
             item = result.get(name)
             if item:
                 item['age'] = max(0, now-item.pop('received_at'))
+        patrol = result.get('patrol')
+        if patrol is not None:
+            received = patrol.pop('received_at', None)
+            patrol['age'] = max(0., now-received) if received is not None else patrol.get('age')
         localization = result.get('localization')
         if localization:
             localization['age'] = max(localization['age'], time.time()-localization.get('stamp', 0))
@@ -974,6 +1055,8 @@ class SharedState:
         request_id = payload.get('request_id', '')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ApiError(400, '요청 ID가 필요합니다.')
+        if kind in ('patrol_start', 'patrol_stop'):
+            return self.patrol_request(kind, request_id, payload)
         if kind in ('stop', 'resume', 'return_home'):
             return self.operator_request(kind, request_id)
         if kind not in ('goal', 'initialpose', 'cancel', 'relocalize', 'set_floor'):
@@ -1083,6 +1166,56 @@ class SharedState:
                 self.cancel_goal_ids.add(goal['request_id'])
             return self.set_hold(True)
 
+    def patrol_start_error(self, request_id=None):
+        if self.patrol_active():
+            return '이미 순찰 중입니다.'
+        if (self.state.get('goal') or {}).get('status') in ACTIVE_GOALS:
+            return '진행 중인 목표를 취소한 뒤 순찰을 시작해 주세요.'
+        if self.mission_active():
+            return '진행 중인 층간 이동이 있습니다.'
+        return self.readiness_error('goal', request_id)
+
+    def patrol_request(self, kind, request_id, payload):
+        route = payload.get('route')
+        keys = {'request_id', 'route'} if kind == 'patrol_start' else {'request_id'}
+        if payload.keys() != keys or (kind == 'patrol_start' and
+                (not isinstance(route, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', route))):
+            raise ApiError(400, '순찰 요청 형식이 올바르지 않습니다.')
+        with self.lock:
+            signature = (kind, route)
+            old = self.requests.get(request_id)
+            if old:
+                if old['signature'] != signature:
+                    raise ApiError(409, '같은 요청 ID에 다른 명령을 사용할 수 없습니다.')
+                return dict(old['response'])
+            if kind == 'patrol_start':
+                if route not in (self.state.get('patrol') or {}).get('routes', []):
+                    raise ApiError(409, '등록되지 않은 순찰 경로입니다.')
+                error = self.patrol_start_error()
+                if error:
+                    raise ApiError(409, error)
+            elif not self.patrol_active():
+                raise ApiError(409, '진행 중인 순찰이 없습니다.')
+            response = dict(request_id=request_id)
+            self.requests[request_id] = dict(request_id=request_id, kind=kind, status='QUEUED',
+                                             signature=signature, response=response)
+            while len(self.requests) > 256:
+                self.requests.popitem(last=False)
+            self.state['pending_request'] = dict(request_id=request_id, kind=kind)
+            command = dict(command='start' if kind == 'patrol_start' else 'stop', request_id=request_id)
+            if kind == 'patrol_start':
+                command['route'] = route
+            if self.state['preview']:
+                self.state['patrol'] = dict(self.state['patrol'], active=kind == 'patrol_start',
+                    phase='NAV' if kind == 'patrol_start' else 'ABORTED',
+                    route=route if kind == 'patrol_start' else self.state['patrol'].get('route'),
+                    index=1, total=12, age=0)
+                self.state['patrol'].pop('received_at', None)
+                self.complete(request_id, 'PREVIEW')
+            else:
+                self.operator_commands.append(dict(kind=kind, request_id=request_id, patrol=command))
+            return dict(response)
+
     def operator_request(self, kind, request_id):
         with self.lock:
             signature = (kind,)
@@ -1095,6 +1228,7 @@ class SharedState:
             if kind == 'return_home' and home is None:
                 raise ApiError(404, '복귀 지점이 설정되지 않았습니다.')
             response = dict(request_id=request_id)
+            patrol_stop = kind in ('stop', 'return_home') and self.patrol_active()
             deferred = False
             if kind in ('stop', 'return_home'):
                 self.cancel_pending_return('새 관리자 명령으로 복귀를 취소했습니다.')
@@ -1133,6 +1267,8 @@ class SharedState:
                 self.requests.popitem(last=False)
             self.state['pending_request'] = dict(request_id=request_id, kind=kind)
             if self.state['preview']:
+                if patrol_stop:
+                    self.state['patrol'] = dict(self.state['patrol'], active=False, phase='ABORTED')
                 if kind == 'return_home':
                     pose = self.building.floor(home.floor).rooms[home.room].goal
                     goal_kind = 'goal' if self.current_floor() == home.floor else 'floor_goal'
@@ -1141,7 +1277,8 @@ class SharedState:
                     self.pending_return = None
                 self.complete(request_id, 'PREVIEW')
             else:
-                self.operator_commands.append(dict(kind=kind, request_id=request_id, hold=event))
+                self.operator_commands.append(dict(kind=kind, request_id=request_id, hold=event,
+                                                   patrol_stop=patrol_stop))
             return dict(response)
 
     def next_return_command(self, now=None):
@@ -1157,6 +1294,8 @@ class SharedState:
             # The hold release travels on a topic and the goal on an action: give the
             # managers time to see held=false, or they reject the goal.
             error = ('이전 목표의 종료를 기다리고 있습니다.' if goal.get('status') in ACTIVE_GOALS
+                     else '이전 주행의 정지 완료를 기다리고 있습니다.'
+                     if self.state.get('navigation') in ACTIVE_NAVIGATION
                      else '관리자 정지 해제를 기다리고 있습니다.'
                      if now - pending['started'] < .5 or self.state.get('navigation') == 'HELD'
                      else self.readiness_error(kind, request_id))
@@ -1315,6 +1454,7 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                          '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
                          '/api/set_floor': 'set_floor', '/api/acknowledge': 'acknowledge',
                          '/api/kiosk/unlock': 'kiosk/unlock', '/api/kiosk/exit': 'kiosk/exit',
+                         '/api/patrol/start': 'patrol_start', '/api/patrol/stop': 'patrol_stop',
                          '/api/stop': 'stop',
                          '/api/resume': 'resume', '/api/return_home': 'return_home'}
                 kind = kinds.get(self.path)

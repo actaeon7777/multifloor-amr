@@ -87,6 +87,7 @@ class WebBridge(Node):
         self.waiting_set_floor = None
         self.pending_set_floor = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
+        self.patrol_pub = self.create_publisher(String, '/patrol/command', 10)
         self.announcement_pub = self.create_publisher(String, '/robot/announcement', 10)
         self.shared.announce = self.announce
         self.hold_pub = self.create_publisher(String, '/operator/hold',
@@ -99,7 +100,8 @@ class WebBridge(Node):
         self.pending_vectors = {}
         self.robot_stamp = None
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.subscriptions_list = []
+        self.subscriptions_list = [self.create_subscription(
+            String, '/patrol/status', lambda m: self.shared.update_patrol(m.data), latched)]
         for name, topic in [('map', '/map'), ('local_costmap', '/local_costmap/costmap'),
                             ('global_costmap', '/global_costmap/costmap')]:
             self.subscriptions_list.append(self.create_subscription(
@@ -668,6 +670,19 @@ class WebBridge(Node):
         with self.shared.lock:
             while self.shared.operator_commands:
                 command = self.shared.operator_commands.popleft()
+                if command['kind'] in ('patrol_start', 'patrol_stop'):
+                    request_id = command['request_id']
+                    error = (self.shared.patrol_start_error(request_id)
+                             if command['kind'] == 'patrol_start' else None)
+                    if error:
+                        self.shared.complete(request_id, 'FAILED', error)
+                    else:
+                        self.shared.pending_patrol[request_id] = time.monotonic()
+                        self.patrol_pub.publish(String(data=json.dumps(command['patrol'])))
+                    continue
+                if command.get('patrol_stop'):
+                    self.patrol_pub.publish(String(data=json.dumps(
+                        {'command': 'stop', 'request_id': command['request_id']})))
                 if command['hold'] is not None:
                     self.hold_pub.publish(String(data=json.dumps(command['hold'])))
                 if command['kind'] != 'return_home':
@@ -693,6 +708,7 @@ class WebBridge(Node):
         self.update_grid_origins()
         self.poll_set_floor()
         self.poll_operator_commands()
+        self.shared.poll_patrol()
         if self.pending_relocalize and time.monotonic()-self.pending_relocalize[2] > 5:
             future, request_id, _received = self.pending_relocalize
             self.pending_relocalize = None

@@ -12,7 +12,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .common import (COMMANDS, MAX_MESSAGE, MAX_SUMMARY, PROTOCOL_VERSION, REQUEST_ID,
-                     HttpClient, base_url, dumps, identifier, loads, positive, read_token)
+                     LOCAL_COMMAND_PATHS, valid_command_payload, HttpClient, base_url, dumps, identifier, loads, positive, read_token)
 from .summary import summarize
 
 LOG = logging.getLogger(__name__)
@@ -60,7 +60,8 @@ class Agent:
         kind, payload, ttl = command.get('kind'), command.get('payload'), command.get('ttl')
         if (not isinstance(command_id, str) or not REQUEST_ID.fullmatch(command_id) or
                 not isinstance(kind, str) or kind not in COMMANDS or
-                payload != {'request_id': command_id} or type(ttl) not in (int, float) or
+                not valid_command_payload(kind, payload) or payload['request_id'] != command_id or
+                type(ttl) not in (int, float) or
                 not math.isfinite(ttl)):
             raise ValueError('Invalid command from host')
         if command_id in self.executed:
@@ -75,7 +76,7 @@ class Agent:
         else:
             try:
                 status, _, body = self.http.request(
-                    self.local_url + '/api/' + kind, payload, {'X-AMR-Request': '1'},
+                    self.local_url + '/api/' + LOCAL_COMMAND_PATHS[kind], payload, {'X-AMR-Request': '1'},
                     timeout=min(self.timeout, ttl - round_trip), limit=64 * 1024)
                 result_body = loads(body)
                 if not isinstance(result_body, dict) or not 200 <= status <= 599:

@@ -1,7 +1,7 @@
 'use strict';
 const cards = new Map();
 const busy = new Set();
-const labels = {stop: '정지', resume: '해제', return_home: '복귀'};
+const labels = {stop: '정지', resume: '해제', return_home: '복귀', patrol_start: '순찰 시작', patrol_stop: '순찰 정지'};
 const numeric = (value, digits = 2) => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -21,19 +21,24 @@ function makeCard(id) {
   }
   const badges = element('div', undefined, 'badges');
   const actions = element('div', undefined, 'actions');
+  const patrolRow = element('div', undefined, 'patrol-row');
+  const route = element('select');
+  route.setAttribute('aria-label', `${id} 순찰 경로`);
+  const patrolProgress = element('p', '', 'patrol-progress');
+  patrolRow.append(element('strong', '순찰'), route);
   const buttons = {};
   for (const [kind, label] of Object.entries(labels)) {
     const button = element('button', label, kind);
     button.type = 'button';
     button.addEventListener('click', () => command(id, kind));
-    actions.append(button);
+    (kind.startsWith('patrol_') ? patrolRow : actions).append(button);
     buttons[kind] = button;
   }
   const result = element('p', '', 'result');
   result.setAttribute('role', 'status');
-  node.append(title, link, fields, badges, actions, result);
+  node.append(title, link, fields, badges, actions, patrolRow, patrolProgress, result);
   document.querySelector('#robots').append(node);
-  const card = {node, link, values, badges, buttons, result, robot: {robot_id: id, online: false}};
+  const card = {node, link, values, badges, buttons, result, route, patrolProgress, robot: {robot_id: id, online: false}};
   cards.set(id, card);
   return card;
 }
@@ -50,6 +55,18 @@ function update(card, robot) {
   card.values.battery.textContent = b ? (b.valid && typeof b.soc === 'number' ? `${numeric(b.soc, 0)} %` : `${numeric(b.voltage)} V`) + (b.fresh === false ? ' (지연)' : '') : '—';
   card.values.mode.textContent = s.mode || '—';
   card.values.hold.textContent = !robot.online ? '—' : s.hold?.held ? '정지 중' : s.hold?.pending ? '하차 후 정지 예정' : '해제됨';
+  const p = s.patrol || {};
+  const patrolOn = p.active === true && typeof p.age === 'number' && p.age < 3;
+  const routes = Array.isArray(p.routes) ? p.routes.filter(v => typeof v === 'string') : [];
+  if (JSON.stringify(routes) !== card.route.dataset.routes) {
+    const selected = card.route.value;
+    card.route.replaceChildren(...routes.map(name => { const option = element('option', name); option.value = name; return option; }));
+    if (routes.includes(selected)) card.route.value = selected;
+    card.route.dataset.routes = JSON.stringify(routes);
+  }
+  card.route.disabled = !robot.online || busy.has(robot.robot_id) || !routes.length;
+  const phase = {NAV:'이동', DWELL:'관측', RETURN:'복귀', IDLE:'대기', DONE:'완료', ABORTED:'중단'}[p.phase] || p.phase || '대기';
+  card.patrolProgress.textContent = robot.online ? `${p.route || '—'} ${p.index ?? 0}/${p.total ?? 0} · ${phase}` : '—';
   card.badges.replaceChildren();
   if (robot.online) {
     if (s.estop?.state === 'ESTOP' || s.estop?.healthy === false || s.estop?.error) {
@@ -59,13 +76,17 @@ function update(card, robot) {
     } else {
       card.badges.append(element('span', `E-stop ${s.estop.state || '정상'}`, 'badge safe'));
     }
+    if (patrolOn) card.badges.append(element('span', '순찰 중', 'badge'));
     if (s.mode === 'MANUAL') card.badges.append(element('span', '수동', 'badge'));
     if (s.hold?.held) card.badges.append(element('span', '관리자 정지', 'badge danger'));
     else if (s.hold?.pending) card.badges.append(element('span', '하차 후 정지 예정', 'badge danger'));
     if (s.localization?.ready !== true) card.badges.append(element('span', '위치 확인 필요', 'badge'));
   }
   for (const [kind, button] of Object.entries(card.buttons)) {
-    button.disabled = !robot.online || busy.has(robot.robot_id) || (kind === 'resume' && s.hold?.held !== true && s.hold?.pending !== true);
+    button.disabled = !robot.online || busy.has(robot.robot_id) || (kind === 'resume' && s.hold?.held !== true && s.hold?.pending !== true) ||
+      (kind === 'patrol_start' && (!routes.length || s.hold?.held || patrolOn ||
+        ['SENDING', 'ACCEPTED', 'CANCELING'].includes(s.goal?.status))) ||
+      (kind === 'patrol_stop' && !patrolOn);
   }
 }
 // AbortSignal.timeout is missing in older browsers; without it every fetch would throw.
@@ -79,14 +100,18 @@ function requestId() {
 async function command(id, kind) {
   const card = cards.get(id);
   if (busy.has(id) || !card.robot.online || card.buttons[kind].disabled) return;
-  if (kind !== 'resume' && !window.confirm(kind === 'stop' ? `${id} 로봇을 정지할까요?` : `${id} 로봇을 홈으로 복귀시킬까요?`)) return;
+  const confirmation = {stop:`${id} 로봇을 정지할까요?`, return_home:`${id} 로봇을 홈으로 복귀시킬까요?`,
+    patrol_start:`${id} 로봇의 ${card.route.value} 순찰을 시작할까요?`, patrol_stop:`${id} 로봇의 순찰을 정지할까요?`};
+  if (kind !== 'resume' && !window.confirm(confirmation[kind])) return;
+  const payload = {request_id: requestId()};
+  if (kind === 'patrol_start') payload.route = card.route.value;
   busy.add(id);
   card.result.textContent = `${labels[kind]} 요청 중…`;
   update(card, card.robot);
   try {
     const response = await fetch(`/robots/${encodeURIComponent(id)}/api/${kind}`, {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-AMR-Request': '1'},
-      body: JSON.stringify({request_id: requestId()}), signal: timeoutSignal(15000)
+      body: JSON.stringify(payload), signal: timeoutSignal(15000)
     });
     const body = await response.json();
     card.result.textContent = response.ok ? `${labels[kind]} 요청 접수 (${response.status})` : (body.error || `요청 실패 (${response.status})`);

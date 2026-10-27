@@ -438,3 +438,68 @@ def test_http_handler_bytes_without_socket(monkeypatch, method, path, payload, h
     assert int(bytes(output).split(b' ', 2)[1]) == expected
     if path == '/api/robots' and expected == 200:
         assert loads(bytes(output).split(b'\r\n\r\n', 1)[1]) == []
+
+
+@pytest.mark.parametrize('kind,path,extra', [('patrol_start', 'patrol/start', {'route': '4F_full'}),
+                                          ('patrol_stop', 'patrol/stop', {})])
+def test_patrol_commands_reach_local_paths(system, kind, path, extra):
+    system.start()
+    payload = dict(request_id='request_' + kind, **extra)
+    status, _, body = system.request('/robots/amr-01/api/' + kind, payload)
+    assert status == 202 and loads(body)['request_id'] == payload['request_id']
+    assert system.calls == [('/api/' + path, payload, '1', 'application/json')]
+    assert system.request('/robots/amr-01/api/' + kind, payload)[0] == 202
+    assert len(system.calls) == 1
+
+
+@pytest.mark.parametrize('route', ['', '../4F', 'a'*33, None, True, [], '4F full'])
+def test_patrol_bad_route_http_never_queued(system, route):
+    system.start()
+    payload = dict(request_id='bad_route_request', route=route)
+    assert system.request('/robots/amr-01/api/patrol_start', payload)[0] == 400
+    assert not system.registry.robots['amr-01'].commands and not system.calls
+
+
+@pytest.mark.parametrize('kind,payload', [
+    ('patrol_start', {'request_id': 'missing_route'}),
+    ('patrol_start', {'request_id': 'bad_route_01', 'route': '../4F'}),
+    ('patrol_start', {'request_id': 'extra_field', 'route': '4F_full', 'x': 1}),
+    ('patrol_stop', {'request_id': 'extra_route', 'route': '4F_full'}),
+    ('stop', {'request_id': 'old_kind_extra', 'route': '4F_full'}),
+])
+def test_patrol_payload_strict_on_both_sides(kind, payload):
+    with pytest.raises(ApiError) as error:
+        Registry().queue('amr-01', kind, payload)
+    assert error.value.status == 400
+    agent = Agent('http://127.0.0.1:8081', TOKEN)
+    with pytest.raises(ValueError, match='Invalid command'):
+        agent.execute(dict(command_id=payload['request_id'], kind=kind, payload=payload, ttl=2), 0)
+    assert not agent.executed
+
+
+@pytest.mark.parametrize('kind,path,extra', [('patrol_start', 'patrol/start', {'route': '4F_full'}),
+                                          ('patrol_stop', 'patrol/stop', {})])
+def test_patrol_relay_without_sockets(kind, path, extra):
+    registry = Registry()
+    registry.exchange(message())
+    payload = dict(request_id='no_socket_patrol', **extra)
+    registry.queue('amr-01', kind, payload)
+    command = registry.exchange(message(2))['commands'][0]
+    agent = Agent('http://127.0.0.1:8081', TOKEN)
+    calls = []
+
+    def request(url, body, headers, **_kwargs):
+        calls.append((url, body, headers))
+        return 202, {}, dumps({'request_id': body['request_id']})
+
+    agent.http.request = request
+    agent.execute(command, 0)
+    assert calls == [(agent.local_url + '/api/' + path, payload, {'X-AMR-Request': '1'})]
+    assert agent.results[payload['request_id']]['http_status'] == 202
+
+
+@pytest.mark.parametrize('routes', ['4F_full', [None], [False], [1], ['a'*33], ['4F_full']*33])
+def test_patrol_summary_routes_schema_rejects_invalid_lists(routes):
+    with pytest.raises(ApiError) as error:
+        Registry().exchange(message(summary={'patrol': {'routes': routes}}))
+    assert error.value.status == 400

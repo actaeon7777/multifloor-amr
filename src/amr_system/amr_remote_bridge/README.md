@@ -1,23 +1,31 @@
 # AMR Remote Bridge — protocol 2
 
-로봇 에이전트가 로컬 `/api/state`를 읽어 최대 16 KiB의 요약을 중앙 서버에 보낸다.
-중앙 서버는 로봇별 카드를 표시하고 `stop`, `resume`, `return_home`만 중계한다.
+로봇 에이전트가 로컬 `/api/kiosk/state`를 읽어 최대 16 KiB의 요약을 중앙 서버에 보낸다.
+중앙 서버는 로봇별 카드를 표시하고 `stop`, `resume`, `return_home`, `patrol_start`, `patrol_stop`을 중계한다.
 지도·costmap·카메라 이미지를 읽거나 전송하지 않으며, 로봇 웹 UI 자산에 의존하지 않는다.
 
 - 에이전트 → 서버: `{protocol: 2, robot_id, session_id, sequence, state_age, summary, local_error, results}`.
 - 서버 → 에이전트: `{protocol: 2, session_id, sequence, commands, accepted_results}`.
-- 명령: `{command_id, kind, payload: {request_id: command_id}, ttl}`.
+- 명령: `{command_id, kind, payload: {request_id: command_id}, ttl}`. `patrol_start`의 payload에만 `route`를 추가한다.
 - 결과: `{command_id, http_status, body}`. 로컬 응답을 그대로 돌려준다.
 - protocol 1은 서버에서 409, 에이전트에서 RuntimeError로 거부한다.
 
 `summary.py`는 층(이동 중 출발층), 구역, x/y/yaw/age, 작업, 모드, 내비 상태,
-E-stop, 관리자 정지, 목표·층간 미션 요약, 배터리, 위치 확인 상태, 알림, 대기 요청만 추린다.
+E-stop, 관리자 정지, 목표·층간 미션·순찰 요약, 배터리, 위치 확인 상태, 알림, 대기 요청만 추린다.
 누락된 블록은 null/default로 처리한다. 서버는 필드 타입과 요약 크기를 검증한다.
 
 서버의 `GET /api/robots`는 로봇 목록 배열을 반환한다. 연결/로컬 상태가 만료되면 `online=false`,
 `summary=null`이며 새 명령을 거부한다. `GET /`, `/console.js`, `/console.css`는 콘솔 자산이다.
 `POST /robots/<id>/api/{stop,resume,return_home}`에는 `X-AMR-Request: 1`, JSON, 유효한
 `request_id`만 필요하다. `/api/...`는 설정한 기본 로봇에 보낸다.
+순찰은 `POST /robots/<id>/api/patrol_start`에 `{request_id, route}`,
+`POST /robots/<id>/api/patrol_stop`에 `{request_id}`를 보낸다. 경로 이름은
+`[A-Za-z0-9_-]{1,32}`만 허용하며, 시작은 로봇이 알린 등록 경로만 받는다.
+에이전트는 각각 로컬 `/api/patrol/start`, `/api/patrol/stop`으로 명시적으로 매핑한다.
+순찰 요약은 `active, route, phase, index, total, detail, routes, age`이며 경로 목록은 최대 32개다.
+HTTP 202는 요청 접수다. 로봇의 응답은 이후 요약의 `notice`에서 확인한다. 로컬 웹은
+`/patrol/status.last_command`의 요청 ID가 일치하면 성공/실패 처리하고, 발행 후 3초 동안
+응답이 없으면 `순찰 노드가 응답하지 않습니다.`로 실패 처리한다.
 운영자 인증은 Basic(`operator`와 공유 토큰), 에이전트는 Bearer다.
 
 활성 세션의 robot_id를 다른 에이전트가 차지할 수 없고 시퀀스 재사용도 거부한다.

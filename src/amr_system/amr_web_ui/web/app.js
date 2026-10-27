@@ -193,6 +193,9 @@
       if (s.hold?.held) {
         $('nav-status').textContent = '관리자 정지';
         $('nav-detail').textContent = '중앙 관제에서 해제한 뒤 목적지를 다시 지정하세요.';
+      } else if (s.patrol?.active === true && Number.isFinite(s.patrol.age) && s.patrol.age >= 0 && s.patrol.age < 3) {
+        $('nav-status').textContent = '야간 순찰 중';
+        $('nav-detail').textContent = s.task || '';
       } else if (goal?.origin === 'return_home' && ['SENDING','ACCEPTED','CANCELING'].includes(goal.status)) {
         $('nav-status').textContent = '관리자 호출로 복귀 중';
         $('nav-detail').textContent = `${goal.floor} ${goal.room}호`;

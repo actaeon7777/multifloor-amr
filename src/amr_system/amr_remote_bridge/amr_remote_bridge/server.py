@@ -1,4 +1,4 @@
-"""Stdlib central console: small robot summaries and three explicit commands."""
+"""Stdlib central console: small robot summaries and explicit operator commands."""
 import argparse
 import base64
 from collections import OrderedDict
@@ -15,7 +15,7 @@ import time
 from urllib.parse import urlsplit
 
 from .common import (COMMANDS, MAX_COMMAND, MAX_MESSAGE, MAX_SUMMARY, PROTOCOL_VERSION,
-                     REQUEST_ID, dumps, identifier, loads, positive, read_token)
+                     REQUEST_ID, valid_command_payload, dumps, identifier, loads, positive, read_token)
 from .slack_notify import SlackNotifier
 
 
@@ -40,6 +40,8 @@ SUMMARY_SCHEMA = {
     'hold': {'held': bool, 'since': 'number', 'reason': str, 'pending': bool},
     'goal': dict.fromkeys(('request_id', 'kind', 'status', 'floor', 'room', 'origin', 'error_message', 'phase'), str),
     'floor_mission': {'phase': str, 'detail': str},
+    'patrol': {'active': bool, 'route': str, 'phase': str, 'index': int, 'total': int,
+               'detail': str, 'routes': [str], 'age': 'number'},
     'battery': {'soc': 'number', 'voltage': 'number', 'valid': bool, 'fresh': bool, 'charge_state': (int, str)},
     'localization': {'ready': bool, 'age': 'number'},
     'notice': {'request_id': str, 'status': str, 'detail': str},
@@ -67,6 +69,13 @@ def validate_summary(summary):
                 raise ApiError(400, f'Invalid summary field: {path}')
             for key, item in value.items():
                 check(item, schema[key], path + '.' + key)
+        elif isinstance(schema, list):
+            if not isinstance(value, list) or len(value) > 32:
+                raise ApiError(400, f'Invalid summary list: {path}')
+            for item in value:
+                if type(item) is not str or len(item) > 32:
+                    raise ApiError(400, f'Invalid summary list item: {path}')
+                check(item, schema[0], path + '[]')
         elif schema == 'number':
             if not _number(value) or (path.endswith(('.age', '.since')) and value < 0):
                 raise ApiError(400, f'Invalid summary number: {path}')
@@ -228,9 +237,9 @@ class Registry:
         if not isinstance(kind, str) or kind not in COMMANDS or not isinstance(payload, dict):
             raise ApiError(400, 'Invalid command')
         request_id = payload.get('request_id')
-        if (not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id) or
-                payload != {'request_id': request_id}):
-            raise ApiError(400, '요청 ID만 포함한 명령이 필요합니다.')
+        if not valid_command_payload(kind, payload):
+            raise ApiError(400, '명령에 필요한 요청 ID와 인자를 확인해 주세요.'
+                           if kind in ('patrol_start', 'patrol_stop') else '요청 ID만 포함한 명령이 필요합니다.')
         now = time.monotonic()
         with self.lock:
             robot = self.robots.get(robot_id)

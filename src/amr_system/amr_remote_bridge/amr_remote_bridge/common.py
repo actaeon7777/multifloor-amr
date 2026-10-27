@@ -13,9 +13,24 @@ PROTOCOL_VERSION = 2
 MAX_MESSAGE = 256 * 1024
 MAX_SUMMARY = 16 * 1024
 MAX_COMMAND = 4096
-COMMANDS = frozenset(('stop', 'resume', 'return_home'))
+COMMANDS = frozenset(('stop', 'resume', 'return_home', 'patrol_start', 'patrol_stop'))
 IDENTIFIER = re.compile(r'[A-Za-z0-9_-]{1,64}')
 REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{8,80}')
+PATROL_ROUTE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+LOCAL_COMMAND_PATHS = {'stop': 'stop', 'resume': 'resume', 'return_home': 'return_home',
+                       'patrol_start': 'patrol/start', 'patrol_stop': 'patrol/stop'}
+
+
+def valid_command_payload(kind, payload):
+    if not isinstance(payload, dict):
+        return False
+    request_id = payload.get('request_id')
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        return False
+    if kind == 'patrol_start':
+        return (payload.keys() == {'request_id', 'route'} and isinstance(payload.get('route'), str)
+                and PATROL_ROUTE.fullmatch(payload['route']) is not None)
+    return kind in COMMANDS and payload.keys() == {'request_id'}
 
 
 def identifier(value):

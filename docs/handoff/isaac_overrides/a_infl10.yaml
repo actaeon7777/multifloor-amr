@@ -1,0 +1,456 @@
+# ROS 2 Jazzy Nav2, adapted from nav2_bringup/params/nav2_params.yaml.
+# No vehicle IO, localization or velocity smoother is launched here.
+# DWB acceleration/deceleration are INITIAL MODEL ASSUMPTIONS, not measured ODrive values.
+# WheelSpeed geometry is required and injected from the running mux configuration by launch.
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 1.0
+    planner_plugins:
+    - GridBased
+    GridBased:
+      plugin: nav2_smac_planner::SmacPlanner2D
+      tolerance: 0.15
+      downsample_costmap: false
+      allow_unknown: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # Higher traversal cost keeps clearance inside the global inflation band.
+      cost_travel_multiplier: 4.0
+      use_final_approach_orientation: false
+      # Strong smoothing removes 8-connected stair steps and medial-axis wiggles
+      # where corridor walls jog. floor4 benchmark (scripts/benchmark_global_planner.py):
+      # heading reversals 29 -> 0, turning -60 %, length -1 %, min clearance 0.80 -> 0.75 m.
+      smoother:
+        max_iterations: 4000
+        w_smooth: 0.95
+        w_data: 0.02
+        tolerance: 1.0e-10
+        do_refinement: true
+        refinement_num: 6
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0
+    enable_stamped_cmd_vel: false
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins:
+    - progress_checker
+    goal_checker_plugins:
+    - goal_checker
+    controller_plugins:
+    - FollowPath
+    progress_checker:
+      # Rotation Shim can legitimately turn in place for longer than 10 s.
+      # Count heading progress without weakening the stationary timeout.
+      plugin: nav2_controller::PoseProgressChecker
+      required_movement_radius: 0.1
+      required_movement_angle: 0.3
+      movement_time_allowance: 10.0
+    FollowPath:
+      # Smac 2D may begin with a sharp turn; align before invoking DWB.
+      plugin: nav2_rotation_shim_controller::RotationShimController
+      primary_controller: dwb_core::DWBLocalPlanner
+      angular_dist_threshold: 0.6
+      angular_disengage_threshold: 0.2
+      # Preserve the measured sampling distance from the original deployment.
+      # Keep this beyond stopping travel during moving replans.
+      # Bag 20261002_154316 overshot the previous 0.5 m target at ~0.9 m/s.
+      forward_sampling_distance: 1.0
+      rotate_to_heading_angular_vel: 0.4
+      max_angular_accel: 0.8
+      simulate_ahead_time: 2.0
+      rotate_to_goal_heading: false
+      # Align only for a new goal. Re-arming on every replan (10 s path refresh) made the
+      # shim turn toward the goal point at the goal and fight DWB's final alignment
+      # (full-stack sim, 2026-10-16: 1 of 3 "goal behind" trials timed out spinning).
+      rotate_to_heading_once: true
+      # Ramp from the last command, not the measured rate: in-place rotation yields ~85 %
+      # of the command in sim, so measured + accel*dt stalled at ~0.26 rad/s instead of 0.4.
+      closed_loop: false
+      debug_trajectory_details: false
+      min_vel_x: 0.0
+      min_vel_y: 0.0
+      # Match the 1.0 m/s body command cap; wheel limits still apply downstream.
+      max_vel_x: 0.5
+      max_vel_y: 0.0
+      max_vel_theta: 0.6
+      min_speed_xy: 0.02
+      max_speed_xy: 1.0
+      # Keep a fine angular sample below the goal checker's 0.05 rad/s stopped
+      # threshold. The wider search window and PreferForward encourage useful
+      # initial turns while still allowing final alignment to settle.
+      min_speed_theta: 0.04
+      acc_lim_x: 0.5
+      acc_lim_y: 0.0
+      # Search-window tuning, not measured physical acceleration: at 20 Hz this
+      # admits +/-0.08 rad/s around measured yaw, instead of +/-0.04 rad/s.
+      acc_lim_theta: 1.6
+      decel_lim_x: -0.5
+      decel_lim_y: 0.0
+      decel_lim_theta: -1.6
+      # 288 nominal candidates (was 800); preserve collision resolution.
+      vx_samples: 12
+      vy_samples: 1
+      vtheta_samples: 24
+      sim_time: 1.5
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      xy_goal_tolerance: 0.15
+      trans_stopped_velocity: 0.03
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      critics:
+      - WheelSpeed
+      - RotateToGoal
+      - Oscillation
+      - ObstacleFootprint
+      - BaseObstacle
+      - PreferForward
+      - GoalAlign
+      - PathAlign
+      - PathDist
+      - GoalDist
+      # Prefer purposeful motion over simultaneous crawl and tiny rotation.
+      PreferForward.scale: 1.0
+      # Penalize crawling below 0.10 m/s unless deliberately turning. A yaw
+      # penalty alone can select near-stationary rollouts on a curved path.
+      # Keep this below the final-heading critic's small-angle cost; a large
+      # crawl penalty can prevent a stopped goal from settling its rotation.
+      PreferForward.penalty: 0.5
+      PreferForward.strafe_x: 0.10
+      PreferForward.strafe_theta: 0.12
+      # Break equal grid-score ties in favor of less yaw. With zero penalty,
+      # the angular iterator's first (most negative) sample can win repeatedly.
+      PreferForward.theta_scale: 0.5
+      BaseObstacle.scale: 0.12
+      # A longer nose projection strengthens heading feedback on straight paths.
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.5
+      # Modest local-goal alignment makes rotation useful before entering a bend;
+      # almost-zero scale plus a yaw penalty stalled the sharp-corner fixture.
+      GoalAlign.scale: 8.0
+      GoalAlign.forward_point_distance: 0.5
+      # Raise path tracking and retain enough goal progress to negotiate bends.
+      # Trial 20261002_162028 drifted up to 0.91 m off a centered straight path.
+      PathDist.scale: 32.0
+      GoalDist.scale: 32.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 3.0
+      RotateToGoal.lookahead_time: -1.0
+      trajectory_generator_name: dwb_plugins::LimitedAccelGenerator
+      sim_period: 0.05
+      publish_local_plan: true
+      publish_global_plan: true
+      publish_trajectories: false
+      # Recording -a subscribes to evaluation and enables large per-cycle copies
+      # unless explicitly disabled (310 MiB in this 111 s trial).
+      publish_evaluation: false
+      publish_cost_grid_pc: false
+      WheelSpeed.class: amr_nav2_plugins::WheelSpeedCritic
+      WheelSpeed.scale: 1.0
+      # Positive scale keeps full polygon collision rejection enabled.
+      # BaseObstacle supplies inflation preference; this critic checks the outline.
+      ObstacleFootprint.scale: 0.02
+    odom_topic: /odometry/filtered
+    goal_checker:
+      plugin: nav2_controller::StoppedGoalChecker
+      xy_goal_tolerance: 0.15
+      yaw_goal_tolerance: 0.15
+      trans_stopped_velocity: 0.03
+      rot_stopped_velocity: 0.05
+      stateful: true
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: map
+      robot_base_frame: base_footprint
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      transform_tolerance: 0.2
+      resolution: 0.05
+      rolling_window: false
+      plugins:
+      - static_layer
+      - obstacle_layer
+      - depth_layer
+      - inflation_layer
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: LaserScan
+          marking: true
+          clearing: true
+          inf_is_valid: true
+          observation_persistence: 0.0
+          expected_update_rate: 0.5
+          obstacle_min_range: 0.1
+          obstacle_max_range: 5.0
+          raytrace_min_range: 0.1
+          raytrace_max_range: 6.0
+          max_obstacle_height: 2.0
+      # Depth-only low obstacles must invalidate the global path as well as
+      # constrain local motion. Keep height/clearing rules aligned with local.
+      depth_layer:
+        # STVL instead of VoxelLayer (2026-10-27): VoxelLayer forgot a mark only
+        # when its own rays crossed it, so marks in the blind band (bumper to
+        # 0.70 m ahead, the sides, behind) stayed forever. On 10-26 a false mark
+        # beside the robot after the 4F elevator exit, and a removed object at
+        # 401, kept every trajectory illegal and recovery kept them (2 m keep zone).
+        # Marks now expire voxel_decay s after their last observation, faster
+        # inside the camera frustum when no return re-marks them.
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
+        enabled: true
+        voxel_decay: 10.0
+        decay_model: 0
+        voxel_size: 0.05
+        track_unknown_space: true
+        # Any occupied voxel marks its column: a low box top fills one voxel.
+        mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1
+        origin_z: 0.0
+        publish_voxel_map: false
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
+          topic: /camera/depth/points_filtered
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # 0.06 with the persistence filter (2026-10-25 bags 012806/020944):
+          # single-frame glossy-floor returns at 5-11 cm, 1.5-2.8 m, blocked the
+          # corridor; 3-frame persistence removes them and keeps an 11 cm box
+          # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
+          min_obstacle_height: 0.06
+          max_obstacle_height: 1.0
+          obstacle_range: 3.0
+          inf_is_valid: false
+          voxel_min_points: 0
+          clear_after_reading: true
+        depth_clear:
+          # Frustum model: a voxel inside the measured view that no return
+          # re-marks expires ~1.4 s after its last mark (decay_acceleration 15
+          # against voxel_decay 10). Gemini 2 depth FOV 92.4 x 66.2 deg.
+          # STVL puts min_z/max_z on the corner rays, so on the axis they are
+          # x0.58: near 0.20 m (past the sensor's 0.15 m dead zone), far 3.0 m
+          # (= obstacle_range; a frame cannot re-mark what lies beyond it).
+          topic: /camera/depth/points
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          model_type: 0
+          min_z: 0.35
+          max_z: 5.1
+          horizontal_fov_angle: 1.613
+          vertical_fov_angle: 1.155
+          decay_acceleration: 15.0
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          clear_after_reading: true
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        # 1.0 (was 1.6, 2026-10-25 bag 023737): with 1.6 every cell of the 2.7 m
+        # corridor carried wall cost, so Smac followed the free-space medial axis,
+        # bulging into lobbies and swinging back to centre after each obstacle.
+        # Below half the corridor width the centre is cost-free and plans run
+        # straight. Real map + observed obstacles (benchmark_global_planner.py):
+        # turning -20..-36 %, heading reversals 3-6 -> 0-4, min clearance 0.45 m
+        # unchanged on the box routes. Local costmap keeps 1.6.
+        inflation_radius: 1.0
+        cost_scaling_factor: 2.0
+      always_send_full_costmap: false
+      track_unknown_space: true
+      robot_radius: 0.44
+      footprint_padding: 0.0
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_topic: /map
+        map_subscribe_transient_local: true
+        subscribe_to_updates: true
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: odom
+      robot_base_frame: base_footprint
+      update_frequency: 10.0
+      # Visualization only; collision checking still updates at 10 Hz.
+      publish_frequency: 2.0
+      transform_tolerance: 0.2
+      resolution: 0.05
+      rolling_window: true
+      plugins:
+      - obstacle_layer
+      - depth_layer
+      - inflation_layer
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          data_type: LaserScan
+          marking: true
+          clearing: true
+          inf_is_valid: true
+          observation_persistence: 0.0
+          expected_update_rate: 0.5
+          obstacle_min_range: 0.1
+          obstacle_max_range: 5.0
+          raytrace_min_range: 0.1
+          raytrace_max_range: 6.0
+          max_obstacle_height: 2.0
+      # Gemini 2 depth cloud (bringup start_camera:=true). The S2 scan plane is
+      # 0.195 m above the floor; this layer adds what it misses: low boxes, table
+      # tops, chair seats, up to the robot top (0.84 m). The lower FOV edge first
+      # meets the floor 0.70 m ahead of base_link (raised surfaces can remain
+      # visible closer); marks there are kept only for voxel_decay (see below).
+      # expected_update_rate 0 keeps the costmap current without the camera
+      # (simulation, start_camera:=false); time_health gates AUTO on a dead camera.
+      depth_layer:
+        # STVL instead of VoxelLayer (2026-10-27): VoxelLayer forgot a mark only
+        # when its own rays crossed it, so marks in the blind band (bumper to
+        # 0.70 m ahead, the sides, behind) stayed forever. On 10-26 a false mark
+        # beside the robot after the 4F elevator exit, and a removed object at
+        # 401, kept every trajectory illegal and recovery kept them (2 m keep zone).
+        # Marks now expire voxel_decay s after their last observation, faster
+        # inside the camera frustum when no return re-marks them.
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
+        enabled: true
+        voxel_decay: 10.0
+        decay_model: 0
+        voxel_size: 0.05
+        track_unknown_space: true
+        # Any occupied voxel marks its column: a low box top fills one voxel.
+        mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1
+        origin_z: 0.0
+        publish_voxel_map: false
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          # Persistence-filtered cloud (camera.launch.py); clearing keeps the raw one.
+          topic: /camera/depth/points_filtered
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          # 0.06 with the persistence filter (2026-10-25 bags 012806/020944):
+          # single-frame glossy-floor returns at 5-11 cm, 1.5-2.8 m, blocked the
+          # corridor; 3-frame persistence removes them and keeps an 11 cm box
+          # visible from 2.6-2.9 m. Keep equal to the filter's min_height.
+          min_obstacle_height: 0.06
+          max_obstacle_height: 1.0
+          obstacle_range: 3.0
+          inf_is_valid: false
+          voxel_min_points: 0
+          clear_after_reading: true
+        depth_clear:
+          # Frustum model: a voxel inside the measured view that no return
+          # re-marks expires ~1.4 s after its last mark (decay_acceleration 15
+          # against voxel_decay 10). Gemini 2 depth FOV 92.4 x 66.2 deg.
+          # STVL puts min_z/max_z on the corner rays, so on the axis they are
+          # x0.58: near 0.20 m (past the sensor's 0.15 m dead zone), far 3.0 m
+          # (= obstacle_range; a frame cannot re-mark what lies beyond it).
+          topic: /camera/depth/points
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          model_type: 0
+          min_z: 0.35
+          max_z: 5.1
+          horizontal_fov_angle: 1.613
+          vertical_fov_angle: 1.155
+          decay_acceleration: 15.0
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          clear_after_reading: true
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        inflation_radius: 1.6
+        cost_scaling_factor: 2.0
+      always_send_full_costmap: false
+      width: 6
+      height: 6
+      # v119 housing X +-0.328; Y +-0.287 is the drive-wheel outer face.
+      footprint: '[[0.328, 0.287], [0.328, -0.287], [-0.328, -0.287], [-0.328, 0.287]]'
+      footprint_padding: 0.02
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    enable_stamped_cmd_vel: false
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_footprint
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    transform_tolerance: 0.2
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.4
+    min_rotational_vel: 0.1
+    rotational_acc_lim: 0.8
+    behavior_plugins:
+    - spin
+    - backup
+    - wait
+    spin:
+      plugin: nav2_behaviors::Spin
+    backup:
+      plugin: nav2_behaviors::BackUp
+    wait:
+      plugin: nav2_behaviors::Wait
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odometry/filtered
+    # 20 ms (50 Hz) instead of the 10 ms default: the BT only relays the 20 Hz
+    # controller result, and 100 Hz ticks plus 100 Hz feedback were 13 % of a
+    # Jetson core in bt_navigator and half of navigation_manager's (2026-10-27).
+    bt_loop_duration: 20
+    default_server_timeout: 100
+    wait_for_service_timeout: 1000
+    navigators:
+    - navigate_to_pose
+    - navigate_through_poses
+    navigate_to_pose:
+      plugin: nav2_bt_navigator::NavigateToPoseNavigator
+    navigate_through_poses:
+      plugin: nav2_bt_navigator::NavigateThroughPosesNavigator
+    # Jazzy loads all built-in BT libraries. Omit plugin_lib_names to use the
+    # default empty custom-library list; YAML [] has no ROS parameter type.
+    transform_tolerance: 0.2
+navigation_manager:
+  ros__parameters:
+    use_sim_time: false
+    require_localization_ready: true
+    localization_status_timeout: 2.0
+    publish_rate: 20.0
+    command_timeout: 0.2
+    backend_response_timeout: 5.0
+    restart_quiet_period: 0.1
+    max_linear_speed: 1.0
+    max_angular_speed: 0.6

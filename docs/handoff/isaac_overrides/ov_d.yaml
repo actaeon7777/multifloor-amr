@@ -1,0 +1,4 @@
+planner_server:
+  ros__parameters:
+    GridBased:
+      cost_travel_multiplier: 8.0

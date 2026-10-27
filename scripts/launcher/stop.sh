@@ -13,4 +13,4 @@ if [[ ${1:-} != --yes ]]; then
 fi
 # SIGTERM lets launch.sh close Chromium and restore the screen-lock settings.
 pkill -f "$ws/scripts/kiosk/launch.sh" || true
-systemctl --user stop amr-web.service amr-stack.service
+systemctl --user stop amr-agent.service amr-web.service amr-stack.service

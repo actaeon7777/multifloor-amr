@@ -26,6 +26,8 @@ if ! systemctl --user --quiet is-active amr-web.service &&
     systemctl --user start amr-web.service || fail '웹 UI를 시작하지 못했습니다.
 journalctl --user-unit amr-web -n 50 으로 확인하세요.'
 fi
+# Optional central console link; a missing agent.env exits successfully.
+systemctl --user start amr-agent.service || echo '중앙 관제 연결 시작 실패: journalctl --user-unit amr-agent -n 50' >&2
 sleep 3
 systemctl --user --quiet is-active amr-stack.service || [[ -n $(manual_stack) ]] ||
     fail '차량 스택이 시작 직후 종료되었습니다.

@@ -3,7 +3,7 @@
 set -eu
 dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 chmod +x "$dir/start.sh" "$dir/stop.sh"
-systemctl --user link "$dir/amr-stack.service" "$dir/amr-web.service"
+systemctl --user link "$dir/amr-stack.service" "$dir/amr-web.service" "$dir/amr-agent.service"
 systemctl --user daemon-reload
 apps="$HOME/.local/share/applications"
 mkdir -p "$apps"

@@ -1,0 +1,18 @@
+[Unit]
+Description=AMR central console agent (optional)
+After=amr-web.service
+# A bad token file or server URL exits 2 at once; do not respawn a Python process every 3 s.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=%h/amr_ws
+Environment=AMR_ROBOT_ID=amr-01 PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/amr/agent.env
+ExecStart=/bin/bash -c 'if [[ ! -f %h/.config/amr/agent.env ]]; then echo "AMR agent disabled: agent.env is missing"; exit 0; fi; if [[ -z "$$AMR_SERVER_URL" ]]; then echo "AMR agent disabled: AMR_SERVER_URL is empty"; exit 0; fi; source %h/amr_ws/scripts/env.sh && exec ros2 run amr_remote_bridge remote_client --server-url "$$AMR_SERVER_URL" --robot-id "$${AMR_ROBOT_ID:-amr-01}" --token-file "$${AMR_TOKEN_FILE:-%h/.config/amr_remote_bridge/token}"'
+KillSignal=SIGINT
+TimeoutStopSec=15
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=3

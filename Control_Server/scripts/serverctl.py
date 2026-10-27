@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import time
 
@@ -23,8 +24,10 @@ def matching_process(pid):
         cwd = process.joinpath('cwd').resolve()
         executable = Path(os.fsdecode(args[0]))
         if not executable.is_absolute():
-            executable = cwd / executable
-        return (cwd == ROOT and executable == ROOT / '.venv/bin/python' and
+            executable = (cwd / executable if '/' in str(executable) else
+                          Path(shutil.which(str(executable)) or str(cwd / executable)))
+        allowed = {ROOT / '.venv/bin/python', Path(shutil.which('python3') or '/usr/bin/python3')}
+        return (cwd == ROOT and executable.resolve() in {path.resolve() for path in allowed} and
                 args[1:3] == [b'-m', b'app'])
     except (OSError, ValueError, IndexError):
         return False
@@ -71,7 +74,7 @@ def start(local=False):
             if process.poll() is not None:
                 raise RuntimeError('Server startup failed; inspect diagnostics/server.log')
             text = LOG.read_text(errors='replace')
-            if 'Uvicorn running on ' in text and matching_process(process.pid):
+            if 'AMR central host: ' in text and matching_process(process.pid):
                 args = (Path('/proc') / str(process.pid) / 'cmdline').read_bytes().split(b'\0')
                 host = os.fsdecode(args[args.index(b'--host') + 1])
                 port = int(args[args.index(b'--port') + 1])

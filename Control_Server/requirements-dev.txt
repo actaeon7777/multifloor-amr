@@ -1,7 +1,0 @@
--r requirements.txt
-pytest
-httpx
-pillow
-pyyaml
-playwright
-

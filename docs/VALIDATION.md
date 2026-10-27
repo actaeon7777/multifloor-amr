@@ -131,7 +131,7 @@ ROS_DOMAIN_ID=195 ROS_LOCALHOST_ONLY=1 AMR_RUN_ELEVATOR_MONITOR_TESTS=1 \
 
 ```bash
 python3 src/amr_system/amr_web_ui/test/browser_check.py
-python3 src/amr_system/amr_remote_bridge/test/browser_check.py
+python3 Control_Server/scripts/browser_check.py
 gjs src/amr_system/amr_web_ui/test/test_geometry.js src/amr_system/amr_web_ui/web/geometry.js
 gjs src/amr_system/amr_web_ui/test/test_tracking_status.js src/amr_system/amr_web_ui/web/app.js
 ```

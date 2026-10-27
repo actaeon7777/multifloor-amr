@@ -1,106 +1,59 @@
 #!/usr/bin/env python3
-"""Verify the original UI through FastAPI and the original Agent in preview mode."""
+"""Optional Playwright check of the console with synthetic summaries, no robot connection."""
 import argparse
-import json
-import os
 from pathlib import Path
 import sys
-import tempfile
-from urllib.parse import urlsplit
-
+import threading
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = ROOT.parent / 'src/amr_system'
-for directory in (ROOT, PACKAGES / 'amr_remote_bridge', PACKAGES / 'amr_web_ui',
-                  PACKAGES / 'amr_control'):
-    sys.path.insert(0, str(directory))
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(ROOT / '.playwright-browsers'))
-
-from playwright.sync_api import sync_playwright
-from amr_web_ui.server import load_preview
-from tests.support import BridgeHarness, TOKEN
+sys.path.insert(0, str(ROOT.parent / 'src/amr_system/amr_remote_bridge'))
+from amr_remote_bridge.server import Registry, create_server
+from amr_remote_bridge.summary import summarize
 
 
 def main():
+    from playwright.sync_api import sync_playwright
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', type=Path, default=ROOT / 'diagnostics')
-    parser.add_argument('--map', type=Path, help='Optional real map YAML with its referenced image')
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='amr-browser-') as directory:
-        with BridgeHarness(Path(directory), large_map=True) as harness, sync_playwright() as playwright:
-            if args.map:
-                load_preview(harness.shared, args.map)
-            harness.start_agent()
+    token = 'browser-test-only-' + 'a'*32
+    registry = Registry(stale_after=3600)
+    registry.exchange(dict(protocol=2, robot_id='preview-01', session_id='a'*32, sequence=1,
+                           state_age=0, local_error=None, results=[], summary=summarize(dict(
+                               floor={'floor': '4F'}, robot=dict(x=1, y=2, yaw=.5, age=0),
+                               task='401호 배송', mode='MANUAL', hold={'held': True},
+                               telemetry={'battery': dict(soc=80, voltage=24, valid=True, fresh=True)}))))
+    server = create_server(registry, token, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
-            try:
-                context = browser.new_context(viewport={'width': 1440, 'height': 1000},
-                                              http_credentials={'username': 'operator', 'password': TOKEN})
-                page = context.new_page()
-                errors, paths = [], []
-                page.on('pageerror', lambda error: errors.append(str(error)))
-                page.on('request', lambda request: paths.append(urlsplit(request.url).path))
-                page.goto(harness.url + '/robots/amr-01/')
-                page.wait_for_function("() => document.getElementById('empty').hidden && "
-                                       "document.getElementById('connection-label').textContent === '미리보기'")
-                grid = harness.shared.grids['map']
-                width, height = grid.info['width'], grid.info['height']
-                # Use a free cell close to the centre, also when an optional real map is supplied.
-                _, i, j = min((abs(x - width / 2) + abs(y - height / 2), x, y)
-                              for y in range(1, height - 1) for x in range(1, width - 1)
-                              if all(grid.data[yy * width + xx] == 0
-                                     for yy in range(y - 1, y + 2) for xx in range(x - 1, x + 2)))
-                page.get_by_role('button', name='지도 전체 보기').click()
-                point = page.evaluate("""({info, i, j}) => {
-                    const G = window.AMRGeometry, rect = document.getElementById('map').getBoundingClientRect();
-                    const corners = [[0,0],[info.width,0],[0,info.height],[info.width,info.height]]
-                        .map(p => G.gridToWorld(...p, info));
-                    const xs = corners.map(p=>p.x), ys = corners.map(p=>p.y);
-                    const minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
-                    const camera = {x:(minX+maxX)/2, y:(minY+maxY)/2,
-                        scale:Math.max(1,Math.min((rect.width-64)/(maxX-minX),(rect.height-100)/(maxY-minY)))};
-                    const p=G.worldToScreen(G.gridToWorld(i+.5,j+.5,info),camera,rect.width,rect.height);
-                    return {x:rect.x+p.x, y:rect.y+p.y};
-                }""", {'info': grid.metadata(), 'i': i, 'j': j})
-                page.mouse.click(point['x'], point['y'])
-                page.wait_for_function("() => document.getElementById('goal-label').textContent === '미리보기'")
-                assert len(harness.calls) == 1 and harness.calls[0][0] == 'goal'
-                goal = dict(harness.shared.state['goal'])
-                assert goal['status'] == 'PREVIEW'
-                page.screenshot(path=str(args.output_dir / 'central_ui.png'), full_page=True)
-                harness.agent.stop.set()
-                harness.agent_threads[0][1].join(timeout=3)
-                page.wait_for_function("() => document.getElementById('connection-label').textContent === 'AMR 상태 지연' && "
-                                       "document.getElementById('send').disabled && document.getElementById('cancel').disabled")
-                harness.start_agent(harness.make_agent())
-                page.wait_for_function("() => document.getElementById('connection-label').textContent === '미리보기' && "
-                                       "!document.getElementById('cancel').disabled")
-                assert len(harness.calls) == 1 and harness.shared.state['goal']['request_id'] == goal['request_id']
-                page.get_by_role('button', name='주행 목표 취소').click()
-                page.wait_for_function("() => document.getElementById('cancel').disabled && "
-                                       "!document.getElementById('heading').disabled")
-                from tests.support import wait_for
-                wait_for(lambda: harness.shared.state['goal'] is None)
-                page.get_by_role('button', name='초기 위치', exact=True).click()
-                page.mouse.click(point['x'], point['y'])
-                wait_for(lambda: len(harness.calls) == 3)
-                assert [call[0] for call in harness.calls] == ['goal', 'cancel', 'initialpose']
-                assert harness.shared.commands.empty()
-                assert any(path.startswith('/robots/amr-01/api/layers/') for path in paths)
-                assert '/robots/amr-01/api/goal' in paths and '/api/goal' not in paths
-                page.goto(harness.url + '/fleet')
-                page.locator('a.robot[href="/robots/amr-01/"]').wait_for()
-                page.screenshot(path=str(args.output_dir / 'fleet_ui.png'), full_page=True)
-                assert not errors, errors
-                report = {'server': 'FastAPI/Uvicorn over TCP', 'map_source': 'provided' if args.map else 'generated Grid',
-                          'map_size': [width, height], 'map_rendered': True, 'goal_relay': True,
-                          'initialpose_relay': True, 'cancel_relay': True, 'robot_scoped_api': True,
-                          'offline_controls_disabled': True, 'reconnect_without_replay': True,
-                          'fleet_rendered': True, 'physical_commands': False, 'page_errors': errors}
-                (args.output_dir / 'browser_result.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
-                print(json.dumps(report, ensure_ascii=False))
-            finally:
-                browser.close()
+            context = browser.new_context(http_credentials={'username': 'operator', 'password': token})
+            page = context.new_page()
+            errors = []
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            page.goto(f'http://127.0.0.1:{server.server_port}/')
+            page.wait_for_selector('.robot-card')
+            assert page.locator('.task').inner_text() == '401호 배송'
+            assert page.get_by_role('button', name='해제', exact=True).is_enabled()
+            for width in (1440, 900, 390):
+                page.set_viewport_size({'width': width, 'height': 900})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                page.screenshot(path=str(args.output_dir / f'console_{width}.png'), full_page=True)
+            with registry.lock:
+                registry.robots['preview-01'].captured = time.monotonic()-4000
+            page.wait_for_selector('.robot-card.offline')
+            assert page.get_by_role('button', name='정지', exact=True).is_disabled()
+            assert not errors, errors
+            browser.close()
+        print('Console layout, badges and offline controls passed; no commands sent.')
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 if __name__ == '__main__':

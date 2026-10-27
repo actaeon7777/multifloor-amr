@@ -3,6 +3,8 @@
 # yaw 생략 시 이동 방향을 사용해 정렬 회전을 줄인다. 무정지 통과는 아직 지원하지 않는다.
 schema_version: 1
 default_dwell_s: 0.0
+exclusions:   # 감지 제외 영역 (map 좌표 사각형). 엘리베이터 문은 열릴 때 장애물로 보인다.
+  - {floor: "4F", x_min: 8.5, x_max: 11.6, y_min: 1.8, y_max: 4.8, note: "E1 엘리베이터 문·홀"}
 routes:
   4F_full:
     floor: "4F"

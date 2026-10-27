@@ -119,3 +119,33 @@ def test_unknown_waypoint_keys_list_allowed_keys(tmp_path, raw, key):
     with pytest.raises(PatrolConfigError, match='allowed keys: x y yaw dwell_s note') as error:
         load(tmp_path, raw)
     assert str(key) in str(error.value)
+
+
+def test_exclusions_optional_and_parsed(tmp_path, raw):
+    assert load(tmp_path, raw).exclusions == ()
+    raw['exclusions'] = [dict(floor='4F', x_min=8.5, x_max=11.6, y_min=1.8,
+                              y_max=4.8, note='엘리베이터 문')]
+    exclusion, = load(tmp_path, raw, load_floor_config(STACK / 'config/floors.yaml')).exclusions
+    assert (exclusion.floor, exclusion.x_min, exclusion.y_max, exclusion.note) == (
+        '4F', 8.5, 4.8, '엘리베이터 문')
+    del raw['exclusions'][0]['note']
+    assert load(tmp_path, raw).exclusions[0].note == ''
+
+
+@pytest.mark.parametrize('key,value', [
+    ('floor', ''), ('floor', 'unknown'), ('floor', None), ('note', 1),
+    ('x_min', float('nan')), ('y_max', float('inf')), ('x_min', True),
+    ('x_max', 0), ('y_max', 0), ('y_min', 3), ('x_min', '0'), ('typo', 1),
+])
+def test_invalid_exclusions(tmp_path, raw, key, value):
+    raw['exclusions'] = [dict(floor='4F', x_min=0, x_max=2, y_min=0, y_max=2)]
+    raw['exclusions'][0][key] = value
+    with pytest.raises(PatrolConfigError):
+        load(tmp_path, raw, load_floor_config(STACK / 'config/floors.yaml'))
+
+
+@pytest.mark.parametrize('value', [None, {}, [None], [{}]])
+def test_invalid_exclusions_container(tmp_path, raw, value):
+    raw['exclusions'] = value
+    with pytest.raises(PatrolConfigError):
+        load(tmp_path, raw)

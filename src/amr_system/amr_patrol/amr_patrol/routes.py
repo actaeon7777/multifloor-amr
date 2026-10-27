@@ -30,11 +30,22 @@ class Route:
 
 
 @dataclass(frozen=True)
+class Exclusion:
+    floor: str
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    note: str = ''
+
+
+@dataclass(frozen=True)
 class PatrolConfig:
     routes: Mapping[str, Route]
     default_dwell_s: float = 3.0
     home_pose: Optional[Tuple[float, float, float]] = None
     home_floor: Optional[str] = None
+    exclusions: Tuple[Exclusion, ...] = ()
 
 
 def default_config_path():
@@ -112,4 +123,25 @@ def load_patrol_config(path=None, building=None) -> PatrolConfig:
             home_pose = tuple(building.floor(home_floor).rooms[building.home.room].goal)
         except (KeyError, ValueError) as error:
             raise PatrolConfigError('home must reference an existing room') from error
-    return PatrolConfig(routes, default_dwell, home_pose, home_floor)
+    exclusions = data.get('exclusions', [])
+    if not isinstance(exclusions, list):
+        raise PatrolConfigError('exclusions must be a list')
+    parsed = []
+    for index, entry in enumerate(exclusions):
+        label = f'exclusions[{index}]'
+        entry = _mapping(entry, label)
+        if set(entry) - {'floor', 'x_min', 'x_max', 'y_min', 'y_max', 'note'}:
+            raise PatrolConfigError(f'{label}: unknown keys')
+        floor, note = entry.get('floor'), entry.get('note', '')
+        if not isinstance(floor, str) or not floor.strip():
+            raise PatrolConfigError(f'{label}: floor must be a non-empty string')
+        if building is not None and floor not in building.floors:
+            raise PatrolConfigError(f'{label}: unknown floor {floor}')
+        if not isinstance(note, str):
+            raise PatrolConfigError(f'{label}: note must be a string')
+        bounds = {key: _number(entry.get(key), f'{label}.{key}')
+                  for key in ('x_min', 'x_max', 'y_min', 'y_max')}
+        if bounds['x_min'] >= bounds['x_max'] or bounds['y_min'] >= bounds['y_max']:
+            raise PatrolConfigError(f'{label}: min must be less than max')
+        parsed.append(Exclusion(floor=floor, note=note, **bounds))
+    return PatrolConfig(routes, default_dwell, home_pose, home_floor, tuple(parsed))

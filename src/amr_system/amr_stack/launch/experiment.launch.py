@@ -91,6 +91,9 @@ def launch_mode(context):
         actions.append(Node(package='amr_patrol', executable='patrol_manager',
                             name='patrol_manager', output='screen',
                             parameters=[{'use_sim_time': sim, 'require_estop': not sim}]))
+        actions.append(Node(package='amr_patrol', executable='motion_detector',
+                            name='motion_detector', output='screen',
+                            parameters=[{'use_sim_time': sim}]))
     if not sim and LaunchConfiguration('start_announcer').perform(context) == 'true':
         from launch_ros.actions import Node
         # Voice cues and the driving alert on the HDMI display speaker (PipeWire default sink).

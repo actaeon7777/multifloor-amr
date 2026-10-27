@@ -1,0 +1,22 @@
+# 야간 순찰 경로. 지점 사이는 Nav2가 주행한다; 꺾이는 곳과 끝에만 지점을 둔다. docs/PATROL.md
+# 각 지점은 별도 NavigateToPose 목표라 정지·방향 정렬한다. dwell_s: 0은 추가 대기 없음.
+# yaw 생략 시 이동 방향을 사용해 정렬 회전을 줄인다. 무정지 통과는 아직 지원하지 않는다.
+schema_version: 1
+default_dwell_s: 0.0
+routes:
+  4F_full:
+    floor: "4F"
+    end: home            # floors.yaml home(401)으로 복귀; stay면 마지막 지점에 멈춤
+    waypoints:
+      - {x: 13.5, y: 4.5, yaw: 1.5708, dwell_s: 3, note: "로비 중앙: 북쪽 복도 입구 관측"}
+      - {x: 15.4, y: 9.2, note: "413 뒷문 앞 통과"}
+      - {x: 15.4, y: 14.5, yaw: 1.5708, dwell_s: 3, note: "북쪽 복도 중간 관측"}
+      - {x: 15.2, y: 20.0, yaw: 1.5708, dwell_s: 3, note: "북쪽 끝: 413 앞문·414"}
+      - {x: 13.5, y: 2.0, note: "로비 남쪽 통과"}
+      - {x: 7.5, y: 0.3, note: "406 앞 통과"}
+      - {x: 1.0, y: 0.3, yaw: 3.1416, dwell_s: 3, note: "서쪽 끝 관측"}
+      - {x: 17.0, y: 0.3, note: "412 앞 통과"}
+      - {x: 22.0, y: 0.3, yaw: 0.0, dwell_s: 3, note: "복도 중간(411~410) 관측"}
+      - {x: 30.0, y: 0.3, note: "409 앞 통과"}
+      - {x: 37.0, y: 0.3, yaw: 0.0, dwell_s: 3, note: "복도 동쪽(407~402) 관측"}
+      - {x: 42.0, y: 0.0, yaw: 0.5236, dwell_s: 3, note: "동쪽 끝·옆 공간 관측"}

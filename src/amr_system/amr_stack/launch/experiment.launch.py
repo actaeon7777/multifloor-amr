@@ -86,6 +86,11 @@ def launch_mode(context):
             'use_rviz': LaunchConfiguration('use_rviz'),
         }),
     ]
+    if LaunchConfiguration('start_patrol').perform(context) == 'true':
+        from launch_ros.actions import Node
+        actions.append(Node(package='amr_patrol', executable='patrol_manager',
+                            name='patrol_manager', output='screen',
+                            parameters=[{'use_sim_time': sim, 'require_estop': not sim}]))
     if not sim and LaunchConfiguration('start_announcer').perform(context) == 'true':
         from launch_ros.actions import Node
         # Voice cues and the driving alert on the HDMI display speaker (PipeWire default sink).
@@ -131,6 +136,8 @@ def generate_launch_description():
                                           'JPEG color -> web snapshot, depth watch in time_health.'),
         DeclareLaunchArgument('start_announcer', default_value='true', choices=['true', 'false'],
                               description='mode:=real only: announcement_player (voice + driving alert)'),
+        DeclareLaunchArgument('start_patrol', default_value='true', choices=['true', 'false'],
+                              description='Current-floor patrol manager; waits for an explicit start command.'),
         DeclareLaunchArgument('use_rviz', default_value='false'),
         DeclareLaunchArgument('map', default_value=''),
         DeclareLaunchArgument('start_floor', default_value='',

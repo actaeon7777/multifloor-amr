@@ -50,6 +50,7 @@
 | 195 | 공용 차량 상태, 엘리베이터 모니터 |
 | 196 | TIM 연동 |
 | 197 | 깊이 costmap, 합성 낮은 장애물 |
+| 198 | 현재 층 고정 경로 순찰 |
 
 테스트 도메인은 실제 로봇 운용에 쓰지 않는다. 격리 ROS 시험에는 `ROS_LOCALHOST_ONLY=1`을 붙인다.
 
@@ -109,6 +110,7 @@ python3 scripts/test_ros_integration.py
 | navigation_startup | `amr_stack/test/test_navigation_startup_ros.py` | `AMR_RUN_STARTUP_TESTS` | 194 | 초기 위치 검증, 빔 전환, suspend |
 | tim_localization | `amr_stack/test/test_tim_integration_ros.py` | `AMR_RUN_TIM_TESTS` | 196 | TIM → AMCL 합성 센서 연동 |
 | depth_costmap | `amr_stack/test/test_depth_costmap_ros.py` | `AMR_RUN_DEPTH_COSTMAP_TESTS` | 197 | 실제 STVL: 10·12 cm 박스·바닥 제외, 시야 안 사라진 박스 ~1.4초 만료·짧은 누락은 유지, 사각대 8 cm 물체는 복구(2 m 보존) 뒤에도 남았다가 10초 뒤 만료, 전체 지우기. 실제 Smac: 깊이 점군만으로 기존 경로 무효화·우회 경로 생성; `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`도 지정 |
+| patrol | `amr_patrol/test/test_patrol_ros.py` | `AMR_RUN_PATROL_TESTS` | 198 | 가짜 NavigateToPose + 합성 floor·hold·E-stop·차량 상태: 상태 전이, 관측 begin/end, home 복귀, 관리자 정지와 늦은 목표 접수 취소, 명령 거부 |
 
 러너에 없는 시험:
 

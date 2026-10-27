@@ -26,6 +26,7 @@ SUITES = [
     ('navigation_startup', 'amr_stack/test/test_navigation_startup_ros.py', 'AMR_RUN_STARTUP_TESTS', 194),
     ('tim_localization', 'amr_stack/test/test_tim_integration_ros.py', 'AMR_RUN_TIM_TESTS', 196),
     ('depth_costmap', 'amr_stack/test/test_depth_costmap_ros.py', 'AMR_RUN_DEPTH_COSTMAP_TESTS', 197),
+    ('patrol', 'amr_patrol/test/test_patrol_ros.py', 'AMR_RUN_PATROL_TESTS', 198),
 ]
 
 

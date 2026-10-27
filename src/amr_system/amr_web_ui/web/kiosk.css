@@ -56,6 +56,7 @@ svg.i{width:28px;height:28px;fill:none;stroke:currentColor;stroke-width:2;stroke
 .rooms.locked .room{opacity:.35}
 .lock-note{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
 .lock-note div{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px 26px;font-size:20px;font-weight:600;box-shadow:0 8px 30px #1d2a3d1f}
+.lock-note small{display:block;margin-top:6px;font-size:16px;font-weight:500;color:var(--muted)}
 
 /* confirm sheet */
 .scrim{position:absolute;inset:0;background:#17203380;display:grid;place-items:center;z-index:5}

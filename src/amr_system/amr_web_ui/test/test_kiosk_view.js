@@ -51,13 +51,18 @@ test('only owned, unacknowledged room results appear, before readiness', () => {
     assert.equal(K.selectScreen(ready({goal:goal(status,{room:''})}),own), 'idle');
   }
 });
-test('every readiness gate locks picker; confirmed and beacon floors work', () => {
+test('every readiness gate locks picker; confirmed, beacon and assumed floors work', () => {
   for (const change of [{localization:null},{localization:{ready:false}}, {localization:{ready:true,age:2}},
-    {action_ready:false}, {floor:null}, {floor:{floor:'4F',confidence:'ASSUMED'}},
+    {action_ready:false}, {floor:null}, {floor:{floor:'4F',confidence:'ASSUMED',zone:2}},
+    {floor:{floor:'4F',confidence:'TRANSIT',zone:2}}, {floor:{floor:'4F',confidence:'UNKNOWN',zone:0}},
     {floor:{floor:null,confidence:'TRANSIT'}},{tf_error:'missing'}, {localization_reset_pending:true},
     {pending_request:{request_id:'admin_123'}}]) assert.equal(K.selectScreen(ready(change)), 'localizing');
   assert.equal(K.selectScreen(ready()), 'idle');
   assert.equal(K.selectScreen(ready({floor:{floor:'3F',confidence:'BEACON'}})), 'idle');
+  // No hall beacon since startup: same-floor rooms open, other floors wait for confirmation.
+  assert.equal(K.selectScreen(ready({floor:{floor:'4F',confidence:'ASSUMED',zone:1}})), 'idle');
+  assert.equal(K.floorConfirmed(ready({floor:{floor:'4F',confidence:'ASSUMED',zone:1}})), false);
+  assert.equal(K.floorConfirmed(ready()), true);
 });
 test('every transit.js phase is mapped, including recovery branches and terminal phases', () => {
   const expected = {NAV_TO_HALL:1,CALL_ELEVATOR:2,WAIT_DOOR_OPEN:2,BOARDING:3,BACKING_OUT:3,
@@ -348,6 +353,18 @@ test('other-floor goal uses static floor version even when live version is null'
   const body=JSON.parse(b.requests.find(r=>r.url==='/api/goal').options.body);
   assert.deepEqual({floor:body.floor,room:body.room,x:body.x,y:body.y,yaw:body.yaw,map_version:body.map_version},
     {floor:'3F',room:'301',x:4,y:5,yaw:0.7,map_version:17});
+});
+test('assumed floor opens same-floor rooms and locks other floors until confirmed',async()=>{
+  const b=browserFixture();await b.settle();b.setState(ready({floor:{floor:'4F',confidence:'ASSUMED',zone:1}}));await b.poll();
+  assert.equal(b.elements.get('status-label').textContent,'정상');
+  const room=id=>[...b.elements.values()].find(e=>e.dataset.room===id);
+  assert.equal(room('402').disabled,false);
+  await b.click('floor','3F');
+  assert.equal(room('301').disabled,true);assert.match(b.elements.get('rooms').innerHTML,/현재 층 확인 후 다른 층/);
+  b.setState(ready({floor:{floor:'4F',confidence:'BEACON',zone:1}}));await b.poll();
+  assert.equal(room('301').disabled,false);assert.doesNotMatch(b.elements.get('rooms').innerHTML,/lock-note/);
+  await b.click('floor','4F');await b.click('room','402');await b.click('action','depart');await fireDeparture(b);
+  assert.equal(JSON.parse(b.requests.find(r=>r.url==='/api/goal').options.body).room,'402');
 });
 test('same-floor goal uses latest live version after the start delay',async()=>{
   const b=browserFixture();await b.settle();await b.click('room','402');await b.click('action','depart');

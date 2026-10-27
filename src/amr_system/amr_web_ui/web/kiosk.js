@@ -33,10 +33,12 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     const {number, suffix} = splitRoomId(id);
     return number ? `${number}호${suffix ? ' '+suffix : ''}` : '';
   };
+  // Same-floor goals only need the loaded map; a startup floor stays ASSUMED until the hall beacon is heard.
+  const floorConfirmed = s => ['BEACON','CONFIRMED'].includes(s?.floor?.confidence);
   function readyForGoal(s) {
     return Boolean(s?.mode === 'AUTO' && !(s.estop?.required && s.estop.error) && s.estop?.state !== 'ESTOP' &&
       !MISSION_ACTIVE.has(s.floor_mission?.phase) && s?.localization?.ready && (s.localization.age == null || s.localization.age < 2) &&
-      s.action_ready && s.floor?.floor && ['BEACON','CONFIRMED'].includes(s.floor.confidence) &&
+      s.action_ready && s.floor?.floor && (floorConfirmed(s) || s.floor.confidence === 'ASSUMED') && s.floor.zone !== 2 &&
       !s.tf_error && !s.localization_reset_pending && !s.pending_request);
   }
   function estopDeliveryRoom(s, ownedRequestIds, pendingRoom='') {
@@ -157,7 +159,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       cancelDelay(notify=false) { if (pending?.phase === 'delay') { if (notify) rejectStart(); else drop(); } },
     };
   }
-  window.AMRKiosk = {selectScreen, phaseToStep, PHASE_STEPS, readyForGoal, splitRoomId,
+  window.AMRKiosk = {selectScreen, phaseToStep, PHASE_STEPS, readyForGoal, floorConfirmed, splitRoomId,
     roomLabel, updateProgress, formatETA, createDeliveryFlow, estopDeliveryRoom};
   if (typeof document === 'undefined') return;
 
@@ -200,7 +202,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     return online() && selectScreen(state, {ownedRequestIds:owned}) === 'idle' && !busy &&
       !admin && !document.hidden && Boolean(floorInfo(viewFloor)?.map) &&
       floorInfo(viewFloor)?.selectable !== false && commandMapVersion(viewFloor) != null &&
-      (viewFloor === currentFloor() || state.floor_action_ready);
+      (viewFloor === currentFloor() || (state.floor_action_ready && floorConfirmed(state)));
   }
   function toast(message) { setText('toast', message); toastUntil = now()+6500; setHidden('toast', false); }
   function leaveAdmin() { admin = false; token = null; tokenUntil = 0; pin = null; adminPose = null; gesture = null; render(); }
@@ -326,13 +328,15 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     setText('map-floor', floorLabel(cf)); setText('mini-floor', floorLabel(cf));
     if (['idle','localizing'].includes(screen)) {
       setHTML('floors', floorButtons());
-      const locked = screen === 'localizing', rooms = floorInfo(viewFloor)?.rooms || [];
-      const key = JSON.stringify([viewFloor, rooms, locked, selection?.room]);
+      const floorLocked = screen === 'idle' && viewFloor !== cf && !floorConfirmed(state);
+      const locked = screen === 'localizing' || floorLocked, rooms = floorInfo(viewFloor)?.rooms || [];
+      const key = JSON.stringify([viewFloor, rooms, locked, floorLocked, selection?.room]);
       if (key !== bodyKey) {
         bodyKey = key;
         setClass('rooms', `rooms${locked ? ' locked' : ''}`);
         setHTML('rooms', rooms.map(r => { const parts = splitRoomId(r.id); return `<button class="room${selection?.room === r.id ? ' sel' : ''}" data-room="${esc(r.id)}"><b>${esc(parts.number)}</b><small>${esc(parts.suffix || '호')}</small></button>`; }).join('') +
-          (locked ? '<div class="lock-note"><div>위치 확인 후 선택할 수 있습니다</div></div>' : ''));
+          (floorLocked ? '<div class="lock-note"><div>현재 층 확인 후 다른 층을 선택할 수 있습니다<small>엘리베이터 홀로 이동하거나 관리자에게 문의하세요</small></div></div>' :
+            locked ? '<div class="lock-note"><div>위치 확인 후 선택할 수 있습니다</div></div>' : ''));
       }
     } else if (screen === 'driving') {
       const p = flow.pending ? {percent:0, remaining:null, eta:''} : progress;

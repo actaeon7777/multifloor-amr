@@ -74,10 +74,11 @@ python3 -m pytest -q tests \
   src/amr_system/amr_control/test/test_manual_gate.py \
   src/amr_system/amr_control/test/test_control_gate.py \
   src/amr_system/amr_control/test/test_wheel_limits.py \
+  src/amr_system/amr_control/test/test_operator_hold.py \
   src/amr_system/amr_can_bridge/test \
   src/amr_system/amr_vehicle_status/test/test_model.py \
   src/amr_system/amr_web_ui/test \
-  src/amr_system/amr_remote_bridge/test/test_remote_bridge.py \
+  src/amr_system/amr_remote_bridge/test \
   src/amr_system/amr_elevator/test \
   src/amr_system/amr_stack/test/test_floor_config.py
 ```

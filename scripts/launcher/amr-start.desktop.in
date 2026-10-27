@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AMR 시작
+Comment=차량 스택·웹 UI·키오스크를 켭니다
+Exec=@DIR@/start.sh
+Icon=media-playback-start
+Terminal=false

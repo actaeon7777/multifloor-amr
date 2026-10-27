@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AMR 종료
+Comment=키오스크·웹 UI·차량 스택을 끕니다 (주행 중이면 멈춤)
+Exec=@DIR@/stop.sh
+Icon=process-stop
+Terminal=false

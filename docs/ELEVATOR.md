@@ -243,7 +243,11 @@ suspend(True) 승인이 실패 처리 뒤 늦게 도착해도 재개 요청과 �
 
 Annex C 표 C.1의 한국어 문구는 `announcements.py`에 있다. `/robot/announcement`에
 `{"key", "text", "phase", "floor", "stamp"}` JSON을 String으로 발행한다(QoS depth 10, volatile).
-`stamp`는 ROS 시각 초, `floor`는 현재 층이며 `alight_floor`에서는 목표 층 이름이다. 실제 스피커 출력은 아직 없다.
+`stamp`는 ROS 시각 초, `floor`는 현재 층이며 `alight_floor`에서는 목표 층 이름이다.
+
+`announcement_player`(`experiment.launch.py mode:=real`에서 `start_announcer:=true` 기본)가 이 토픽을 받아 `tools/tts/wav/<키>.wav`를 `pw-play`로 재생한다(PipeWire 기본 출력 = HDMI 화면 스피커). `chime.wav`가 있으면 앞에 붙이고, `arrival`은 `arrival_<층>.wav`, `room_arrival`은 `room_<호실>.wav`를 쓴다. `alight_floor`는 표 C.1 각주 c에 따라 재생하지 않는다. 한 번에 하나씩 재생하며 `estop`·`robot_error`·`elevator_error`·`shock`은 재생 중인 안내를 끊고 대기열을 비운다. 5초(`max_age_s`)보다 오래 기다린 안내는 버린다. 바퀴가 움직이는 동안(`/odometry/filtered` 속도 > 0.03 m/s 또는 0.1 rad/s가 0.3초 지속)에는 `drive.wav`(5초 파일, 앞 0.7초만 소리)를 반복해 주행 알림을 낸다. 2초 정지하거나 오도메트리가 1초 끊기면 즉시 끄고, 안내가 들어오면 끊고 안내를 먼저 재생한다. 알림음과 음성은 `voice_volume`(기본 0.6, `pw-play --volume`)으로 줄여 재생하며 주행 알림은 원래 크기다.
+
+같은 토픽에 웹 UI(`ros_bridge`)가 키오스크 배송(호실이 있는 목표)의 `delivery_start`(접수), `room_arrival`(`room` 포함, 도착), `delivery_cancel`, `received`(수령 확인 첫 1회), 같은 층 배송 실패의 `robot_error`(E-stop·LB 중단은 제외)를 낸다. 재생 노드는 스스로 두 가지를 더 낸다: `/navigation/status`가 `RUNNING`인데 3초(`nav_stall_s`) 정지해 있으면 `obstacle`, 이후 10초(`nav_stall_repeat_s`)마다 반복; `/estop/status`가 정상 상태에서 `ESTOP`으로 바뀌면 `estop`. 엘리베이터 미션의 `obstacle`은 1.5초(`obstacle_announce_delay`) 연속 막힌 뒤부터 낸다. 안전 안내(`estop` 등)는 일반 안내를 끊지만 다른 안전 안내는 끊지 않고 뒤에 이어 재생한다. wav는 PC에서 `tools/tts/generate_google_tts.py`로 만든다.
 
 | 키 | 발행 시점 |
 |---|---|

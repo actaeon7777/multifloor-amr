@@ -1,7 +1,8 @@
 """The public navigation Action is the same manager used by RViz /goal_pose."""
+import json
 import math
 
-from .server import ScanPoints
+from .server import ScanPoints, delivery_announcement
 
 import numpy as np
 import queue
@@ -86,6 +87,8 @@ class WebBridge(Node):
         self.waiting_set_floor = None
         self.pending_set_floor = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
+        self.announcement_pub = self.create_publisher(String, '/robot/announcement', 10)
+        self.shared.announce = self.announce
         self.goal_handle = None
         self.goal_id = None
         self.pending_scan = None
@@ -381,7 +384,17 @@ class WebBridge(Node):
         with self.shared.lock:
             goal = self.shared.state.get('goal')
             if goal and goal['request_id'] == request_id:
+                before = goal.get('status')
                 goal.update(values)
+                key = delivery_announcement(goal, before)
+                if key:
+                    self.announce(key, goal)
+
+    def announce(self, key, goal):
+        """Kiosk delivery voice cue for announcement_player (same JSON as the elevator mission)."""
+        self.announcement_pub.publish(String(data=json.dumps(dict(
+            key=key, room=goal.get('room', ''), floor=goal.get('floor', ''), phase='DELIVERY',
+            stamp=self.get_clock().now().nanoseconds / 1e9), ensure_ascii=False)))
 
     def process_command(self, command):
         kind, request_id, pose = command['kind'], command['request_id'], command['pose']

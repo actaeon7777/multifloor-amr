@@ -562,7 +562,8 @@ def test_door_closes_while_space_occupied_relocalizes_and_recalls(ros):
 
 
 def test_continuously_blocked_boarding_backs_out(ros):
-    node = wait_at_open_door(ros, board_block_timeout=.2, clear_confirm_s=.05, announce_period=.1)
+    node = wait_at_open_door(ros, board_block_timeout=.2, clear_confirm_s=.05, announce_period=.1,
+                             obstacle_announce_delay=0.)
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(2., lambda: node.mission.phase == 'BOARDING')
     publish_point(ros, (.4, 0.))
@@ -839,7 +840,8 @@ def test_door_closing_during_retreat_stops_and_bounds_or_aligns(ros, front_in_ca
 def test_return_to_car_blocked_or_phase_timeout_fails_and_holds_door(ros, total_timeout):
     from amr_elevator.maneuver import LineManeuver, DRIVE
 
-    node = wait_at_open_door(ros, use_door_open_button=True, alight_block_timeout=.2)
+    node = wait_at_open_door(ros, use_door_open_button=True, alight_block_timeout=.2,
+                             obstacle_announce_delay=0.)
     freeze_phase_timer(node)
     geometry = node.geometry('3F')
     node.set_phase('RETURN_TO_CAR')

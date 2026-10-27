@@ -445,3 +445,33 @@ def test_pin_environment_only_without_logging(monkeypatch, capsys, environment):
     assert captured[0].kiosk_pin == (environment or '')
     output = capsys.readouterr()
     assert '1234' not in output.out+output.err
+
+
+def test_delivery_announcement_keys():
+    from amr_web_ui.server import delivery_announcement
+    goal = lambda status, **kw: dict(room='401', floor='4F', kind='goal', status=status, **kw)  # noqa: E731
+    assert delivery_announcement(goal('ACCEPTED'), 'SENDING') == 'delivery_start'
+    assert delivery_announcement(goal('ACCEPTED'), 'CANCELING') is None  # Cancel refused: not a new start.
+    assert delivery_announcement(goal('ACCEPTED'), 'ACCEPTED') is None
+    assert delivery_announcement(goal('SUCCEEDED'), 'ACCEPTED') == 'room_arrival'
+    assert delivery_announcement(goal('CANCELED'), 'CANCELING') == 'delivery_cancel'
+    assert delivery_announcement(goal('FAILED'), 'ACCEPTED') == 'robot_error'
+    assert delivery_announcement(goal('FAILED', error_message='E-stop으로 자율주행을 중단했습니다.'),
+                                 'ACCEPTED') is None
+    assert delivery_announcement(goal('FAILED', error_message='수동 조작(LB)으로 자율주행을 중단했습니다.'),
+                                 'ACCEPTED') is None
+    assert delivery_announcement(dict(goal('FAILED'), kind='floor_goal'), 'ACCEPTED') is None
+    assert delivery_announcement(dict(goal('SUCCEEDED'), room=''), 'ACCEPTED') is None  # Map click.
+
+
+def test_acknowledged_delivery_announces_received_once(shared, http):
+    calls = []
+    shared.announce = lambda key, goal: calls.append((key, goal['room']))
+    shared.state['preview'] = False
+    with http(shared) as request:
+        shared.state['goal'] = dict(request_id='delivery_001', status='SUCCEEDED', room='401')
+        for _ in range(2):
+            assert request('/api/acknowledge', {'request_id': 'delivery_001'})[0] == 202
+        shared.state['goal'] = dict(request_id='delivery_002', status='FAILED', room='401')
+        assert request('/api/acknowledge', {'request_id': 'delivery_002'})[0] == 202
+    assert calls == [('received', '401')]

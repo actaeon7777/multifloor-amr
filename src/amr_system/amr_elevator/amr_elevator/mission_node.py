@@ -152,6 +152,8 @@ class FloorMissionManager(Node):
             'depth_min_height': .06, 'depth_max_height': 1., 'depth_max_range': 3.,
             'door_cancel_grace': 1.5,
             'scan_max_age': .5,
+            # Brief brushes past the robot stay silent; only a hold this long is announced.
+            'obstacle_announce_delay': 1.5,
         }.items()}
         for key in ('depth_max_age', 'space_margin', 'wall_margin', 'turn_margin', 'clear_confirm_s',
                     'announce_period', 'board_block_timeout', 'alight_block_timeout', 'turn_block_timeout',
@@ -159,6 +161,8 @@ class FloorMissionManager(Node):
                     'depth_max_range', 'door_cancel_grace', 'scan_max_age'):
             if not math.isfinite(p[key]) or p[key] <= 0.:
                 raise ValueError(f'{key} must be positive and finite')
+        if not math.isfinite(p['obstacle_announce_delay']) or p['obstacle_announce_delay'] < 0.:
+            raise ValueError('obstacle_announce_delay must be non-negative and finite')
         if type(p['max_alighting_attempts']) is not int:
             raise ValueError('max_alighting_attempts must be an integer')
         if p['depth_min_height'] >= p['depth_max_height']:
@@ -323,6 +327,10 @@ class FloorMissionManager(Node):
             return False
         since = self.mission.counters.setdefault('_clear_since', self.now())
         return self.now() - since >= self.p['clear_confirm_s']
+
+    def announce_blocked(self, duration):
+        if duration >= self.p['obstacle_announce_delay']:
+            self.announce('obstacle')
 
     def blocked_for(self, blocked):
         if not blocked:
@@ -1052,7 +1060,7 @@ class FloorMissionManager(Node):
         blocked = self.maneuver is not None and self.maneuver.blocked
         duration = self.blocked_for(blocked)
         if blocked:
-            self.announce('obstacle')
+            self.announce_blocked(duration)
             if duration >= self.p['board_block_timeout']:
                 self.back_out('boarding continuously blocked')
                 return
@@ -1238,11 +1246,11 @@ class FloorMissionManager(Node):
             clear = self.space_clear(region)
             # A clear-confirmation interval is still a hold, but not an obstacle.
             blocked = not clear and '_clear_since' not in m.counters
-            self.blocked_for(blocked)
+            duration = self.blocked_for(blocked)
             if not clear:
                 self.publish_twist()
                 if blocked:
-                    self.announce('obstacle')
+                    self.announce_blocked(duration)
                 return
             m.counters['_exit_started'] = True
             m.counters['_exit_started_at'] = self.now()
@@ -1252,7 +1260,7 @@ class FloorMissionManager(Node):
         blocked = self.maneuver is not None and self.maneuver.blocked
         duration = self.blocked_for(blocked)
         if blocked:
-            self.announce('obstacle')
+            self.announce_blocked(duration)
             if duration >= self.p['alight_block_timeout']:
                 self.return_to_car('alighting continuously blocked')
                 return
@@ -1290,7 +1298,7 @@ class FloorMissionManager(Node):
             blocked = self.maneuver is not None and self.maneuver.blocked
             duration = self.blocked_for(blocked)
             if blocked:
-                self.announce('obstacle')
+                self.announce_blocked(duration)
                 if duration >= self.p['alight_block_timeout']:
                     self.fail('RETURN_BLOCKED', 'return to car continuously blocked')
                     return

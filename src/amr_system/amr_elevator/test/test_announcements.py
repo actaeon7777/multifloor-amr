@@ -97,3 +97,15 @@ def test_late_suspend_success_after_failure_requests_resume_again_without_ros_no
     late_suspend.set_result(SetBool.Response(success=True))
     assert [c.args[0].data for c in client.call_async.call_args_list] == [True, False, False]
     assert node.calls['suspend'] is final_resume
+
+
+def test_obstacle_is_announced_only_after_the_hold_delay():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from amr_elevator.mission_node import FloorMissionManager
+
+    node = SimpleNamespace(p={'obstacle_announce_delay': 1.5}, announce=Mock())
+    FloorMissionManager.announce_blocked(node, 1.49)
+    node.announce.assert_not_called()
+    FloorMissionManager.announce_blocked(node, 1.5)
+    node.announce.assert_called_once_with('obstacle')

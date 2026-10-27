@@ -56,6 +56,25 @@ DEVICE_RESULT_NAMES = {0x00: 'PRESSED', 0x01: 'DUPLICATE', 0x81: 'WRONG_DEVICE',
                        0x83: 'BUTTON_FAULT', 0x84: 'BAD_REQUEST', 0xFF: 'NONE'}
 
 
+def delivery_announcement(goal, before):
+    """/robot/announcement key for a kiosk delivery (a goal with a room) leaving ``before``."""
+    status = goal.get('status')
+    if not goal.get('room') or status == before:
+        return None
+    if status == 'ACCEPTED' and before == 'SENDING':
+        return 'delivery_start'
+    if status == 'SUCCEEDED':
+        return 'room_arrival'
+    if status == 'CANCELED':
+        return 'delivery_cancel'
+    # A floor_goal failure is already announced by the elevator mission; an E-stop or LB
+    # takeover (navigation_manager ESTOP_DETAIL / OVERRIDE_DETAIL) is not a robot error.
+    if (status in ('FAILED', 'REJECTED') and goal.get('kind') == 'goal'
+            and not str(goal.get('error_message', '')).startswith(('E-stop', '수동 조작'))):
+        return 'robot_error'
+    return None
+
+
 def _typed(source, keys):
     """Copy whitelisted keys whose value has the expected type (bool is not an int here)."""
     result = {}
@@ -147,6 +166,7 @@ class SharedState:
     def __init__(self, preview=False, kiosk_pin=''):
         self.lock = threading.RLock()
         self.commands = queue.Queue(maxsize=32)
+        self.announce = None  # ros_bridge: announce(key, goal) publishes /robot/announcement
         self.grids = {}
         self.grid_versions = {}
         self.requests = OrderedDict()
@@ -258,7 +278,10 @@ class SharedState:
             if (not isinstance(request_id, str) or not request_id
                     or request_id != goal.get('request_id') or goal.get('status') not in TERMINAL_GOALS):
                 raise ApiError(409, '현재 완료된 배송만 확인할 수 있습니다.')
+            first = self.state.get('acknowledged_request') != request_id
             self.state['acknowledged_request'] = request_id
+            if first and self.announce and goal.get('room') and goal.get('status') == 'SUCCEEDED':
+                self.announce('received', goal)
             return dict(acknowledged=request_id)
 
     def update_camera(self, data, fmt=''):

@@ -196,6 +196,45 @@ def test_late_beacon_upgrades_an_assumed_arrival(building):
     assert (ride.s.floor, ride.s.confidence, ride.m.car_target) == ('5F', 'BEACON', '')
 
 
+def test_weak_target_beacon_after_travel_confirms_the_arrival(building):
+    ride = Ride(building)
+    board(ride)
+    depart(ride, '5F')
+    arrive(ride, 30.)
+    assert ride.at(32.).beacon(5, rssi=-80) == 'ok'
+    assert (ride.s.floor, ride.s.confidence, ride.m.car_target) == ('5F', 'BEACON', '')
+    assert 'ARRIVAL_UNCONFIRMED' not in ride.events()
+
+
+def test_weak_target_beacon_upgrades_an_assumed_arrival(building):
+    ride = Ride(building)
+    board(ride)
+    depart(ride, '5F')
+    arrive(ride, 30.)
+    ride.at(35.)
+    assert ride.s.confidence == 'ASSUMED'
+    assert ride.at(35.5).beacon(5, rssi=-80) == 'ok'
+    assert (ride.s.floor, ride.s.confidence, ride.m.car_target) == ('5F', 'BEACON', '')
+
+
+def test_weak_beacon_is_not_enough_off_target_or_without_travel(building):
+    ride = Ride(building)
+    board(ride)
+    depart(ride, '5F')
+    assert ride.at(24.).beacon(5, rssi=-80) == 'weak'  # door still closed
+    arrive(ride, 30.)
+    assert ride.at(32.).beacon(3, rssi=-80) == 'weak'  # not the target floor
+    assert ride.s.confidence == 'TRANSIT'
+
+    ride = Ride(building)
+    board(ride)
+    depart(ride, '3F')           # closed only 1.1 s after departure
+    ride.at(22.6).door(OPENING)
+    ride.at(23.).door(OPEN)
+    assert ride.at(23.5).beacon(3, rssi=-80) == 'weak'
+    assert ride.s.confidence == 'TRANSIT'
+
+
 def test_reopened_door_without_travel_assumes_the_departure_floor(building):
     ride = Ride(building)
     board(ride)

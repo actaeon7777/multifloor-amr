@@ -180,3 +180,11 @@ button:disabled{cursor:default;opacity:.45}.rooms.locked .room:disabled{opacity:
 .now-card>div:last-child{min-width:0}.now-card h2{overflow-wrap:break-word}
 
 .full.held p { max-width: 32em; }
+
+.patrol #patrol-progress { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+.admin-grid .side{min-height:0;overflow-y:auto}.admin-grid .side>div{flex-shrink:0}
+.patrol-actions{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px}
+.patrol-actions select{min-width:0;width:100%;height:56px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--ink);font:inherit;font-size:16px}
+.patrol-actions .btn{height:56px;padding:0 10px;font-size:16px;border-radius:12px;white-space:nowrap}
+#patrol-admin-status{overflow-wrap:anywhere;font-variant-numeric:tabular-nums}

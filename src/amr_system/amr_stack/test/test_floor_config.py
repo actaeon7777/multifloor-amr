@@ -1,6 +1,7 @@
 """floors.yaml must stay the single, consistent source for multi-floor data."""
 
 import copy
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -11,8 +12,8 @@ import pytest
 import yaml
 
 from amr_stack.floor_config import (
-    FloorConfigError, find_workspace_root, load_floor_config, load_occupancy_map,
-    parse_floor_config,
+    FloorConfigError, elevator_geometry, find_workspace_root, load_floor_config,
+    load_occupancy_map, parse_floor_config,
 )
 
 PACKAGE = Path(__file__).resolve().parents[1]
@@ -131,18 +132,29 @@ def test_car_interior_has_no_mapped_wall(config, simulation):
 
 def test_elevator_geometry_matches_drawing(config):
     geometry = config.elevator_geometry('4F', 'E1')
-    # Door centred in a 1.87 m car (0.385 + 1.10 + 0.385), car 0.66 m beyond the hall wall.
-    assert geometry.car_pose[0] == pytest.approx(9.975 - 0.66 - 2.23 / 2)
+    # Door centred in a 1.87 m car (0.385 + 1.10 + 0.385). The hall door panel (the
+    # map wall, door_center) sits 0.37 m inside the hall wall face; the car's inner
+    # wall is 0.32 m beyond the panel (sketch 0.66 m = face to car wall).
+    assert geometry.car_pose[0] == pytest.approx(9.975 - 0.32 - 2.23 / 2)
     assert geometry.car_pose[1] == pytest.approx(3.31)
     assert geometry.car_pose[2] == pytest.approx(0.0, abs=1e-5)  # facing the door (east)
     (x0, y0), (x1, y1) = geometry.hall_door
     assert x0 == pytest.approx(9.975) and x1 == pytest.approx(9.975)
     assert abs(y0 - y1) == pytest.approx(1.10)
-    assert {round(p[0], 3) for p in geometry.car_door} == {round(9.975 - 0.66, 3)}
+    assert {round(p[0], 3) for p in geometry.hall_entry} == {round(9.975 + 0.37, 3)}
+    assert {round(p[1], 3) for p in geometry.hall_entry} == {round(3.31 - 0.55, 3), round(3.31 + 0.55, 3)}
+    assert {round(p[0], 3) for p in geometry.car_door} == {round(9.975 - 0.32, 3)}
     xs = sorted({round(p[0], 3) for p in geometry.car_polygon})
     ys = sorted({round(p[1], 3) for p in geometry.car_polygon})
-    assert xs == [round(9.975 - 0.66 - 2.23, 3), round(9.975 - 0.66, 3)]
+    assert xs == [round(9.975 - 0.32 - 2.23, 3), round(9.975 - 0.32, 3)]
     assert ys == [round(3.31 - 0.935, 3), round(3.31 + 0.935, 3)]
+
+
+def test_hall_recess_defaults_to_the_door_plane(config):
+    spec = config.elevators['E1']
+    assert spec.hall_recess_m == pytest.approx(0.37)
+    flat = elevator_geometry(replace(spec, hall_recess_m=0.), config.floor('4F').elevators['E1'])
+    assert flat.hall_entry == flat.hall_door
 
 
 def test_elevator_door_matches_generated_layer(config):

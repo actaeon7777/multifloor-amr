@@ -1,4 +1,5 @@
 """Opt-in ROS test: elevator_monitor through a full 4F -> 3F ride with synthetic sensors."""
+import functools
 import json
 import math
 import os
@@ -30,19 +31,31 @@ from amr_stack.floor_config import load_floor_config
 COUNT = 720
 
 
+@functools.lru_cache(maxsize=None)
 def world(hall_open, car_open):
-    """4F elevator walls as segments (hall door plane x=9.975, car to the west)."""
+    """4F elevator walls as segments from floors.yaml (hall door plane x=9.975, car to the west).
+
+    The hall wall face sits ``hall_recess_m`` east of the door plane, the car's
+    inner front wall ``threshold_depth_m`` west of it, with side walls in between.
+    """
+    g = load_floor_config().elevator_geometry('4F', 'E1')
+    hx = g.hall_entry[0][0]                                  # hall wall face
+    dx = g.hall_door[0][0]                                   # hall door plane (map wall)
+    cx = g.car_door[0][0]                                    # car front wall
+    bx = min(p[0] for p in g.car_polygon)                    # car back wall
+    door_lo, door_hi = sorted(p[1] for p in g.hall_door)     # door span
+    car_lo, car_hi = min(p[1] for p in g.car_polygon), max(p[1] for p in g.car_polygon)  # car sides
     segments = [
-        ((9.975, 3.86), (9.975, 8.)), ((9.975, 2.76), (9.975, -2.)),         # hall wall
-        ((9.315, 2.375), (9.315, 2.76)), ((9.315, 3.86), (9.315, 4.245)),    # car front wall
-        ((7.085, 2.375), (7.085, 4.245)),                                    # car back wall
-        ((7.085, 2.375), (9.315, 2.375)), ((7.085, 4.245), (9.315, 4.245)),  # car sides
-        ((9.315, 2.76), (9.975, 2.76)), ((9.315, 3.86), (9.975, 3.86)),      # threshold sides
+        ((hx, door_hi), (hx, 8.)), ((hx, door_lo), (hx, -2.)),         # hall wall face
+        ((cx, car_hi), (cx, door_hi)), ((cx, door_lo), (cx, car_lo)),  # car front wall
+        ((bx, car_lo), (bx, car_hi)),                                  # car back wall
+        ((bx, car_lo), (cx, car_lo)), ((bx, car_hi), (cx, car_hi)),    # car sides
+        ((cx, door_lo), (hx, door_lo)), ((cx, door_hi), (hx, door_hi)),  # recess + threshold sides
     ]
     if not hall_open:
-        segments.append(((9.975, 2.76), (9.975, 3.86)))
+        segments.append(((dx, door_lo), (dx, door_hi)))
     if not car_open:
-        segments.append(((9.315, 2.76), (9.315, 3.86)))
+        segments.append(((cx, door_lo), (cx, door_hi)))
     return segments
 
 
@@ -138,7 +151,7 @@ def test_full_ride_and_operator_override(ros):
 
     place(hall, True, True)
     assert ros.doors[-1].state == ElevatorDoorState.OPEN
-    car = (8.2, 3.31, math.pi)
+    car = load_floor_config().elevator_geometry('4F', 'E1').car_pose[:2] + (math.pi,)
     place(car, True, False)  # localization suspended inside the car
     assert ros.spin(2., lambda: ros.states[-1].zone == FloorState.ZONE_IN_ELEVATOR)
 

@@ -108,6 +108,21 @@ def test_boarding_from_the_wait_pose_covers_hall_approach_and_tunnel(geometry):
     assert offset.contains([(-2.3, .13)])[0] and not offset.contains([(-1.775, .55)])[0]
 
 
+def test_door_recess_walls_never_block_a_slanted_approach(geometry):
+    # Real E1 door: the hall door plane sits 0.37 m inside the hall wall face, with
+    # side walls along that recess. The recess belongs to the tunnel, not the hall.
+    recessed = SimpleNamespace(**vars(geometry), hall_entry=((-2.145, -.55), (-2.145, .55)))
+    recess_walls = [(x, side) for x in np.linspace(-2.14, -1.776, 12) for side in (-.55, .55)]
+    for pose in [(-2.775, 0., 0.), (-2.775, .2, 0.), (-2.775, .2, .15), (-2.775, -.2, -.15)]:
+        assert boarding_region(recessed, .1, approach_from=pose).contains(recess_walls).sum() == 0, pose
+    # The old tunnel (hall door plane only) is what let a slanted corridor hit them.
+    assert boarding_region(geometry, .1, approach_from=(-2.775, .2, .15)).contains(recess_walls).any()
+    # People in the recess still block, and the exit corridor uses the same tunnel.
+    assert boarding_region(recessed, .1, approach_from=(-2.775, .2, -.15)).contains([(-2., .1)])[0]
+    exit_corridor = exit_region(recessed, (-2.5, 0., math.pi), .1)
+    assert not exit_corridor.contains(recess_walls).any() and exit_corridor.contains([(-2., .1)])[0]
+
+
 def test_exit_includes_hall_and_excludes_car_walls(geometry):
     region = exit_region(geometry, (-2.5, 0., math.pi), .1)
     assert region.contains([(0., 0.), (-.8, 0.), (-1.5, 0.), (-2.4, .3)]).all()

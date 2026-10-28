@@ -13,9 +13,24 @@ PROTOCOL_VERSION = 2
 MAX_MESSAGE = 256 * 1024
 MAX_SUMMARY = 16 * 1024
 MAX_COMMAND = 4096
-COMMANDS = frozenset(('stop', 'resume', 'return_home'))
+COMMANDS = frozenset(('stop', 'resume', 'return_home', 'patrol_start', 'patrol_stop'))
 IDENTIFIER = re.compile(r'[A-Za-z0-9_-]{1,64}')
 REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{8,80}')
+PATROL_ROUTE = re.compile(r'[A-Za-z0-9_-]{1,32}')
+LOCAL_COMMAND_PATHS = {'stop': 'stop', 'resume': 'resume', 'return_home': 'return_home',
+                       'patrol_start': 'patrol/start', 'patrol_stop': 'patrol/stop'}
+
+
+def valid_command_payload(kind, payload):
+    if not isinstance(payload, dict):
+        return False
+    request_id = payload.get('request_id')
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        return False
+    if kind == 'patrol_start':
+        return (payload.keys() == {'request_id', 'route'} and isinstance(payload.get('route'), str)
+                and PATROL_ROUTE.fullmatch(payload['route']) is not None)
+    return kind in COMMANDS and payload.keys() == {'request_id'}
 
 
 def identifier(value):
@@ -79,7 +94,7 @@ class HttpClient:
         request_headers = dict(headers or {})
         data = payload if isinstance(payload, bytes) else dumps(payload) if payload is not None else None
         if data is not None:
-            request_headers['Content-Type'] = 'application/json'
+            request_headers.setdefault('Content-Type', 'application/json')
         req = Request(url, data=data, headers=request_headers)
         try:
             response = self.opener.open(req, timeout=timeout)
@@ -90,3 +105,57 @@ class HttpClient:
             if len(body) > limit:
                 raise ValueError('HTTP response exceeds protocol size limit')
             return response.status, dict(response.headers.items()), body
+
+
+MAX_EVENT = 64 * 1024
+MAX_EVENT_IMAGE = 400 * 1024
+MAX_EVENT_BATCH = 20 * MAX_EVENT + 4096
+EVENT_ID = re.compile(r'[0-9a-f]{32}')
+EVENT_KIND = re.compile(r'[a-z_]+(?:\.[a-z_]+)+')
+
+
+def event_id(value):
+    if not isinstance(value, str) or not EVENT_ID.fullmatch(value):
+        raise ValueError('Event id must be 32 lowercase hex characters')
+    return value
+
+
+def validate_event(event):
+    fields = {'id', 'kind', 'severity', 'text', 'floor', 'room', 'pose',
+              'image_path', 'stamp', 'wall_time', 'extra'}
+    if (not isinstance(event, dict) or event.keys() - fields or
+            (fields - {'extra'}) - event.keys()):
+        raise ValueError('Invalid event fields')
+    event = dict(event, extra=event.get('extra'))
+    if len(dumps(event)) > MAX_EVENT:
+        raise ValueError('Event exceeds 64 KiB')
+    event_id(event['id'])
+    kind = event['kind']
+    if not isinstance(kind, str) or len(kind) > 128 or not EVENT_KIND.fullmatch(kind):
+        raise ValueError('Invalid event kind')
+    if event['severity'] not in ('info', 'warn', 'alert'):
+        raise ValueError('Invalid event severity')
+    if not isinstance(event['text'], str) or len(event['text']) > 1024:
+        raise ValueError('Invalid event text')
+    for name in ('floor', 'room'):
+        if event[name] is not None and (not isinstance(event[name], str) or len(event[name]) > 128):
+            raise ValueError('Invalid event ' + name)
+    def number(value):
+        try:
+            return type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            return False
+    for name in ('stamp', 'wall_time'):
+        if not number(event[name]):
+            raise ValueError('Invalid event ' + name)
+    pose = event['pose']
+    if pose is not None and (not isinstance(pose, list) or len(pose) != 3 or not all(number(n) for n in pose)):
+        raise ValueError('Invalid event pose')
+    path = event['image_path']
+    if path is not None and (not isinstance(path, str) or len(path) > 4096 or
+                             not Path(path).is_absolute() or '\x00' in path):
+        raise ValueError('Invalid event image_path')
+    extra = event['extra']
+    if extra is not None and (not isinstance(extra, dict) or len(dumps(extra)) > 8192):
+        raise ValueError('Invalid event extra (maximum 8 KiB)')
+    return event

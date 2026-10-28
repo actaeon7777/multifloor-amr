@@ -173,6 +173,7 @@ function browserFixture() {
     }
     get innerHTML(){return this.html;}
     set innerHTML(value){
+      this.htmlWrites=(this.htmlWrites || 0)+1;
       this.children.forEach(id=>elements.delete(id));this.children=[];this.html=value;
       for(const m of value.matchAll(/<(\w+)\b([^>]*)>/g)) {
         const id=m[2].match(/\bid="([^"]*)"/)?.[1] || (m[1]==='button'?`button-${++serial}`:null);
@@ -190,7 +191,7 @@ function browserFixture() {
   const floors=[{name:'4F',level:4,selectable:true,map:{width:100,height:100,resolution:0.1,
     origin:[0,0,0],render_origin:[0,0,0],transform_valid:true,version:1},rooms:[{id:'402',x:2,y:3,yaw:0}]}];
   floors.push({...copy(floors[0]), name:'3F',level:3,map:{...copy(floors[0].map),version:17},rooms:[{id:'301',x:4,y:5,yaw:0.7}]});
-  let failState=false, rejectAdmin=false;
+  let failState=false, rejectAdmin=false, patrolError=null;
   const env={window:{}, document:{hidden:false,getElementById:id=>elements.get(id)||null,
     addEventListener:(name,fn)=>{handlers[name]=fn;},
     querySelectorAll(selector){const attr=selector.slice(6,-1).replace(/-([a-z])/g,(_,c)=>c.toUpperCase());return [...elements.values()].filter(e=>e.dataset[attr]!==undefined);}},
@@ -207,6 +208,13 @@ function browserFixture() {
       if(url.includes('/map.png'))return {ok:true,headers:{get:()=> '1'},blob:async()=>({})};
       if(url==='/api/acknowledge'){state.acknowledged_request=JSON.parse(options.body).request_id;return {ok:true,json:async()=>({})};}
       if(url==='/api/kiosk/unlock')return {ok:true,json:async()=>({token:'memory-only',expires_in:600})};
+      if(url==='/api/patrol/start' || url==='/api/patrol/stop') {
+        if(patrolError)return {ok:false,status:patrolError.status,json:async()=>({error:patrolError.detail})};
+        const body=JSON.parse(options.body), active=url.endsWith('/start');
+        state.patrol={...state.patrol,active,route:body.route || state.patrol?.route,phase:active?'NAV':'ABORTED',index:1,total:12,age:0};
+        state.notice={request_id:body.request_id,status:'SUCCEEDED',detail:''};
+        return {ok:true,status:202,json:async()=>({request_id:body.request_id})};
+      }
       if(url==='/api/initialpose' && rejectAdmin)return {ok:false,status:403,json:async()=>({error:'토큰 만료'})};
       return {ok:true,json:async()=>({})};
     },
@@ -218,6 +226,7 @@ function browserFixture() {
   return {env,elements,requests,timers,frames,handlers,intervals,settle,
     get draws(){return draws;}, get storage(){return storage;},
     setState:s=>{state=s;},fail:()=>{failState=true;},rejectAdmin:()=>{rejectAdmin=true;},
+    rejectPatrol:(status,detail)=>{patrolError={status,detail};},
     setTime:n=>{time=n;},
     draw(){const queued=[...frames.values()];frames.clear();queued.forEach(fn=>fn());},
     async poll(){const entry=[...timers.entries()].find(([,v])=>v.ms===500);assert(entry,'scheduled polling');timers.delete(entry[0]);await entry[1].fn();await settle();},
@@ -456,3 +465,114 @@ test('held admin remains reachable and return home hides delivery stop', async (
     assert.equal(b.elements.get(kind==='goal'?'drive-label':'transit-label').textContent,'관리자 호출로 복귀 중');
   }
 });
+
+test('fresh patrol locks deliveries after held and before transit', () => {
+  const patrol={active:true,route:'4F_full',phase:'NAV',index:1,total:12,age:0.2};
+  const s=ready({patrol,goal:goal('ACCEPTED',{kind:'floor_goal'})});
+  assert.equal(K.selectScreen(s),'patrol');
+  assert.equal(K.readyForGoal(s),false);
+  assert.equal(K.selectScreen({...s,hold:{held:true}}),'held');
+  assert.equal(K.selectScreen({...s,mode:'MANUAL'}),'manual');
+  assert.equal(K.selectScreen({...s,estop:{state:'ESTOP'}}),'estop');
+  for(const age of [3,4,null,undefined,'0',NaN,-1]) {
+    const stale=ready({patrol:{...patrol,age}});
+    assert.equal(K.selectScreen(stale),'idle');
+    assert.equal(K.readyForGoal(stale),true);
+  }
+  for(const phase of ['DONE','ABORTED']) assert.equal(K.selectScreen(ready({patrol:{...patrol,active:false,phase}})),'idle');
+});
+
+test('patrol warning renders progress, keeps admin reachable and removes delivery controls', async () => {
+  const b=browserFixture();await b.settle();
+  b.setState(ready({patrol:{active:true,route:'4F_full',phase:'DWELL',index:3,total:12,age:0},
+    kiosk:{pin_required:false},goal:goal()}));await b.poll();
+  assert.equal(b.elements.get('status-label').textContent,'야간 순찰 중');
+  assert(b.elements.get('status-pill').className.includes('warn'));
+  assert(b.elements.get('screen').innerHTML.includes('순찰이 끝날 때까지 배송을 받지 않습니다.'));
+  assert.equal(b.elements.get('patrol-progress').textContent,'4F_full · 3/12 · 관측');
+  assert.equal(b.elements.get('stop'),undefined);
+  assert.equal(b.elements.get('admin-button').disabled,false);
+  await b.click('action','admin');
+  assert.equal(b.elements.get('app').className,'app admin');
+});
+
+test('patrol admin status reports waiting, progress and terminal results defensively', () => {
+  assert.equal(K.patrolAdminStatus(null),'대기');
+  for(const [phase,label] of [['NAV','이동'],['DWELL','관측'],['RETURN','복귀']]) {
+    const s=ready({patrol:{active:true,age:0,route:'4F_full',index:2,total:12,phase}});
+    assert.equal(K.patrolAdminStatus(s),`4F_full 2/12 · ${label}`);
+    assert.equal(K.patrolAdminStatus({...s,patrol:{...s.patrol,age:3}}),'대기');
+  }
+  assert.equal(K.patrolAdminStatus({patrol:{phase:'DONE'}}),'완료');
+  assert.equal(K.patrolAdminStatus({patrol:{phase:'ABORTED',detail:'관리자 요청'}}),'중단: 관리자 요청');
+});
+
+test('patrol admin start and stop have independent enable rules', () => {
+  const s=ready({patrol:{active:false,routes:['4F_full'],age:0}}), live={online:true};
+  assert.deepEqual(copy(K.patrolAdminControls(s,live)),{start:true,stop:false});
+  for(const options of [{}, {online:false}, {...live,busy:true}, {...live,blocked:true}])
+    assert.equal(K.patrolAdminControls(s,options).start,false);
+  for(const changes of [{hold:{held:true}}, {goal:goal()}, {patrol:{routes:[]}}, {patrol:{routes:null}}])
+    assert.equal(K.patrolAdminControls({...s,...changes},live).start,false);
+  const active={...s,goal:goal(),hold:{held:true},patrol:{...s.patrol,active:true}};
+  assert.deepEqual(copy(K.patrolAdminControls(active,{...live,blocked:true})),{start:false,stop:true});
+  assert.equal(K.patrolAdminControls(active,{...live,busy:true}).stop,false);
+  assert.equal(K.patrolAdminControls(active,{online:false}).stop,false);
+  assert.equal(K.patrolAdminControls({...active,patrol:{...active.patrol,age:3}},live).stop,false);
+});
+
+test('patrol route choices retain selection and only rewrite options when routes change', async () => {
+  const b=browserFixture();await b.settle();
+  const s=ready({kiosk:{pin_required:false},patrol:{routes:['4F_full','4F_short'],active:false}});
+  b.setState(s);await b.poll();await b.click('action','admin');
+  const route=b.elements.get('patrol-route'), writes=route.htmlWrites;
+  assert.equal(route.value,'4F_full');
+  route.value='4F_short';b.elements.get('app').listeners.change({target:route});
+  await b.poll();assert.equal(route.htmlWrites,writes);assert.equal(route.value,'4F_short');
+  b.setState({...s,patrol:{...s.patrol,routes:['4F_short','new_route']}});await b.poll();
+  assert.equal(route.htmlWrites,writes+1);assert.equal(route.value,'4F_short');
+  await b.click('action','exit');await b.click('action','admin');
+  assert.equal(b.elements.get('patrol-route').value,'4F_short');
+  b.setState({...s,patrol:{routes:[]}});await b.poll();
+  assert.equal(b.elements.get('patrol-start').disabled,true);
+  assert.equal(b.elements.get('patrol-route').value,'');
+});
+
+for(const pin of [false,true]) test(`patrol admin sends kiosk commands with PIN=${pin} and exits only on start`, async () => {
+  const b=browserFixture();await b.settle();
+  b.setState(ready({kiosk:{pin_required:pin},patrol:{routes:['4F_full'],active:false,phase:'IDLE'}}));await b.poll();
+  const enter=async()=>{await b.click('action','admin');if(pin){await b.click('pin','1');await b.click('action','unlock');}};
+  await enter();assert.equal(b.elements.get('patrol-admin-status').textContent,'대기');
+  await b.click('action','patrol-start');
+  assert.equal(b.elements.get('app').className,'app');
+  assert.equal(b.elements.get('status-label').textContent,'야간 순찰 중');
+  // Stop must work while the existing adminBlocked() rejects moving/active goals.
+  b.setState(ready({kiosk:{pin_required:pin},navigation:'RUNNING',goal:goal(),
+    patrol:{routes:['4F_full'],active:true,phase:'NAV',age:0,route:'4F_full',index:1,total:12}}));await b.poll();
+  await enter();assert.equal(b.elements.get('patrol-start').disabled,true);
+  assert.equal(b.elements.get('patrol-stop').disabled,false);
+  assert.equal(b.elements.get('patrol-admin-status').textContent,'4F_full 1/12 · 이동');
+  // The fake server will finish the navigation before the next state update.
+  b.setState(ready({kiosk:{pin_required:pin},patrol:{routes:['4F_full'],active:true,phase:'NAV',age:0,route:'4F_full'}}));
+  await b.click('action','patrol-stop');
+  assert.equal(b.elements.get('app').className,'app admin');
+  assert.equal(b.elements.get('patrol-stop').disabled,true);
+  const sent=b.requests.filter(r=>r.url.startsWith('/api/patrol/'));
+  assert.deepEqual(sent.map(r=>r.url),['/api/patrol/start','/api/patrol/stop']);
+  for(const [i,r] of sent.entries()) {
+    assert.equal(r.options.headers['X-AMR-Client'],'kiosk');
+    assert.equal(r.options.headers['X-AMR-Kiosk-Token'],pin?'memory-only':undefined);
+    const payload=JSON.parse(r.options.body);assert.match(payload.request_id,/^[A-Za-z0-9_-]{8,80}$/);
+    assert.deepEqual(Object.keys(payload).sort(),i===0?['request_id','route']:['request_id']);
+    if(i===0)assert.equal(payload.route,'4F_full');
+  }
+});
+
+for(const [status,detail] of [[409,'등록되지 않은 순찰 경로입니다.'],[403,'관리 모드 잠금을 먼저 해제하세요.']])
+  test(`patrol admin surfaces HTTP ${status} and handles rejected start`, async () => {
+    const b=browserFixture();await b.settle();
+    b.setState(ready({kiosk:{pin_required:false},patrol:{routes:['4F_full'],active:false}}));await b.poll();
+    await b.click('action','admin');b.rejectPatrol(status,detail);await b.click('action','patrol-start');
+    assert.equal(b.elements.get('toast').textContent,detail);
+    assert.equal(b.elements.get('app').className,status===403?'app':'app admin');
+  });

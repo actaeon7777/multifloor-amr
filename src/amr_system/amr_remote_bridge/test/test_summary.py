@@ -13,6 +13,8 @@ def test_missing_fields():
     assert result == dict(floor=None, zone=None, robot=None, task='', mode=None, navigation=None,
                           estop=dict(state=None, healthy=None, detail=None, error=None),
                           hold={'held': False}, goal=None, floor_mission=None, battery=None,
+                          patrol=dict(active=False, route=None, phase='IDLE', index=None, total=None,
+                                      detail=None, routes=[], age=None),
                           localization={'ready': False, 'age': None}, notice=None, pending_request=None)
 
 
@@ -55,3 +57,26 @@ def test_projection_is_independent_and_drops_large_fields():
 
 def test_current_floor_precedes_transit_from():
     assert summarize({'floor': {'floor': '3F', 'transit_from': '4F'}})['floor'] == '3F'
+
+
+def test_patrol_projection_subset_and_route_limit():
+    from amr_remote_bridge.server import validate_summary
+    source = dict(active=True, route='4F_full', phase='DWELL', index=3, total=12, detail='관측',
+                  routes=[f'route_{i}' for i in range(40)], age=.3, received_at=42,
+                  skipped=[2], last_command={'request_id': 'private'}, stamp=123.)
+    before = deepcopy(source)
+    result = summarize({'patrol': source})
+    assert result['patrol'] == {k: before[k] for k in ('active', 'route', 'phase', 'index', 'total', 'detail', 'age')} | {'routes': before['routes'][:32]}
+    validate_summary(result)
+    result['patrol']['routes'].clear()
+    assert source == before
+
+
+@pytest.mark.parametrize('value', [None, [], 'bad', {},
+    {'active': 'true', 'index': True, 'total': [], 'phase': 42, 'routes': [False, '4F_full'], 'age': float('nan')}])
+def test_patrol_missing_or_garbage_fields(value):
+    from amr_remote_bridge.server import validate_summary
+    result = summarize({'patrol': value})
+    validate_summary(result)
+    assert result['patrol']['active'] is False and result['patrol']['phase'] == 'IDLE'
+    assert result['patrol']['index'] is None and result['patrol']['age'] is None

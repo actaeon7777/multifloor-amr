@@ -96,7 +96,7 @@ def test_light_snapshot_uses_same_freshness_and_skips_heavy_parts(shared, http, 
                         goal=dict(request_id='goal_001', status='ACCEPTED', feedback_received_at=98.))
     expected = set('preview connection_epoch mode navigation action_ready floor_action_ready floor '
                    'floor_mission goal notice pending_request localization localization_reset_pending '
-                   'robot global_path tf_error estop telemetry acknowledged_request kiosk map_version hold task'.split())
+                   'robot global_path tf_error estop telemetry acknowledged_request kiosk map_version hold task patrol'.split())
     with http(shared) as request:
         full = request('/api/state')[1]
         assert full['kiosk'] == {'pin_required': True} and full['acknowledged_request'] is None
@@ -840,3 +840,365 @@ def test_kiosk_browser_pid_skips_child_processes(tmp_path):
     assert kiosk_browser_pid(tmp_path) == 12  # Chromium's rewritten process title.
     (tmp_path/'12'/'cmdline').unlink()
     assert kiosk_browser_pid(tmp_path) is None
+
+
+def patrol_status(shared, **values):
+    shared.update_patrol(json.dumps(dict(active=False, phase='IDLE', routes=['4F_full', '4F_short'],
+                                         route=None, index=0, total=12) | values))
+
+
+@pytest.mark.parametrize('preview', [True, False])
+def test_patrol_start_stop_http_and_ack(shared, http, preview):
+    shared.kiosk_pin = '1234'
+    make_ready(shared)
+    shared.state['preview'] = preview
+    patrol_status(shared)
+    with http(shared) as request:
+        start = dict(request_id='patrol_start_001', route='4F_full')
+        assert request('/api/patrol/start', start)[0] == 403
+        assert request('/api/patrol/start', start, kiosk=False)[:2] == (202, {'request_id': start['request_id']})
+        assert request('/api/patrol/start', start, kiosk=False)[0] == 202
+        if preview:
+            assert shared.requests[start['request_id']]['status'] == 'PREVIEW'
+            assert shared.state['patrol']['index'] == 1 and shared.state['patrol']['total'] == 12
+            assert not shared.operator_commands
+        else:
+            command = shared.operator_commands.popleft()
+            assert command['patrol'] == dict(command='start', **start)
+            assert shared.state['pending_request']['kind'] == 'patrol_start'
+            shared.pending_patrol[start['request_id']] = time.monotonic()
+            patrol_status(shared, active=True, phase='NAV', route='4F_full')
+            shared.state['patrol']['last_command'] = dict(request_id=start['request_id'], accepted=True, detail='시작')
+            shared.poll_patrol()
+            assert shared.requests[start['request_id']]['status'] == 'SUCCEEDED'
+            assert shared.state['notice']['detail'] == '시작'
+            assert shared.state['pending_request'] is None
+        snapshot = request('/api/kiosk/state')[1]
+        assert snapshot['patrol']['active'] and snapshot['patrol']['age'] < 3
+        assert 'received_at' not in snapshot['patrol']
+        stop = dict(request_id='patrol_stop_001')
+        assert request('/api/patrol/stop', stop)[0] == 403
+        assert request('/api/patrol/stop', stop, kiosk=False)[0] == 202
+        if preview:
+            assert not shared.patrol_active()
+            assert shared.requests[stop['request_id']]['status'] == 'PREVIEW'
+        else:
+            command = shared.operator_commands.popleft()
+            assert command['patrol'] == dict(command='stop', **stop)
+            shared.pending_patrol[stop['request_id']] = time.monotonic()
+            shared.state['patrol']['last_command'] = dict(request_id=stop['request_id'], accepted=False, detail='거절')
+            shared.poll_patrol()
+            assert shared.requests[stop['request_id']]['status'] == 'FAILED'
+            assert shared.state['notice']['detail'] == '거절'
+
+
+@pytest.mark.parametrize('route,status', [('', 400), ('../4F', 400), ('a'*33, 400),
+                                        (None, 400), (True, 400), ('unknown', 409)])
+def test_patrol_route_http_validation(shared, http, route, status):
+    patrol_status(shared)
+    with http(shared) as request:
+        result = request('/api/patrol/start', dict(request_id='bad_route_01', route=route), kiosk=False)
+        assert result[0] == status
+        if status == 409:
+            assert result[1] == {'error': '등록되지 않은 순찰 경로입니다.'}
+        assert not shared.operator_commands and not shared.requests
+
+
+@pytest.mark.parametrize('change,detail', [
+    ({'goal': {'status': 'ACCEPTED'}}, '진행 중인 목표'),
+    ({'goal': {'status': 'SENDING'}}, '진행 중인 목표'),
+    ({'goal': {'status': 'CANCELING'}}, '진행 중인 목표'),
+    ({'floor_mission': {'phase': 'RIDING'}}, '진행 중인 층간 이동'),
+    ({'hold': {'held': True}}, '관리자가 원격으로 정지'),
+    ({'mode': 'MANUAL'}, '수동 조작'),
+    ({'action_ready': False}, '내비게이션 연결'),
+])
+def test_patrol_start_http_conflicts(shared, http, change, detail):
+    make_ready(shared)
+    patrol_status(shared)
+    shared.state.update(change)
+    with http(shared) as request:
+        status, body, _ = request('/api/patrol/start', dict(request_id='patrol_conflict', route='4F_full'), kiosk=False)
+        assert status == 409 and detail in body['error']
+        assert request('/api/patrol/stop', dict(request_id='patrol_no_active'), kiosk=False)[0] == 409
+    assert not shared.operator_commands
+
+
+def test_patrol_ack_matching_timeout_and_no_late_completion(shared, monkeypatch):
+    from amr_web_ui.server import ApiError
+    make_ready(shared)
+    patrol_status(shared)
+    shared.request('patrol_start', dict(request_id='patrol_timeout', route='4F_full'))
+    with pytest.raises(ApiError, match='다른 명령'):
+        shared.request('patrol_start', dict(request_id='patrol_timeout', route='4F_short'))
+    shared.pending_patrol['patrol_timeout'] = 100.
+    shared.state['patrol']['last_command'] = dict(request_id='other_request', accepted=True, detail='old')
+    monkeypatch.setattr(time, 'monotonic', lambda: 102.99)
+    shared.poll_patrol()
+    assert shared.requests['patrol_timeout']['status'] == 'QUEUED'
+    monkeypatch.setattr(time, 'monotonic', lambda: 103.)
+    shared.poll_patrol()
+    assert shared.state['notice'] == dict(request_id='patrol_timeout', status='FAILED', detail='순찰 노드가 응답하지 않습니다.')
+    assert not shared.pending_patrol and shared.state['pending_request'] is None
+    shared.state['patrol']['last_command'] = dict(request_id='patrol_timeout', accepted=True)
+    shared.poll_patrol()
+    assert shared.requests['patrol_timeout']['status'] == 'FAILED'
+
+
+@pytest.mark.parametrize('phase,label', [('NAV', '이동'), ('DWELL', '관측'), ('RETURN', '복귀')])
+def test_patrol_summary_readiness_freshness_and_terminal(shared, monkeypatch, phase, label):
+    from amr_web_ui.server import PATROL_DELIVERY_ERROR
+    make_ready(shared)
+    patrol_status(shared, active=True, phase=phase, route='4F_full', index=3)
+    received = shared.state['patrol']['received_at']
+    for kiosk in (False, True):
+        assert shared.snapshot(kiosk=kiosk)['task'] == f'순찰 4F_full 3/12 · {label}'
+    for kind in ('goal', 'floor_goal'):
+        assert shared.readiness_error(kind) == PATROL_DELIVERY_ERROR
+    shared.state['hold']['pending'] = True
+    assert shared.snapshot()['task'].endswith(' · 하차 후 정지 예정')
+    shared.state['hold']['held'] = True
+    assert shared.snapshot()['task'] == '관리자 정지'
+    shared.state['hold']['held'] = False
+    shared.state['mode'] = 'MANUAL'
+    assert shared.snapshot()['task'] == '수동 조작'
+    shared.state['mode'] = 'AUTO'
+    monkeypatch.setattr(time, 'monotonic', lambda: received+3)
+    assert not shared.patrol_active()
+    shared.state['localization']['received_at'] = time.monotonic()
+    assert shared.snapshot()['task'] == '대기'
+    assert shared.readiness_error('goal') != PATROL_DELIVERY_ERROR
+    for terminal in ('DONE', 'ABORTED'):
+        patrol_status(shared, active=False, phase=terminal)
+        assert not shared.patrol_active() and shared.snapshot()['task'] == '대기'
+
+
+def test_patrol_status_whitelist_and_garbage(shared):
+    for value in ('broken', '[]', 'null', '42'):
+        assert not shared.update_patrol(value)
+    patrol_status(shared, active='true', phase='BAD', index=True, total=[], detail=['bad'], route=12,
+                  elapsed_s=float('nan'), started_at=True, stamp=float('inf'), extra='secret',
+                  routes=['4F_full', False, 'a'*33, '../bad'], skipped=[1, False, '2', -1],
+                  last_command=dict(request_id='valid_request', accepted='yes'))
+    p = shared.snapshot()['patrol']
+    assert p['active'] is False and p['phase'] == 'IDLE' and p['route'] is None
+    assert p['routes'] == ['4F_full'] and p['skipped'] == [1] and p['last_command'] is None
+    assert p['started_at'] is None
+    assert not {'extra', 'index', 'total', 'elapsed_s', 'stamp', 'detail', 'received_at'} & p.keys()
+
+
+@pytest.mark.parametrize('kind', ['stop', 'return_home'])
+def test_operator_command_also_stops_patrol(shared, operator_bridge, kind):
+    bridge = operator_bridge
+    sent = []
+    bridge.patrol_pub = SimpleNamespace(publish=lambda m: sent.append(('patrol', json.loads(m.data))))
+    bridge.hold_pub = SimpleNamespace(publish=lambda m: sent.append(('hold', json.loads(m.data))))
+    patrol_status(shared, active=True, phase='NAV', route='4F_full')
+    shared.request(kind, dict(request_id='operator_patrol_stop'))
+    bridge.poll_operator_commands()
+    assert sent[0] == ('patrol', {'command': 'stop', 'request_id': 'operator_patrol_stop'})
+    assert shared.state['hold']['held'] == (kind == 'stop')
+    if kind == 'stop':
+        assert sent[1][0] == 'hold'
+
+
+def test_patrol_executor_publishes_and_rechecks_readiness(shared, operator_bridge):
+    bridge = operator_bridge
+    sent = []
+    bridge.patrol_pub = SimpleNamespace(publish=lambda m: sent.append(json.loads(m.data)))
+    patrol_status(shared)
+    shared.request('patrol_start', dict(request_id='executor_patrol', route='4F_full'))
+    bridge.poll_operator_commands()
+    assert sent == [dict(command='start', request_id='executor_patrol', route='4F_full')]
+    assert 'executor_patrol' in shared.pending_patrol
+    shared.state['patrol']['last_command'] = dict(request_id='executor_patrol', accepted=True, detail='ok')
+    shared.poll_patrol()
+    shared.request('patrol_start', dict(request_id='executor_changed', route='4F_full'))
+    shared.state['mode'] = 'MANUAL'
+    bridge.poll_operator_commands()
+    assert len(sent) == 1 and shared.requests['executor_changed']['status'] == 'FAILED'
+
+
+def test_patrol_preview_blocks_delivery_and_reset_drops_queued_start(shared):
+    from amr_web_ui.server import ApiError
+    patrol_status(shared)
+    shared.request('patrol_start', dict(request_id='preview_patrol', route='4F_full'))
+    with pytest.raises(ApiError, match='야간 순찰 중'):
+        shared.request('goal', pose(shared))
+    shared.request('patrol_stop', dict(request_id='preview_patrol_stop'))
+    make_ready(shared)
+    shared.request('patrol_start', dict(request_id='reset_patrol', route='4F_full'))
+    shared.reset_connection('reset')
+    assert not shared.operator_commands and not shared.pending_patrol
+    assert shared.requests['reset_patrol']['status'] == 'FAILED'
+
+
+def test_patrol_reset_preserves_routes_without_reusing_live_status(shared):
+    make_ready(shared)
+    patrol_status(shared, active=True, phase='NAV', route='4F_full',
+                  last_command=dict(request_id='old_patrol', accepted=True, detail='old'))
+    shared.reset_connection('controller session changed')
+    patrol = shared.state['patrol']
+    assert patrol == dict(active=False, phase='IDLE', routes=['4F_full', '4F_short'])
+    assert not shared.patrol_active()
+    for kiosk in (False, True):
+        snapshot = shared.snapshot(kiosk=kiosk)['patrol']
+        assert snapshot['routes'] == ['4F_full', '4F_short'] and snapshot['age'] is None
+    # The idle patrol node need not republish its route list after readiness recovers.
+    make_ready(shared)
+    shared.request('patrol_start', dict(request_id='after_reset_patrol', route='4F_full'))
+    assert shared.operator_commands[-1]['patrol'] == dict(
+        command='start', request_id='after_reset_patrol', route='4F_full')
+
+
+@pytest.mark.parametrize('navigation', ['RUNNING', 'STOPPING'])
+def test_return_after_patrol_waits_for_navigation_idle(shared, navigation):
+    make_ready(shared)
+    patrol_status(shared, active=True, phase='NAV', route='4F_full')
+    shared.state['navigation'] = navigation
+    shared.request('return_home', dict(request_id='return_after_patrol'))
+    started = shared.pending_return['started']
+    # The patrol status becomes inactive before Nav2's cancel has completed.
+    patrol_status(shared, active=False, phase='ABORTED', route='4F_full')
+    assert not shared.patrol_active()
+    assert shared.next_return_command(now=started+1) is None
+    assert shared.pending_return['request_id'] == 'return_after_patrol'
+    shared.state['navigation'] = 'IDLE'
+    command = shared.next_return_command(now=started+1)
+    assert command['request_id'] == 'return_after_patrol' and command['origin'] == 'return_home'
+    assert command['kind'] == 'goal' and shared.pending_return is None
+
+
+def test_return_navigation_stop_timeout_explains_wait(shared):
+    make_ready(shared)
+    shared.request('return_home', dict(request_id='navigation_stop_timeout'))
+    shared.state['navigation'] = 'STOPPING'
+    assert shared.next_return_command(now=shared.pending_return['started']+30) is None
+    assert shared.state['notice'] == dict(request_id='navigation_stop_timeout', status='FAILED',
+        detail='복귀를 시작하지 못했습니다: 이전 주행의 정지 완료를 기다리고 있습니다.')
+
+
+def test_patrol_start_already_active_takes_precedence(shared):
+    from amr_web_ui.server import ApiError
+    make_ready(shared)
+    patrol_status(shared, active=True, phase='NAV', route='4F_full')
+    shared.state['goal'] = dict(status='ACCEPTED')
+    shared.state['floor_mission'] = dict(phase='RIDING')
+    assert shared.patrol_start_error() == '이미 순찰 중입니다.'
+    with pytest.raises(ApiError, match='^이미 순찰 중입니다\\.$') as error:
+        shared.request('patrol_start', dict(request_id='already_patrolling', route='4F_full'))
+    assert error.value.status == 409 and not shared.operator_commands
+
+
+@pytest.fixture
+def patrol_http_bytes(monkeypatch):
+    """Use the real HTTP parser/handler with byte streams when TCP is unavailable."""
+    import io
+    from amr_web_ui import server as module
+    monkeypatch.setattr(module, 'ThreadingHTTPServer',
+                        lambda address, handler: SimpleNamespace(handler=handler))
+
+    @contextmanager
+    def serve(shared):
+        server = module.create_http_server(shared, '/nonexistent')
+
+        def request(path, payload=None, kiosk=True, headers=None):
+            body = json.dumps(payload).encode() if payload is not None else b''
+            fields = {'Host': '127.0.0.1', 'Connection': 'close', 'Content-Type': 'application/json',
+                      'X-AMR-Request': '1', 'Content-Length': str(len(body))}
+            if kiosk:
+                fields['X-AMR-Client'] = 'kiosk'
+            fields.update(headers or {})
+            raw = (f'{"POST" if payload is not None else "GET"} {path} HTTP/1.1\r\n' +
+                   ''.join(f'{key}: {value}\r\n' for key, value in fields.items()) + '\r\n').encode() + body
+            output = bytearray()
+            stream = SimpleNamespace(makefile=lambda *_args: io.BytesIO(raw),
+                                     settimeout=lambda _timeout: None, sendall=output.extend)
+            server.handler(stream, ('127.0.0.1', 12345), server)
+            head, body = bytes(output).split(b'\r\n\r\n', 1)
+            return int(head.split(b' ', 2)[1]), json.loads(body), {}
+
+        yield request
+    return serve
+
+
+@pytest.mark.parametrize('preview', [True, False])
+def test_patrol_http_bytes_start_stop_ack(shared, patrol_http_bytes, preview):
+    test_patrol_start_stop_http_and_ack(shared, patrol_http_bytes, preview)
+
+
+@pytest.mark.parametrize('route,status', [('', 400), ('../4F', 400), ('a'*33, 400),
+                                        (None, 400), (True, 400), ('unknown', 409)])
+def test_patrol_http_bytes_route_validation(shared, patrol_http_bytes, route, status):
+    test_patrol_route_http_validation(shared, patrol_http_bytes, route, status)
+
+
+@pytest.mark.parametrize('change,detail', [
+    ({'goal': {'status': 'ACCEPTED'}}, '진행 중인 목표'),
+    ({'floor_mission': {'phase': 'RIDING'}}, '진행 중인 층간 이동'),
+    ({'hold': {'held': True}}, '관리자가 원격으로 정지'),
+    ({'mode': 'MANUAL'}, '수동 조작'),
+    ({'action_ready': False}, '내비게이션 연결'),
+])
+def test_patrol_http_bytes_conflicts(shared, patrol_http_bytes, change, detail):
+    test_patrol_start_http_conflicts(shared, patrol_http_bytes, change, detail)
+
+
+def check_kiosk_patrol_admin_access(shared, serve, pin, preview):
+    make_ready(shared)
+    shared.state['preview'] = preview
+    shared.kiosk_pin = pin
+    patrol_status(shared)
+    with serve(shared) as request:
+        headers = {}
+        if pin:
+            token = request('/api/kiosk/unlock', {'pin': pin})[1]['token']
+            headers['X-AMR-Kiosk-Token'] = token
+        for command, extra in [('start', {'route': '4F_full'}), ('stop', {})]:
+            payload = dict(request_id=f'kiosk_patrol_{command}', **extra)
+            endpoint = '/api/patrol/' + command
+            if pin:
+                for bad_headers in ({}, {'X-AMR-Kiosk-Token': 'invalid'}):
+                    assert request(endpoint, payload, headers=bad_headers)[:2] == (
+                        403, {'error': '관리 모드 잠금을 먼저 해제하세요.'})
+                assert payload['request_id'] not in shared.requests
+            assert request(endpoint, payload, headers=headers)[:2] == (
+                202, {'request_id': payload['request_id']})
+            # Operators still use the same request table without kiosk tokens.
+            assert request(endpoint, payload, kiosk=False)[0] == 202
+            if preview:
+                assert shared.requests[payload['request_id']]['status'] == 'PREVIEW'
+            else:
+                queued = shared.operator_commands.popleft()
+                assert queued['patrol'] == dict(command=command, **payload)
+                shared.pending_patrol[payload['request_id']] = time.monotonic()
+                patrol_status(shared, active=command == 'start', route='4F_full',
+                              phase='NAV' if command == 'start' else 'ABORTED',
+                              last_command=dict(request_id=payload['request_id'], accepted=True, detail='ack'))
+                shared.poll_patrol()
+                assert shared.requests[payload['request_id']]['status'] == 'SUCCEEDED'
+        assert not shared.patrol_active() and shared.state['pending_request'] is None
+
+
+@pytest.mark.parametrize('pin', ['', '1234'])
+@pytest.mark.parametrize('preview', [True, False])
+def test_kiosk_patrol_admin_http(shared, http, pin, preview):
+    check_kiosk_patrol_admin_access(shared, http, pin, preview)
+
+
+@pytest.mark.parametrize('pin', ['', '1234'])
+@pytest.mark.parametrize('preview', [True, False])
+def test_kiosk_patrol_admin_bytes(shared, patrol_http_bytes, pin, preview):
+    check_kiosk_patrol_admin_access(shared, patrol_http_bytes, pin, preview)
+
+
+def test_kiosk_patrol_expired_admin_token(shared, patrol_http_bytes, monkeypatch):
+    shared.kiosk_pin = '1234'
+    patrol_status(shared, active=True, phase='NAV')
+    with patrol_http_bytes(shared) as request:
+        token = request('/api/kiosk/unlock', {'pin': '1234'})[1]['token']
+        monkeypatch.setattr(time, 'monotonic', lambda: shared.kiosk_tokens[token])
+        assert request('/api/patrol/stop', {'request_id': 'expired_patrol_stop'},
+                       headers={'X-AMR-Kiosk-Token': token})[:2] == (
+                           403, {'error': '관리 모드 잠금을 먼저 해제하세요.'})
+        assert not shared.operator_commands

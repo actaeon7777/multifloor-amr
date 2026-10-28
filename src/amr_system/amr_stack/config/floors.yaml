@@ -17,7 +17,11 @@ elevators:
     car_interior_m: [1.87, 2.23]     # [문 벽 방향 폭, 깊이]  docs/images/Elevator_size.jpg
     door_width_m: 1.10
     door_offset_from_left_m: 0.385   # 홀에서 카를 바라볼 때 카 왼쪽 안벽 ~ 출입구
-    threshold_depth_m: 0.66          # 층 벽(홀 문 평면) ~ 카 안쪽 벽
+    # door_center는 지도에 벽으로 찍힌 홀 문 패널이다. 복도 벽면은 그보다 hall_recess_m 앞에 있다.
+    # 2026-10-28: 스케치의 0.66 m는 복도 벽면 기준이라 둘로 나눴다. 카 벽 맞춤 보정이 매번 -0.32~-0.345 m를
+    # 내던 원인(카가 설정보다 0.33 m 깊게 등록됨 → 끝 벽까지 진입, 회전 막힘).
+    hall_recess_m: 0.37              # 복도 벽면 ~ 홀 문 패널(door_center). 문 앞 홈의 양옆 벽이 이 구간에 있다
+    threshold_depth_m: 0.32          # 홀 문 패널(door_center) ~ 카 안쪽 벽. 스케치 29 cm + 패널 두께, 벽 맞춤 측정값
     door_open_time_s: [6.0, 10.0]
 
 floors:

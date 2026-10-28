@@ -42,6 +42,7 @@ class ElevatorSpec:
     door_offset_from_left_m: float
     threshold_depth_m: float
     door_open_time_s: Tuple[float, float]
+    hall_recess_m: float = 0.  # hall wall face -> door_center plane (the door recess)
 
 
 @dataclass(frozen=True)
@@ -99,14 +100,17 @@ class SimSettings:
 class ElevatorGeometry:
     """Elevator shapes on one floor's map frame, derived from the config.
 
-    ``hall_door`` is the hall wall plane the robot crosses when boarding.
-    ``car_door`` is the car's inner front wall.  ``car_polygon`` is the car
-    interior, counter-clockwise.  ``car_pose`` is the car centre facing out.
+    ``hall_door`` is the hall door plane (``door_center``, the wall on the map)
+    the robot crosses when boarding.  ``car_door`` is the car's inner front wall.
+    ``car_polygon`` is the car interior, counter-clockwise.  ``car_pose`` is the
+    car centre facing out.  ``hall_entry`` is the hall wall face, ``hall_recess_m``
+    before ``hall_door``: the door tunnel with its side walls starts there.
     """
     hall_door: Tuple[Point, Point]
     car_door: Tuple[Point, Point]
     car_polygon: Tuple[Point, Point, Point, Point]
     car_pose: Pose
+    hall_entry: Optional[Tuple[Point, Point]] = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,7 @@ def elevator_geometry(spec: ElevatorSpec, stop: FloorElevator) -> ElevatorGeomet
         car_door=(at(near, half_door), at(near, -half_door)),
         car_polygon=(at(near, right), at(far, right), at(far, left), at(near, left)),
         car_pose=(centre[0], centre[1], outward),
+        hall_entry=(at(-spec.hall_recess_m, half_door), at(-spec.hall_recess_m, -half_door)),
     )
 
 
@@ -268,6 +273,7 @@ def _elevator_spec(name, data) -> ElevatorSpec:
     door = _positive(data.get('door_width_m'), f'elevator {name}.door_width_m')
     offset = _number(data.get('door_offset_from_left_m'), f'elevator {name}.door_offset_from_left_m')
     threshold = _number(data.get('threshold_depth_m'), f'elevator {name}.threshold_depth_m')
+    recess = _number(data.get('hall_recess_m', 0.), f'elevator {name}.hall_recess_m')
     open_min, open_max = _numbers(data.get('door_open_time_s'), 2, f'elevator {name}.door_open_time_s')
     if width <= 0 or depth <= 0:
         raise FloorConfigError(f'elevator {name}: car dimensions must be positive')
@@ -275,9 +281,11 @@ def _elevator_spec(name, data) -> ElevatorSpec:
         raise FloorConfigError(f'elevator {name}: door does not fit the car width')
     if threshold < 0:
         raise FloorConfigError(f'elevator {name}: threshold_depth_m must not be negative')
+    if recess < 0:
+        raise FloorConfigError(f'elevator {name}: hall_recess_m must not be negative')
     if not 0 < open_min <= open_max:
         raise FloorConfigError(f'elevator {name}: door_open_time_s must be 0 < min <= max')
-    return ElevatorSpec(name, width, depth, door, offset, threshold, (open_min, open_max))
+    return ElevatorSpec(name, width, depth, door, offset, threshold, (open_min, open_max), recess)
 
 
 def _level_and_code(label, data):

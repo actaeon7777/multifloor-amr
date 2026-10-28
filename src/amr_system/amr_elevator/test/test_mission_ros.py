@@ -818,10 +818,13 @@ def test_door_closing_during_retreat_stops_and_bounds_or_aligns(ros, front_in_ca
     geometry = node.geometry('4F')
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert node.back_out('test retreat')
-    # Use the hall door plane or car door plane to straddle the corresponding edge.
+    # Straddle the car door plane, or the hall door plane with the front bumper
+    # still short of the car's inner wall (threshold 0.32 m = HALF_LENGTH: back off 0.1 m).
+    yaw = node.stop_geometry('4F').car_inward_yaw
     door = geometry.car_door if front_in_car else geometry.hall_door
-    node.pose = (sum(p[0] for p in door)/2, sum(p[1] for p in door)/2,
-                 node.stop_geometry('4F').car_inward_yaw)
+    setback = 0. if front_in_car else .1
+    node.pose = (sum(p[0] for p in door)/2 - setback * math.cos(yaw),
+                 sum(p[1] for p in door)/2 - setback * math.sin(yaw), yaw)
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.CLOSING))
     twists = []
     monkeypatch.setattr(node, 'publish_twist', lambda linear=0., angular=0.: twists.append((linear, angular)))

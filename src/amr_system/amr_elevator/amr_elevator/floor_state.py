@@ -6,7 +6,8 @@ car (pose from the last verified localization carried by odometry, plus LiDAR
 enclosure).  Rules (docs/ELEVATOR.md 4.2):
 
 * A floor changes only through the car: depart (door closed with an acknowledged
-  target) -> arrive (door open + a strong hall beacon).  Outside the car a
+  target) -> arrive (door open + a strong hall beacon, or a weak one from the
+  target floor after at least min_travel_closed_s of closed-door travel).  Outside the car a
   different floor's beacon is RF leakage: flagged, never applied.
 * Beacons are filtered per device for staleness, duplicates and old sequence
   numbers.  Floor beacons heard while the car travels are ignored.
@@ -142,7 +143,10 @@ class FloorStateMachine:
         if heard is None:
             return self._unmapped_beacon(floor_code, rssi, now)
         if rssi != 0 and rssi < self.presence_min_rssi:
-            return 'weak'
+            if not self._weak_target_arrival(heard.name):
+                return 'weak'
+            self._arrive(heard.name, 'BEACON', now, 'weak hall beacon at the target floor after travel')
+            return 'ok'
         s = self.state
         if s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT':
             if self.t.arrival_wait_since is None:
@@ -163,6 +167,16 @@ class FloorStateMachine:
             self.state = replace(self.state, floor_conflict=True)
             self.t.conflict_seen = now
         return 'conflict'
+
+    def _weak_target_arrival(self, floor):
+        """A weak beacon confirms only the target floor, after real travel, with the door open."""
+        s, t = self.state, self.t
+        if (s.zone != ZONE_IN_ELEVATOR or floor != self.car_target or t.door_state not in (OPEN, OPENING)
+                or t.closed_during_transit < self.min_travel_closed_s):
+            return False
+        if s.confidence == 'TRANSIT':
+            return t.arrival_wait_since is not None
+        return s.confidence == 'ASSUMED'
 
     def _unmapped_beacon(self, floor_code, rssi, now):
         passing = self.building.pass_floor_by_beacon_code(floor_code)

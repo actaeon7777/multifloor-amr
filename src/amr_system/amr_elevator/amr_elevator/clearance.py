@@ -134,6 +134,21 @@ class SpaceRegion:
         return corridor & allowed
 
 
+def door_tunnel(geometry):
+    """(hall end, car-door centre, half-width) of the door passage with side walls.
+
+    The hall end is the hall wall face (``hall_entry``) when the door sits in a
+    recess; otherwise the hall door plane. Without it the recess side walls, 0.55 m
+    off the axis, enter a slanted approach corridor and block boarding for good.
+    """
+    hall_entry = getattr(geometry, 'hall_entry', None)
+    hall = np.mean(geometry.hall_door if hall_entry is None else hall_entry, axis=0)
+    car = np.mean(geometry.car_door, axis=0)
+    half_door = min(np.linalg.norm(np.subtract(*geometry.hall_door)),
+                    np.linalg.norm(np.subtract(*geometry.car_door))) / 2
+    return hall, car, half_door
+
+
 def boarding_region(geometry, margin, wall_margin=.12, approach_from=None):
     """Corridor to the car centre plus turning disc.
 
@@ -148,11 +163,8 @@ def boarding_region(geometry, margin, wall_margin=.12, approach_from=None):
                            geometry.car_polygon, .307 + margin, wall_margin, turn)
     x, y, yaw = approach_from
     bumper = (x + .348 * math.cos(yaw), y + .348 * math.sin(yaw))
-    hall, car = np.mean(geometry.hall_door, axis=0), np.mean(geometry.car_door, axis=0)
-    half_door = min(np.linalg.norm(np.subtract(*geometry.hall_door)),
-                    np.linalg.norm(np.subtract(*geometry.car_door))) / 2
     return SpaceRegion(bumper, geometry.car_pose[:2], geometry.car_polygon, .307 + margin,
-                       wall_margin, turn, include_hall=True, tunnel=(hall, car, half_door))
+                       wall_margin, turn, include_hall=True, tunnel=door_tunnel(geometry))
 
 
 def exit_region(geometry, hall_exit_pose, margin, wall_margin=.12):
@@ -161,8 +173,5 @@ def exit_region(geometry, hall_exit_pose, margin, wall_margin=.12):
     Tunnel jamb inset is at least wall_margin and 0.15 m (pose-error allowance).
     The same tunnel clip applies to the boarding region's hall approach.
     """
-    hall, car = np.mean(geometry.hall_door, axis=0), np.mean(geometry.car_door, axis=0)
-    half_door = min(np.linalg.norm(np.subtract(*geometry.hall_door)),
-                    np.linalg.norm(np.subtract(*geometry.car_door))) / 2
     return SpaceRegion(geometry.car_pose[:2], hall_exit_pose[:2], geometry.car_polygon,
-                       .307 + margin, wall_margin, include_hall=True, tunnel=(hall, car, half_door))
+                       .307 + margin, wall_margin, include_hall=True, tunnel=door_tunnel(geometry))

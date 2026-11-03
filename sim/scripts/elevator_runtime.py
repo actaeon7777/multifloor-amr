@@ -1,13 +1,8 @@
-"""Isaac side of the simulated elevator: moves the car and doors with physics.
+"""Isaac car/door dynamics using JSON requests from elevator_sim_relay.
 
-Runs inside the Isaac process (bundled rclpy, std_msgs only).  The ROS-typed
-/elevator/command and /elevator/beacon are translated by the system-Python
-``elevator_sim_relay`` node over JSON topics:
-  /sim/elevator/command_raw  (in)   {"command", "floor_code", "direction", "sequence", "repeat"}
-  /sim/elevator/beacon_raw   (out)  [{"event", "location", "floor_code", "sequence", ...}]
-  /sim/elevator/command_status_raw (out) [{"cmd_seq", "status", "device_result", "target", ...}]
-  /sim/elevator/status       (out)  ground truth for evaluation (latched)
-  /sim/elevator/inject       (in)   {"faults": {...}} | {"obstruct": bool}
+/sim/elevator/request_raw carries kind, start_floor, target_floor, direction, sequence.
+/sim/elevator/status publishes ground truth; /sim/elevator/inject accepts faults.
+Arrival confirmation is provided by the relay's sim auto-confirm.
 """
 
 import json
@@ -16,7 +11,7 @@ import sys
 
 
 class ElevatorRuntime:
-    def __init__(self, stage, node, root, seed=0):
+    def __init__(self, stage, node, root, seed=0, press_delay_s=1.0):
         from pxr import Gf
         from rclpy.qos import DurabilityPolicy, QoSProfile
         from std_msgs.msg import String
@@ -32,15 +27,16 @@ class ElevatorRuntime:
         self.elevator_id = building_prim.GetAttribute('elevator:id').Get()
         self.building = building = load_floor_config(root / 'src/amr_system/amr_stack/config/floors.yaml')
         self.floors = sorted(building.floors.values(), key=lambda f: f.level)
-        self.names = [f.name for f in self.floors]
+        self.names = [f.name for f in sorted([*building.floors.values(), *building.pass_floors.values()],
+                                            key=lambda f: f.level)]
         reference = building.floor(building_prim.GetAttribute('referenceFloor').Get())
         self.reference_index = self.names.index(reference.name)
         self.height = building.sim.floor_height_m
         spec = building.elevators[self.elevator_id]
-        self.model = ElevatorSim([(f.name, f.beacon_floor_code) for f in self.floors],
+        self.model = ElevatorSim(self.names,
                                  floor_height_m=self.height, speed_m_s=building.sim.car_speed_m_s,
                                  accel_m_s2=building.sim.car_accel_m_s2, open_time_s=spec.door_open_time_s,
-                                 seed=seed, start_floor=reference.name)
+                                 seed=seed, start_floor=reference.name, press_delay_s=press_delay_s)
         self.geometry = building.elevator_geometry(reference.name, self.elevator_id)
         self.stop = reference.elevators[self.elevator_id]
         self.near = spec.threshold_depth_m
@@ -60,10 +56,8 @@ class ElevatorRuntime:
         self.obstructed = False
         self.next_status = 0.
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.beacon_pub = node.create_publisher(String, '/sim/elevator/beacon_raw', 50)
-        self.command_status_pub = node.create_publisher(String, '/sim/elevator/command_status_raw', 20)
         self.status_pub = node.create_publisher(String, '/sim/elevator/status', latched)
-        node.create_subscription(String, '/sim/elevator/command_raw', self.on_command, 20)
+        node.create_subscription(String, '/sim/elevator/request_raw', self.on_request, latched)
         node.create_subscription(String, '/sim/elevator/inject', self.on_inject, 10)
         self.robot = (0., 0., 0.)
         self.apply(force=True)
@@ -76,11 +70,11 @@ class ElevatorRuntime:
     def floor_z(self, index):
         return (index - self.reference_index) * self.height
 
-    def on_command(self, message):
+    def on_request(self, message):
         try:
             c = json.loads(message.data)
-            self.model.command(self.now, int(c['command']), int(c['floor_code']), int(c.get('direction', 0)),
-                               int(c['sequence']), int(c.get('repeat', 0)))
+            self.model.request(self.now, int(c['kind']), c['start_floor'], c['target_floor'],
+                               int(c['direction']))
         except (ValueError, KeyError, TypeError):
             pass
 
@@ -111,12 +105,7 @@ class ElevatorRuntime:
         self.obstructed = (-.4 < depth < self.near + .4 and abs(lateral) < self.door_half + .3
                            and abs(z - car_z) < .5)
         self.model.obstruct(self.obstructed)
-        frames = self.model.step(elapsed)
-        if frames:
-            self.beacon_pub.publish(self.String(data=json.dumps([frame.__dict__ for frame in frames])))
-        statuses = self.model.take_statuses()
-        if statuses:
-            self.command_status_pub.publish(self.String(data=json.dumps([s.__dict__ for s in statuses])))
+        self.model.step(elapsed)
         self.apply()
         if elapsed >= self.next_status:
             self.publish_status()
@@ -133,7 +122,7 @@ class ElevatorRuntime:
         at = None if self.model.motion else round(self.model.position)
         for index, name in enumerate(self.names):
             hall = ratio if index == at else 0.
-            for attribute, closed, opened in self.hall_doors[name]:
+            for attribute, closed, opened in self.hall_doors.get(name, []):
                 self._set(attribute, Gf.Vec3d(*(c + (o - c) * hall for c, o in zip(closed, opened))), force)
 
     def _set(self, attribute, value, force):

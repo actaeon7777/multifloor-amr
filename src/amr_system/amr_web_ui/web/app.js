@@ -15,8 +15,7 @@
   function requestDraw() {
     if (drawFrame === null && !document.hidden) drawFrame = requestAnimationFrame(draw);
   }
-  const rfCommandLabels = {RF_TIMEOUT:'버튼 무선 전달 지연 · 재시도', NO_RESULT:'버튼 응답 없음 · 재시도',
-    DEVICE_REJECTED:'비콘이 버튼 명령을 거절', NO_ROUTE:'대상 비콘 없음', BAD_FRAME:'버튼 명령 형식 오류'};
+
   // Multi-floor: floorsInfo from /api/floors; viewFloor is the floor whose map is shown.
   let floorsInfo = null, viewFloor = null, shownCurrentFloor = null, floorPolls = 0;
   const floorImages = {}, floorLoading = {};
@@ -256,11 +255,9 @@
     line.hidden = $('floor-mission-link').hidden = !visible;
     if (visible) {
       const route = mission.start_floor && mission.goal_floor ? `${mission.start_floor} → ${mission.goal_floor}${mission.goal_room ? ' ' + roomLabel(mission.goal_room) : ''} · ` : '';
-      const press = state.elevator?.last_command;
-      const pressNote = press && press.age < 10 && rfCommandLabels[press.status] &&
-        !['SUCCEEDED', 'FAILED_SAFE', 'CANCELED'].includes(mission.phase) ? ` · ${rfCommandLabels[press.status]}` : '';
+
       line.textContent = `층간 이동: ${route}${missionLabels[mission.phase] || mission.phase}` +
-        (state.floor?.zone === 2 ? ' · 엘리베이터 안' : '') + pressNote +
+        (state.floor?.zone === 2 ? ' · 엘리베이터 안' : '') +
         (mission.detail && mission.phase === 'FAILED_SAFE' ? ` (${mission.detail})` : '');
     }
   }

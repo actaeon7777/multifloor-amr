@@ -44,11 +44,11 @@ try:  # Multi-floor support is optional: the web UI still runs without the eleva
     from amr_elevator_interfaces.action import NavigateToFloorPose
     from amr_elevator_interfaces.srv import SetCurrentFloor
     from amr_elevator_interfaces.msg import (
-        ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorEvent, FloorState)
+        ElevatorRequest, FloorArrivalConfirm, ElevatorDoorState, FloorEvent, FloorState)
     from amr_stack.floor_config import load_floor_config
 except ImportError:  # pragma: no cover - depends on the installed workspace
-    NavigateToFloorPose = ElevatorCommandStatus = FloorState = load_floor_config = None
-    ElevatorBeacon = ElevatorCommand = ElevatorDoorState = FloorEvent = None
+    NavigateToFloorPose = FloorState = load_floor_config = None
+    ElevatorRequest = FloorArrivalConfirm = ElevatorDoorState = FloorEvent = None
     SetCurrentFloor = None
 
 from .geometry import Grid, transform_xy, yaw
@@ -84,6 +84,8 @@ class WebBridge(Node):
         # exposes floor/set_current in the same root namespace.
         self.set_floor_client = (self.create_client(SetCurrentFloor, '/floor/set_current')
                                  if SetCurrentFloor is not None else None)
+        self.arrival_pub = (self.create_publisher(FloorArrivalConfirm, '/floor/arrival_confirm', 10)
+                            if FloorArrivalConfirm is not None else None)
         self.waiting_set_floor = None
         self.pending_set_floor = None
         self.initialpose = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 5)
@@ -140,17 +142,9 @@ class WebBridge(Node):
                 String, '/floor_mission/status', lambda m: self.shared.update_floor_mission(m.data),
                 QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)))
             self.subscriptions_list.append(self.create_subscription(
-                String, '/elevator/rf_status', lambda m: self.shared.update_elevator_rf(m.data), latched))
-            self.subscriptions_list.append(self.create_subscription(
-                ElevatorCommandStatus, '/elevator/command_status', lambda m: self.shared.update_elevator_command(
-                    m.cmd_seq, m.status, m.device_result, m.target, m.attempts, m.source), 10))
-            # Floor transit view. Callbacks only store; the snapshot does the work (Jetson CPU).
-            self.subscriptions_list.append(self.create_subscription(
-                ElevatorCommand, '/elevator/command', lambda m: self.shared.update_sent_command(
-                    m.command, m.floor_code, m.direction, m.sequence, m.repeat), 10))
-            self.subscriptions_list.append(self.create_subscription(
-                ElevatorBeacon, '/elevator/beacon', lambda m: self.shared.update_beacon(
-                    m.event, m.location, m.floor_code, m.ack_sequence, m.rssi_dbm), 50))
+                ElevatorRequest, '/elevator/request', lambda m: self.shared.update_elevator_request(
+                    m.kind, m.start_floor, m.target_floor, m.direction, m.sequence),
+                QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)))
             self.subscriptions_list.append(self.create_subscription(
                 ElevatorDoorState, '/elevator/door', lambda m: self.shared.update_door(
                     m.state, m.open_ratio, m.valid_beams), 1))
@@ -233,10 +227,8 @@ class WebBridge(Node):
     def on_floor_state(self, msg):
         self.set_state(floor=dict(zone=msg.zone, floor=msg.floor, confidence=msg.confidence,
                                   transit_from=msg.transit_from, transit_to=msg.transit_to,
-                                  floor_conflict=msg.floor_conflict, last_event=msg.last_event,
-                                  duplicate_count=msg.duplicate_count,
-                                  out_of_order_count=msg.out_of_order_count,
-                                  stale_count=msg.stale_count))
+                                  last_event=msg.last_event, awaiting_confirm=msg.awaiting_confirm,
+                                  candidate_id=msg.candidate_id, candidate_source=msg.candidate_source))
 
     def on_scan(self, msg):
         self.pending_scan = (msg, time.monotonic())
@@ -404,6 +396,18 @@ class WebBridge(Node):
 
     def process_command(self, command):
         kind, request_id, pose = command['kind'], command['request_id'], command['pose']
+        if kind == 'arrival_confirm':
+            with self.shared.lock:
+                error = self.shared.arrival_error(command['floor'], command['candidate_id'])
+                if error or self.arrival_pub is None:
+                    self.shared.complete(request_id, 'FAILED', error or '층 확인에 연결되지 않았습니다.')
+                    return
+                message = FloorArrivalConfirm(source=FloorArrivalConfirm.SOURCE_OPERATOR,
+                                              floor=command['floor'], candidate_id=command['candidate_id'],
+                                              accepted=command['accepted'], actual_floor=command.get('actual_floor', ''), score=1.0)
+                message.header.stamp = self.get_clock().now().to_msg()
+                self.arrival_pub.publish(message)
+            return
         error = self.shared.readiness_error(kind, request_id)
         if error:
             self.shared.complete(request_id, 'FAILED', error)

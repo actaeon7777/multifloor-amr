@@ -33,8 +33,15 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     const {number, suffix} = splitRoomId(id);
     return number ? `${number}호${suffix ? ' '+suffix : ''}` : '';
   };
-  // Same-floor goals only need the loaded map; a startup floor stays ASSUMED until the hall beacon is heard.
-  const floorConfirmed = s => ['BEACON','CONFIRMED'].includes(s?.floor?.confidence);
+  // Same-floor goals need the loaded map; cross-floor goals require a confirmed floor.
+  const floorConfirmed = s => ['CONFIRMED','VERIFIED'].includes(s?.floor?.confidence);
+  function elevatorHint(s) {
+    if (!MISSION_ACTIVE.has(s?.floor_mission?.phase)) return '';
+    const r = s?.elevator_request;
+    if (r?.kind === 'CALL') return `엘리베이터 ${r.direction === 1 ? '▲ 위로' : '▼ 아래로'} 버튼을 눌러 주세요`;
+    if (r?.kind === 'CAR_FLOOR') return `엘리베이터 안에서 ${r.target_floor} 버튼을 눌러 주세요`;
+    return '';
+  }
   const patrolActive = s => s?.patrol?.active === true && Number.isFinite(s.patrol.age) && s.patrol.age >= 0 && s.patrol.age < 3;
   const patrolPhaseLabel = phase => ({NAV:'이동', DWELL:'관측', RETURN:'복귀'}[phase] || phase || '대기');
   const patrolRoutes = s => Array.isArray(s?.patrol?.routes) ? s.patrol.routes.filter(r => typeof r === 'string') : [];
@@ -176,7 +183,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       cancelDelay(notify=false) { if (pending?.phase === 'delay') { if (notify) rejectStart(); else drop(); } },
     };
   }
-  window.AMRKiosk = {patrolAdminControls, patrolAdminStatus, patrolActive, patrolPhaseLabel, selectScreen, phaseToStep, PHASE_STEPS, readyForGoal, floorConfirmed, splitRoomId,
+  window.AMRKiosk = {elevatorHint,patrolAdminControls, patrolAdminStatus, patrolActive, patrolPhaseLabel, selectScreen, phaseToStep, PHASE_STEPS, readyForGoal, floorConfirmed, splitRoomId,
     roomLabel, updateProgress, formatETA, createDeliveryFlow, estopDeliveryRoom};
   if (typeof document === 'undefined') return;
 
@@ -197,6 +204,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   let patrolRoute = '';
   let pollTimer = null, polling = false, pollAbort = null, floorLoading = false, progress = null;
   let estopStartRoom = '';
+  let arrivalBusy = false, arrivalCandidate = null, arrivalError = '', arrivalPicking = false, arrivalFloors = [];
   let toastUntil = 0, drawFrame = null, mapSignature = '', mapCamera = null, lastNotice = '';
   const maps = new Map(), mapLoading = new Set(), started = new Map();
   const STORAGE = 'amr-kiosk-goals-v1';
@@ -254,6 +262,11 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <span id="clock" class="clock"></span><span class="rid">AMR-01</span>
       <button id="admin-button" class="gear" data-action="admin" aria-label="관리 모드">${icon('gear')}</button></div></header>
     <main class="body"><div id="screen"></div><div id="sheet" class="scrim" hidden></div>
+      <div id="elevator-request-hint" class="elevator-request-hint" role="status" hidden></div>
+      <div id="arrival-confirm" class="scrim arrival-overlay" role="dialog" aria-modal="true" aria-labelledby="arrival-title" hidden><section class="arrival-card">
+        <h2 id="arrival-title"></h2><p id="arrival-source" class="arrival-source"></p><p>목적층으로 확인되면 로봇이 내립니다.</p>
+        <div id="arrival-actions" class="arrival-actions"><button id="arrival-yes" data-action="arrival-yes" class="btn primary"></button><button id="arrival-no" data-action="arrival-no" class="btn ghost">아니요</button></div>
+        <div id="arrival-picker" class="arrival-picker" hidden></div><p id="arrival-error" role="alert"></p></section></div>
       <div id="connection" class="scrim connection-overlay" role="status" hidden><div class="sheet"><h2>연결 대기</h2></div></div>
       <div id="toast" role="status" hidden></div></main>`;
   const stopButton = () => `<div id="stop-wrap" class="stopwrap"><button id="stop" data-action="stop" class="btn stop">${icon('stop')}정지</button><p>정지하면 배송이 취소됩니다</p></div>`;
@@ -280,7 +293,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <div class="notice">${icon('alert')}통로를 비워 주세요</div>${stopButton()}</aside></div>`,
     transit:() => `<div class="transit"><section id="steps" class="card steps"></section><div class="transit-main">
       <section class="card now-card"><div class="lift"><div id="lift-floor" class="disp"></div><div class="doors"><span></span><span></span></div><div class="bot"></div></div>
-      <div><div id="step-number" class="label"></div><h2 id="phase-title"></h2><p id="phase-detail"></p><div class="notice">${icon('lift')}호출 버튼은 로봇이 자동으로 누릅니다</div></div></section>
+      <div><div id="step-number" class="label"></div><h2 id="phase-title"></h2><p id="phase-detail"></p></div></section>
       <aside class="card side"><div><div id="transit-label" class="label accent">배송지</div><h1 id="transit-destination"></h1></div><div class="kv"><div><span>경과</span><b id="elapsed"></b></div></div>${stopButton()}</aside></div></div>`,
     arrived:() => `<div id="result" class="full ok"><div class="inner"><span id="result-icon" class="big"></span><div><div id="result-label" class="label"></div><h1 id="result-title"></h1>
       <p id="result-detail" class="one-line"></p><button id="ack" data-action="ack" class="btn ok"></button><div id="result-foot" class="foot"></div></div></div>`,
@@ -331,8 +344,33 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     if (percent !== null) { setText('battery-percent', `${percent}%`); setWidth('battery-fill', `${percent}%`); }
     setHidden('admin-tag', !admin); setClass('app', `app${admin ? ' admin' : ''}`);
   }
+  function renderArrival() {
+    const floor = online() && state?.floor?.awaiting_confirm ? state.floor.floor : null;
+    const candidateId = floor ? state.floor.candidate_id : null;
+    if (floor !== (arrivalCandidate?.floor ?? null) || candidateId !== (arrivalCandidate?.candidate_id ?? null)) {
+      arrivalCandidate = floor ? {floor, candidate_id:candidateId} : null;
+      arrivalBusy = false; arrivalError = ''; arrivalPicking = false;
+    }
+    setHidden('arrival-confirm', !floor);
+    setText('arrival-title', `엘리베이터가 ${floor}에 도착했나요?`);
+    setText('arrival-yes', `네, ${floor}입니다`);
+    setText('arrival-source', {VISION:'카메라 판단', TARGET:'목적층'}[state?.floor?.candidate_source] || '');
+    setHidden('arrival-actions', arrivalPicking);
+    setHidden('arrival-picker', !arrivalPicking);
+    if (arrivalPicking) setHTML('arrival-picker',
+      arrivalFloors.filter(f => f.name !== floor).map(f => `<button class="btn ghost" data-action="arrival-pick" data-actual-floor="${esc(f.name)}" ${arrivalBusy ? 'disabled' : ''}>${esc(f.name)}</button>`).join('') +
+      `<button class="btn ghost" data-action="arrival-pick" data-actual-floor="" ${arrivalBusy ? 'disabled' : ''}>모르겠음</button><button class="btn ghost" data-action="arrival-back" ${arrivalBusy ? 'disabled' : ''}>뒤로</button>`);
+    setText('arrival-error', arrivalError);
+    setDisabled('arrival-yes', arrivalBusy || !floor);
+    setDisabled('arrival-no', arrivalBusy || !floor);
+    const hint = online() ? elevatorHint(state) : '';
+    setHidden('elevator-request-hint', !hint);
+    setText('elevator-request-hint', hint);
+    setClass('screen', hint ? 'with-elevator-hint' : '');
+  }
   function render() {
     if (document.hidden) return;
+    renderArrival();
     if (!state?.hold?.held && !patrolActive(state) && ACTIVE.has(state?.goal?.status) && (admin || pin !== null)) {
       admin = false; token = null; tokenUntil = 0; pin = null; adminPose = null; gesture = null;
     }
@@ -507,6 +545,24 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       renderSheet(); return;
     }
     switch (button.dataset.action) {
+      case 'arrival-no':
+        if (online() && !arrivalBusy && arrivalCandidate) { arrivalPicking = true; renderArrival(); }
+        break;
+      case 'arrival-back':
+        if (!arrivalBusy) { arrivalPicking = false; renderArrival(); }
+        break;
+      case 'arrival-yes':
+      case 'arrival-pick': {
+        if (!online() || arrivalBusy || !arrivalCandidate) break;
+        const candidate = arrivalCandidate;
+        arrivalBusy = true; arrivalError = ''; renderArrival();
+        const accepted = button.dataset.action === 'arrival-yes';
+        try { await post('floor/arrival_confirm', {...candidate, accepted,
+          ...(accepted ? {} : {actual_floor:button.dataset.actualFloor || ''})}); }
+        catch (error) { if (candidate === arrivalCandidate) arrivalError = error.message; }
+        finally { if (candidate === arrivalCandidate) { arrivalBusy = false; renderArrival(); } }
+        break;
+      }
       case 'dismiss': selection = null; render(); break;
       case 'depart': {
         if (!selection || !canStart()) break;
@@ -582,6 +638,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       const response = await fetch('/api/floors', {signal:AbortSignal.timeout(2500)});
       if (!response.ok) throw new Error('층 정보 조회 실패');
       const value = await response.json(); floors = value.floors || []; floorsAt = now();
+      arrivalFloors = [...floors, ...(value.pass_floors || [])].sort((a,b) => a.level-b.level);
       if (!floorInfo(viewFloor)) viewFloor = currentFloor() || value.current_floor || floors[0]?.name;
       if (selection) {
         const f = floorInfo(selection.floor), r = f?.rooms.find(x => x.id === selection.room);

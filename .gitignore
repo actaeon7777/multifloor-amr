@@ -5,6 +5,7 @@ log/
 logs/
 bags/
 diagnostics/
+datasets/
 backups/
 releases/
 sim/assets/

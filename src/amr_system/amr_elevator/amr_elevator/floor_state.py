@@ -1,32 +1,28 @@
 """Current floor and inside/outside-the-car estimation (no ROS).
 
-Evidence: hall beacons (RF, 1 Hz, "I am the N-floor beacon"), the acknowledged
-car-floor command, the LiDAR door state, and the robot position relative to the
-car (pose from the last verified localization carried by odometry, plus LiDAR
-enclosure).  Rules (docs/ELEVATOR.md 4.2):
-
-* A floor changes only through the car: depart (door closed with an acknowledged
-  target) -> arrive (door open + a strong hall beacon, or a weak one from the
-  target floor after at least min_travel_closed_s of closed-door travel).  Outside the car a
-  different floor's beacon is RF leakage: flagged, never applied.
-* Beacons are filtered per device for staleness, duplicates and old sequence
-  numbers.  Floor beacons heard while the car travels are ignored.
-* A stop at a pass floor (beacon installed, no map) is another passenger's stop:
-  the ride continues and the floor stays in transit.  Car beacon PRESENCE is only
-  device liveness and never moves the floor.
-* Crossing the door line needs the door to have been seen open; otherwise the
-  zone becomes UNKNOWN (stop) until the operator sets the floor.
-* Leaving the car before the floor is confirmed by a beacon is a violation.
+The operator sets the start floor. A requested car target plus closed doors
+starts transit; a settled open door proposes an ASSUMED arrival candidate.
+With the camera enabled, its guess selects the asked floor; unknown or missing
+evidence falls back to the ride target. A negative answer may name the real floor.
+Only an explicit operator, vision or simulator confirmation for the current
+candidate ID, while the door is open or opening, verifies arrival. Closure
+while the whole body is inside the car, or position reports have gone stale,
+invalidates that verification and requires a new candidate and confirmation,
+even if the door simply reopens. A fresh position straddling the doorway keeps
+the verified floor while the robot exits.
+Rejected stops require another closed-door journey before proposing again.
+Door and position evidence guard crossings; leaving an unconfirmed floor is a
+rule violation. Localization READY after a verified exit confirms the floor.
 """
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 from amr_elevator.door_detector import CLOSED, OPEN, OPENING
 
 ZONE_UNKNOWN, ZONE_OUTSIDE, ZONE_IN_ELEVATOR = 0, 1, 2
 ZONE_NAMES = {ZONE_UNKNOWN: 'UNKNOWN', ZONE_OUTSIDE: 'OUTSIDE', ZONE_IN_ELEVATOR: 'IN_ELEVATOR'}
-EVENT_PRESENCE = 1
-LOCATION_HALL = 0
+SOURCE_OPERATOR, SOURCE_VISION, SOURCE_SIM = 1, 2, 3
+SOURCE_NAMES = {SOURCE_OPERATOR: 'OPERATOR', SOURCE_VISION: 'VISION', SOURCE_SIM: 'SIM'}
 
 
 @dataclass(frozen=True)
@@ -37,10 +33,9 @@ class FloorSnapshot:
     transit_to: str = ''
     confidence: str = 'ASSUMED'
     last_event: str = ''
-    floor_conflict: bool = False
-    duplicate_count: int = 0
-    out_of_order_count: int = 0
-    stale_count: int = 0
+    awaiting_confirm: bool = False
+    candidate_id: int = 0
+    candidate_source: str = ''
 
 
 @dataclass(frozen=True)
@@ -51,27 +46,6 @@ class FloorEventRecord:
     detail: str
 
 
-class BeaconFilter:
-    """Per-device staleness, duplicate and sequence-order checks."""
-
-    def __init__(self, max_age=2., duplicate_window=5., future_tolerance=.5):
-        self.max_age, self.window, self.future = max_age, duplicate_window, future_tolerance
-        self.last = {}
-
-    def accept(self, device, sequence, stamp, now):
-        if now - stamp > self.max_age or stamp - now > self.future:
-            return 'stale'
-        previous = self.last.get(device)
-        if previous is not None and now - previous[1] < self.window:
-            delta = (sequence - previous[0]) % 256
-            if delta == 0:
-                return 'duplicate'
-            if delta >= 128:
-                return 'out_of_order'
-        self.last[device] = (sequence, now)
-        return 'ok'
-
-
 @dataclass
 class _Timers:
     door_state: int = 0
@@ -79,30 +53,40 @@ class _Timers:
     door_closed_since: float = None
     arrival_wait_since: float = None
     closed_during_transit: float = 0.
-    conflict_seen: float = None
     exit_time: float = None
     ready: bool = False
-    pass_stop: str = ''
-    unknown_codes: set = field(default_factory=set)
+    confirmation_rejected: bool = False
+    vision_guess: str = None  # None: no report; '': reported unknown
+    vision_confident: bool = False  # score and margin clear the automatic-decision bar
+    vision_references: frozenset = frozenset()  # floors with reference images at guess time
+    origin_verified: bool = False  # transit_from was a verified/confirmed floor at departure
 
 
 class FloorStateMachine:
-    def __init__(self, building, initial_floor=None, presence_min_rssi=-70, depart_closed_s=1.,
-                 min_travel_closed_s=3., arrival_beacon_timeout_s=3., door_recent_s=5.,
-                 conflict_hold_s=5., beacon_filter=None):
+    def __init__(self, building, initial_floor=None, depart_closed_s=1.,
+                 min_travel_closed_s=3., arrival_settle_s=1., door_recent_s=5., position_stale_s=1.,
+                 vision_wait_s=0., vision_auto=False, vision_auto_min_score=.93,
+                 vision_auto_min_margin=.03):
         self.building = building
-        self.presence_min_rssi = presence_min_rssi
         self.depart_closed_s = depart_closed_s
         self.min_travel_closed_s = min_travel_closed_s
-        self.arrival_timeout = arrival_beacon_timeout_s
+        self.arrival_settle_s = arrival_settle_s
         self.door_recent_s = door_recent_s
-        self.conflict_hold_s = conflict_hold_s
-        self.filter = beacon_filter or BeaconFilter()
+        self.position_stale_s = position_stale_s
+        self.vision_wait_s = vision_wait_s
+        # Automatic arrival (2026-11-02): a confident camera guess verifies the stop without a
+        # person; below the bar the kiosk question remains the fallback.
+        self.vision_auto = vision_auto
+        self.vision_auto_min_score = vision_auto_min_score
+        self.vision_auto_min_margin = vision_auto_min_margin
         floor = initial_floor or building.default_floor
         building.floor(floor)
         self.state = FloorSnapshot(floor=floor)
         self.car_target = ''
         self.t = _Timers()
+        self.in_car = self.past_hall_door = self.enclosed = False
+        self.fully_inside = False
+        self.position_time = None
         self.events = []
 
     # Helpers -----------------------------------------------------------------
@@ -120,91 +104,76 @@ class FloorStateMachine:
             self.t.door_open_seen is not None and now - self.t.door_open_seen <= self.door_recent_s)
 
     def _violation(self, now, detail):
-        self.state = replace(self.state, zone=ZONE_UNKNOWN, confidence='UNKNOWN')
+        self.state = replace(self.state, zone=ZONE_UNKNOWN, confidence='UNKNOWN',
+                             awaiting_confirm=False, candidate_source='')
+        self.car_target = ''
         self._emit('RULE_VIOLATION', self.state.floor, '', detail)
 
     # Inputs ------------------------------------------------------------------
 
     def on_car_target(self, floor):
-        """The car device acknowledged pressing ``floor``."""
+        """The mission requested ``floor`` from inside the car."""
         self.building.floor(floor)
         self.car_target = floor
 
-    def on_beacon(self, event, location, floor_code, sequence, stamp, rssi, now):
-        verdict = self.filter.accept((location, floor_code), sequence, stamp, now)
-        if verdict != 'ok':
-            key = {'stale': 'stale_count', 'duplicate': 'duplicate_count',
-                   'out_of_order': 'out_of_order_count'}[verdict]
-            self.state = replace(self.state, **{key: getattr(self.state, key) + 1})
-            return verdict
-        if event != EVENT_PRESENCE or location != LOCATION_HALL:
-            return 'ok'
-        heard = self.building.floor_by_beacon_code(floor_code)
-        if heard is None:
-            return self._unmapped_beacon(floor_code, rssi, now)
-        if rssi != 0 and rssi < self.presence_min_rssi:
-            if not self._weak_target_arrival(heard.name):
-                return 'weak'
-            self._arrive(heard.name, 'BEACON', now, 'weak hall beacon at the target floor after travel')
-            return 'ok'
-        s = self.state
-        if s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT':
-            if self.t.arrival_wait_since is None:
-                return 'ignored_in_transit'
-            self._arrive(heard.name, 'BEACON', now)
-            return 'ok'
-        if s.zone == ZONE_IN_ELEVATOR and s.confidence == 'ASSUMED' and self.t.door_state in (OPEN, OPENING):
-            self._arrive(heard.name, 'BEACON', now)  # late beacon upgrades an assumed arrival
-            return 'ok'
-        if heard.name == s.floor:
-            if s.confidence == 'ASSUMED' and s.zone == ZONE_OUTSIDE:
-                self.state = replace(s, confidence='BEACON')
-                self._emit('FLOOR_BEACON', s.floor, s.floor)
-            return 'ok'
-        if s.zone != ZONE_UNKNOWN:
-            if not s.floor_conflict:
-                self._emit('FLOOR_CONFLICT', s.floor, heard.name, 'other floor beacon heard; not applied')
-            self.state = replace(self.state, floor_conflict=True)
-            self.t.conflict_seen = now
-        return 'conflict'
+    def _known_floor(self, floor):
+        return floor in self.building.floors or floor in self.building.pass_floors
 
-    def _weak_target_arrival(self, floor):
-        """A weak beacon confirms only the target floor, after real travel, with the door open."""
+    def on_vision_guess(self, floor, now, score=0., margin=0., reference_floors=()):
+        """Accept evidence only for this travelled, open-door arrival window."""
         s, t = self.state, self.t
-        if (s.zone != ZONE_IN_ELEVATOR or floor != self.car_target or t.door_state not in (OPEN, OPENING)
+        if (self.vision_wait_s <= 0 or s.zone != ZONE_IN_ELEVATOR or s.confidence != 'TRANSIT'
+                or t.arrival_wait_since is None or not now >= t.arrival_wait_since
+                or now > t.arrival_wait_since + self.arrival_settle_s + self.vision_wait_s
                 or t.closed_during_transit < self.min_travel_closed_s):
-            return False
-        if s.confidence == 'TRANSIT':
-            return t.arrival_wait_since is not None
-        return s.confidence == 'ASSUMED'
+            return 'ignored'
+        t.vision_guess = floor if self._known_floor(floor) else ''
+        t.vision_confident = bool(t.vision_guess) and (
+            score >= self.vision_auto_min_score and margin >= self.vision_auto_min_margin)
+        t.vision_references = frozenset(reference_floors)
+        return 'stored' if t.vision_guess else 'unknown'
 
-    def _unmapped_beacon(self, floor_code, rssi, now):
-        passing = self.building.pass_floor_by_beacon_code(floor_code)
-        if passing is None:
-            if floor_code not in self.t.unknown_codes:  # Once per code, not every second.
-                self.t.unknown_codes.add(floor_code)
-                self._emit('UNKNOWN_BEACON', detail=f'floor code {floor_code}')
-            return 'unknown'
-        if rssi != 0 and rssi < self.presence_min_rssi:
-            return 'weak'
+    def _target_recognisable(self, origin, references):
+        """A camera "this is the target" is trusted only if every floor the car can stop at on
+        the way (strictly between origin and target) and the target itself have references:
+        an unreferenced floor that resembles the target would otherwise pass as the target.
+        Non-target decisions only keep the robot riding and need no such check."""
+        levels = {f.name: f.level for f in (*self.building.floors.values(), *self.building.pass_floors.values())}
+        if not self.t.origin_verified or origin not in levels or self.car_target not in levels:
+            return False  # unverified origin (e.g. after a rejected stop): no bound on the stops
+        low, high = sorted((levels[origin], levels[self.car_target]))
+        on_the_way = {name for name, level in levels.items() if low < level < high} | {self.car_target}
+        return on_the_way <= set(references)
+
+    def on_arrival_confirm(self, source, floor, candidate_id, accepted, now, actual_floor=''):
         s = self.state
-        if s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT':
-            if self.t.arrival_wait_since is None:
-                return 'ignored_in_transit'
-            # Someone else's stop at a floor without a map: keep riding, never assume
-            # the target from this door opening.
-            self.t.arrival_wait_since = None
-            if self.t.pass_stop != passing.name:
-                self.t.pass_stop = passing.name
-                self._emit('PASS_FLOOR_STOP', s.transit_from, passing.name,
-                           f'target {s.transit_to}; staying in the car')
-            return 'pass_floor'
-        if s.zone != ZONE_UNKNOWN:
-            if not s.floor_conflict:
-                self._emit('FLOOR_CONFLICT', s.floor, passing.name, 'pass floor beacon heard; not applied')
-            self.state = replace(self.state, floor_conflict=True)
-            self.t.conflict_seen = now
-        return 'conflict'
+        if (s.zone != ZONE_IN_ELEVATOR or not s.awaiting_confirm or floor != s.floor
+                or candidate_id != s.candidate_id or self.t.door_state not in (OPEN, OPENING)):
+            return 'ignored'
+        detail = SOURCE_NAMES.get(source, str(source))
+        if not accepted and actual_floor == floor:
+            return 'ignored'
+        corrected = not accepted and self._known_floor(actual_floor)
+        if accepted or corrected:
+            verified_floor = actual_floor if corrected else floor
+            if corrected:
+                detail += f' corrected {floor}->{actual_floor}'
+            self.state = replace(s, floor=verified_floor, confidence='VERIFIED',
+                                 awaiting_confirm=False, candidate_source='')
+            self.t.confirmation_rejected = False
+            self._emit('ARRIVED', s.floor, verified_floor, detail)
+            return 'accepted'
+        self.state = replace(s, floor='', confidence='TRANSIT', transit_from=s.floor,
+                             transit_to=self.car_target, awaiting_confirm=False, candidate_source='')
+        self.t.origin_verified = False  # transit_from is the rejected guess, not a known floor
+        self.t.closed_during_transit = 0.
+        self.t.arrival_wait_since = None
+        self.t.vision_guess = None
+        self.t.vision_confident = False
+        self.t.confirmation_rejected = True
+        self.t.door_closed_since = None
+        self._emit('ARRIVAL_REJECTED', s.floor, self.car_target, detail)
+        return 'rejected'
 
     def on_door(self, door_state, now):
         previous = self.t.door_state
@@ -216,14 +185,23 @@ class FloorStateMachine:
             self.t.door_closed_since = None
         elif door_state == CLOSED and self.t.door_closed_since is None:
             self.t.door_closed_since = now
-            self.t.pass_stop = ''
+        if door_state != OPEN:
+            self.t.arrival_wait_since = None
+            self.t.vision_guess = None
+            self.t.vision_confident = False
         s = self.state
         if (s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT' and door_state == OPEN
-                and previous != OPEN and self.t.arrival_wait_since is None):
+                and previous != OPEN and self.t.arrival_wait_since is None
+                and (not self.t.confirmation_rejected
+                     or self.t.closed_during_transit >= self.min_travel_closed_s)):
             self.t.arrival_wait_since = now
+            self.t.vision_guess = None
+            self.t.vision_confident = False
 
-    def on_position(self, in_car, past_hall_door, enclosed, now):
-        """``in_car``: centre inside the car polygon; ``past_hall_door``: clearly on the hall side."""
+    def on_position(self, in_car, past_hall_door, enclosed, now, *, fully_inside=False):
+        """Report centre/zone evidence and whether the whole body clears the car door."""
+        self.in_car, self.past_hall_door, self.enclosed = in_car, past_hall_door, enclosed
+        self.fully_inside, self.position_time = fully_inside, now
         s = self.state
         if s.zone == ZONE_OUTSIDE and in_car and enclosed:
             if not self._door_recently_open(now):
@@ -236,7 +214,7 @@ class FloorStateMachine:
                 self._violation(now, 'left the car while travelling or through a closed door')
                 return
             self.state = replace(s, zone=ZONE_OUTSIDE, transit_from='', transit_to='',
-                                 floor_conflict=False)
+                                 awaiting_confirm=False, candidate_source='')
             self.t.exit_time, self.t.ready = now, False
             self.t.arrival_wait_since = None
             self.car_target = ''
@@ -248,7 +226,7 @@ class FloorStateMachine:
         rising = ready and not self.t.ready
         self.t.ready = ready
         s = self.state
-        if rising and s.zone == ZONE_OUTSIDE and s.confidence == 'BEACON' and self.t.exit_time is not None:
+        if rising and s.zone == ZONE_OUTSIDE and s.confidence == 'VERIFIED' and self.t.exit_time is not None:
             self.state = replace(s, confidence='CONFIRMED')
             self._emit('FLOOR_CONFIRMED', s.floor, s.floor, 'localization verified after the ride')
 
@@ -261,45 +239,77 @@ class FloorStateMachine:
             raise ValueError('not allowed inside the car')
         old = self.state.floor
         self.state = replace(self.state, zone=ZONE_OUTSIDE, floor=floor, transit_from='',
-                             transit_to='', confidence='CONFIRMED', floor_conflict=False)
+                             transit_to='', confidence='CONFIRMED', awaiting_confirm=False,
+                             candidate_source='')
         self.car_target = ''
         self.t.arrival_wait_since = None
+        self.t.confirmation_rejected = False
         self._emit('FLOOR_SET_BY_OPERATOR', old, floor)
 
     def tick(self, now):
-        s = self.state
-        t = self.t
+        s, t = self.state, self.t
+        if s.confidence == 'VERIFIED':
+            position_stale = self.position_time is None or now - self.position_time > self.position_stale_s
+            # A verified stop that is not the ride target is never exited by the mission, so the
+            # robot is inside: depart without the whole-body check, which only guards an exit.
+            can_depart = self.car_target != s.floor or position_stale or self.fully_inside
+        else:
+            can_depart = self.car_target != s.floor or s.confidence == 'ASSUMED'
         if (s.zone == ZONE_IN_ELEVATOR and s.confidence != 'TRANSIT' and t.door_state == CLOSED
                 and t.door_closed_since is not None and now - t.door_closed_since >= self.depart_closed_s
-                and self.car_target and self.car_target != s.floor):
+                and self.car_target and can_depart):
+            # A camera-only verification is not a known origin for bounding the next stop.
+            t.origin_verified = (s.confidence == 'CONFIRMED'
+                                 or (s.confidence == 'VERIFIED' and s.candidate_source != 'VISION_AUTO'))
             self.state = replace(s, floor='', transit_from=s.floor, transit_to=self.car_target,
-                                 confidence='TRANSIT')
-            t.closed_during_transit = 0.  # door_closed_since keeps counting until it opens
+                                 confidence='TRANSIT', awaiting_confirm=False, candidate_source='')
+            t.closed_during_transit = 0.  # door_closed_since counts until opening
             t.arrival_wait_since = None
+            t.vision_guess = None
+            t.vision_confident = False
+            t.vision_references = frozenset()
+            t.confirmation_rejected = False
             self._emit('DEPARTED', s.floor, self.car_target)
         s = self.state
-        if (s.confidence == 'TRANSIT' and t.arrival_wait_since is not None
-                and now - t.arrival_wait_since >= self.arrival_timeout):
+        if (s.zone == ZONE_IN_ELEVATOR and s.confidence == 'TRANSIT' and t.door_state == OPEN
+                and t.arrival_wait_since is not None
+                and now - t.arrival_wait_since >= self.arrival_settle_s):
             moved = t.closed_during_transit >= self.min_travel_closed_s
-            assumed = s.transit_to if moved else s.transit_from
-            self._arrive(assumed, 'ASSUMED', now,
-                         'no hall beacon after the door opened' + ('' if moved else '; door only reopened'))
-        if s.floor_conflict and t.conflict_seen is not None and now - t.conflict_seen > self.conflict_hold_s:
-            self.state = replace(self.state, floor_conflict=False)
+            use_vision = self.vision_wait_s > 0 and moved
+            if (use_vision and t.vision_guess is None
+                    and now < t.arrival_wait_since + self.arrival_settle_s + self.vision_wait_s):
+                return s
+            candidate = s.transit_to if moved else s.transit_from
+            source = 'TARGET'
+            if use_vision:
+                candidate = t.vision_guess or self.car_target
+                if t.vision_guess:
+                    source = 'VISION'
+            awaiting = (moved if self.vision_wait_s > 0 else candidate == self.car_target)
+            automatic = (use_vision and source == 'VISION' and self.vision_auto and t.vision_confident
+                         and (candidate != self.car_target
+                              or self._target_recognisable(s.transit_from, t.vision_references)))
+            t.arrival_wait_since = None
+            t.vision_guess = None
+            t.vision_confident = False
+            if automatic:
+                # Same effect as an accepted confirmation while the door is open: the mission
+                # alights only if this is the ride target, otherwise the robot keeps riding.
+                self.state = replace(s, floor=candidate, confidence='VERIFIED', transit_from='',
+                                     transit_to='', awaiting_confirm=False, candidate_source='VISION_AUTO',
+                                     candidate_id=s.candidate_id % 0xffffffff + 1)
+                self._emit('ARRIVAL_CANDIDATE', s.transit_from, candidate, 'after travel source VISION_AUTO')
+                self._emit('ARRIVED', s.transit_from, candidate, 'VISION auto')
+                if candidate != self.car_target:
+                    self._emit('ARRIVED_OTHER_FLOOR', s.transit_from, candidate, f'target {self.car_target}')
+                return self.state
+            self.state = replace(s, floor=candidate, confidence='ASSUMED', transit_from='',
+                                 transit_to='', awaiting_confirm=awaiting,
+                                 candidate_source=source if awaiting else '',
+                                 candidate_id=s.candidate_id % 0xffffffff + 1)
+            self._emit('ARRIVAL_CANDIDATE', s.transit_from, candidate,
+                       f'after travel source {source}' if moved else 'door only reopened')
+            if candidate != self.car_target:
+                self._emit('ARRIVED_OTHER_FLOOR', s.transit_from, candidate,
+                           f'target {self.car_target}')
         return self.state
-
-    def _arrive(self, floor, confidence, now, detail=''):
-        s = self.state
-        origin = s.transit_from or s.floor
-        target = self.car_target
-        self.t.arrival_wait_since = None
-        self.state = replace(s, floor=floor, confidence=confidence, transit_from='', transit_to='')
-        if floor == target:
-            if confidence != 'ASSUMED':
-                self.car_target = ''  # an assumed arrival keeps the target until a beacon agrees
-            self._emit('ARRIVED', origin, floor, detail or confidence)
-        else:
-            # Another passenger's stop, or the door only reopened: keep the target for the next ride.
-            self._emit('ARRIVED_OTHER_FLOOR', origin, floor, detail or f'target {target}')
-        if confidence == 'ASSUMED':
-            self._emit('ARRIVAL_UNCONFIRMED', origin, floor, detail)

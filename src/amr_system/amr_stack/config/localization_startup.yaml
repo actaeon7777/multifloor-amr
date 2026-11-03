@@ -75,7 +75,7 @@ navigation_startup:
     # clutter as above (2026-10-27).
     manual_min_match_ratio: 0.50
     # The first /initialpose after an elevator resume (the mission's hall pose)
-    # carries a tight prior: beacon-confirmed floor, in-car wall alignment and
+    # carries a tight prior: confirmed arrival floor, in-car wall alignment and
     # a straight exit leg. No corridor-copy ambiguity applies, so admit it
     # here and let AMCL correct on the straight corridor leg that follows.
     after_ride_min_match_ratio: 0.50

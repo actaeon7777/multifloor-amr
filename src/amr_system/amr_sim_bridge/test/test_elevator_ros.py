@@ -1,4 +1,4 @@
-"""Opt-in ROS test: simulated elevator and the CAN relay speak the same topics."""
+"""Opt-in request and arrival-confirm integration, isolated domain 193 only."""
 import json
 import os
 import time
@@ -9,19 +9,13 @@ import pytest
 if os.environ.get('AMR_RUN_ELEVATOR_TESTS') != '1':
     pytest.skip('Set AMR_RUN_ELEVATOR_TESTS=1 in domain 193', allow_module_level=True)
 
-from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus
-from nav_msgs.msg import Odometry
+from amr_elevator_interfaces.msg import ElevatorRequest, FloorArrivalConfirm, FloorState
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
-
-from amr_can_bridge import elevator_can_link
-from amr_can_bridge.elevator_protocol import (
-    ELEVATOR_COMMAND_CAN_ID, ELEVATOR_DIAG_CAN_ID, ELEVATOR_EVENT_CAN_ID, EVENT_PRESENCE,
-    LOCATION_HALL, STATUS_COMPLETED, CommandStatus, ElevatorEvent, encode_diagnostic, encode_event,
-)
-from amr_sim_bridge.elevator_node import ElevatorSimNode
+from amr_sim_bridge.elevator_node import ElevatorSimNode, ElevatorRelayNode
 from amr_stack.floor_config import load_floor_config
 
 
@@ -33,18 +27,14 @@ def ros():
     executor = SingleThreadedExecutor()
     probe = rclpy.create_node('elevator_test_probe')
     executor.add_node(probe)
-    beacons, statuses, command_statuses, rf_statuses = [], [], [], []
-    probe.create_subscription(ElevatorBeacon, 'elevator/beacon', beacons.append, 50)
-    probe.create_subscription(ElevatorCommandStatus, 'elevator/command_status',
-                              command_statuses.append, 20)
-    latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-    probe.create_subscription(String, 'sim/elevator/status',
-                              lambda m: statuses.append(json.loads(m.data)), latched)
-    probe.create_subscription(String, 'elevator/rf_status',
-                              lambda m: rf_statuses.append(json.loads(m.data)), latched)
-    command_pub = probe.create_publisher(ElevatorCommand, 'elevator/command', 10)
-    inject_pub = probe.create_publisher(String, 'sim/elevator/inject', 10)
-    truth_pub = probe.create_publisher(Odometry, 'sim/ground_truth', 10)
+    statuses, confirms, raw = [], [], []
+    latched = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    probe.create_subscription(String, '/sim/elevator/status', lambda m: statuses.append(json.loads(m.data)), latched)
+    probe.create_subscription(FloorArrivalConfirm, '/floor/arrival_confirm', confirms.append, 10)
+    probe.create_subscription(String, '/sim/elevator/request_raw', lambda m: raw.append(json.loads(m.data)), latched)
+    request = probe.create_publisher(ElevatorRequest, '/elevator/request', latched)
+    state = probe.create_publisher(FloorState, '/floor/state', latched)
+    status = probe.create_publisher(String, '/sim/elevator/status', latched)
 
     def spin(duration, until=None):
         end = time.monotonic() + duration
@@ -54,9 +44,8 @@ def ros():
                 return True
         return until is None
 
-    yield SimpleNamespace(executor=executor, beacons=beacons, statuses=statuses, spin=spin,
-                          command=command_pub, inject=inject_pub, truth=truth_pub,
-                          command_statuses=command_statuses, rf_statuses=rf_statuses)
+    yield SimpleNamespace(executor=executor, probe=probe, statuses=statuses, confirms=confirms,
+                          raw=raw, request=request, state=state, status=status, spin=spin)
     nodes = executor.get_nodes()
     executor.shutdown()
     for node in nodes:
@@ -64,100 +53,87 @@ def ros():
     rclpy.shutdown()
 
 
-def command(kind, floor, direction, sequence):
-    return ElevatorCommand(command=kind, floor_code=floor, direction=direction, sequence=sequence)
+def candidate(ros, floor, awaiting=True, candidate_id=7):
+    message = FloorState(zone=FloorState.ZONE_IN_ELEVATOR, floor=floor,
+                         confidence='ASSUMED', awaiting_confirm=awaiting, candidate_id=candidate_id)
+    message.header.stamp = ros.probe.get_clock().now().to_msg()
+    ros.state.publish(message)
 
 
-def test_simulated_elevator_answers_commands_and_tracks_the_robot(ros):
-    building = load_floor_config()
-    node = ElevatorSimNode(building=building)
+def test_request_opens_car_and_auto_confirms_once_per_candidate(ros):
+    node = ElevatorSimNode(building=load_floor_config(), parameter_overrides=[
+        Parameter('start_floor', value='4F'), Parameter('press_delay_s', value=.1),
+        Parameter('confirm_delay_s', value=.1)])
     ros.executor.add_node(node)
-    assert ros.spin(3., lambda: any(b.floor_code == 4 for b in ros.beacons))
-    first = next(b for b in ros.beacons if b.floor_code == 4)
-    assert (first.event, first.location, first.source) == (EVENT_PRESENCE, LOCATION_HALL, 'sim')
-
-    ros.command.publish(command(ElevatorCommand.CMD_HALL_CALL, 4, ElevatorCommand.DIR_DOWN, 21))
-    assert ros.spin(2., lambda: any(b.event == ElevatorBeacon.EVENT_BUTTON_ACK for b in ros.beacons))
-    ack = next(b for b in ros.beacons if b.event == ElevatorBeacon.EVENT_BUTTON_ACK)
-    assert (ack.location, ack.floor_code, ack.ack_sequence) == (LOCATION_HALL, 4, 21)
-    assert ros.spin(1., lambda: ros.command_statuses)
-    done = ros.command_statuses[-1]
-    assert (done.cmd_seq, done.status, done.target, done.source) == \
-        (21, ElevatorCommandStatus.STATUS_COMPLETED, 0x44, 'sim')
-    assert ros.spin(4., lambda: ros.statuses and ros.statuses[-1]['door'] in ('OPENING', 'OPEN'))
-    assert ros.statuses[-1]['car_floor'] == '4F' and ros.statuses[-1]['car_z_m'] == 0.
-
-    # Ground truth inside the 4F car polygon -> robot_in_car; the car height must match too.
-    truth = Odometry()
-    truth.pose.pose.position.x, truth.pose.pose.position.y = 8.2, 3.31
-    ros.truth.publish(truth)
-    assert ros.spin(2., lambda: ros.statuses[-1]['robot_in_car'])
-    truth.pose.pose.position.z = 3.6  # same xy on 5F: not in the car
-    ros.truth.publish(truth)
-    assert ros.spin(2., lambda: not ros.statuses[-1]['robot_in_car'])
-
-    ros.inject.publish(String(data=json.dumps({'faults': {'button_fails': True}})))
+    ros.spin(.5)
+    ros.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CALL, start_floor='4F',
+                                        target_floor='3F', direction=ElevatorRequest.DIR_DOWN, sequence=1))
+    assert ros.spin(5., lambda: ros.statuses and ros.statuses[-1]['door'] == 'OPEN')
+    candidate(ros, '4F')
+    assert ros.spin(2., lambda: ros.confirms)
+    assert ros.confirms[-1].actual_floor == ''
+    assert ros.confirms[-1].accepted and ros.confirms[-1].source == FloorArrivalConfirm.SOURCE_SIM
+    assert ros.confirms[-1].candidate_id == 7
+    for _ in range(3):
+        candidate(ros, '4F')  # new publication stamp must not generate another answer
+        ros.spin(.15)
+    assert len(ros.confirms) == 1
+    candidate(ros, '4F', False)
+    ros.spin(.1)
+    candidate(ros, '4F')
     ros.spin(.3)
-    count = len(ros.beacons)
-    ros.command.publish(command(ElevatorCommand.CMD_CAR_FLOOR, 5, 0, 22))
-    ros.spin(1.)
-    assert all(b.event == EVENT_PRESENCE for b in ros.beacons[count:])
-    assert ros.statuses[-1]['faults'] == {'button_fails': True}
-    node.destroy_node()
+    assert len(ros.confirms) == 1
+    candidate(ros, '4F', candidate_id=8)
+    assert ros.spin(2., lambda: len(ros.confirms) == 2)
+    assert ros.confirms[-1].candidate_id == 8 and ros.confirms[-1].accepted
+    candidate(ros, '3F', candidate_id=9)
+    assert ros.spin(2., lambda: len(ros.confirms) == 3)
+    assert not ros.confirms[-1].accepted and ros.confirms[-1].candidate_id == 9
+    assert ros.confirms[-1].actual_floor == '4F'
 
 
-class LoopbackBus:
-    """Echo every elevator command as the STM32 would acknowledge it."""
-    def __init__(self, **kwargs):
-        assert [(f['can_id'], f['can_mask']) for f in kwargs['can_filters']] == [
-            (ELEVATOR_EVENT_CAN_ID, 0x7FE)]  # 0x310 events and 0x311 diagnostics
-        self.inbox, self.sent = [], []
-
-    def send(self, message, timeout):
-        assert message.arbitration_id == ELEVATOR_COMMAND_CAN_ID
-        self.sent.append(bytes(message.data))
-        sequence = message.data[1]
-        self.inbox.append(SimpleNamespace(
-            arbitration_id=ELEVATOR_EVENT_CAN_ID, timestamp=time.time(), is_extended_id=False,
-            is_remote_frame=False, is_error_frame=False, is_fd=False,
-            data=encode_event(ElevatorEvent(ElevatorBeacon.EVENT_BUTTON_ACK, 0,
-                                            ElevatorBeacon.LOCATION_CAR, 5, sequence, -40))))
-        self.inbox.append(SimpleNamespace(
-            arbitration_id=ELEVATOR_DIAG_CAN_ID, timestamp=time.time(), is_extended_id=False,
-            is_remote_frame=False, is_error_frame=False, is_fd=False,
-            data=encode_diagnostic(CommandStatus(sequence, STATUS_COMPLETED, 0, 0x21, 1))))
-
-    def recv(self, timeout):
-        return self.inbox.pop(0) if self.inbox else None
-
-    def shutdown(self):
-        pass
-
-
-def test_can_link_relays_commands_and_acknowledgements(ros):
-    pytest.importorskip('can')
-    node = elevator_can_link.ElevatorCanLink(
-        bus_factory=LoopbackBus,
-        parameter_overrides=[rclpy.parameter.Parameter('dry_run', value=False)])
+def test_auto_confirm_can_be_disabled(ros):
+    node = ElevatorSimNode(building=load_floor_config(), parameter_overrides=[Parameter('auto_confirm', value=False)])
     ros.executor.add_node(node)
+    ros.spin(.5)
+    candidate(ros, '4F')
+    ros.spin(1.5)
+    assert not ros.confirms
+
+
+def test_relay_request_json_and_ground_truth_confirmation(ros):
+    node = ElevatorRelayNode(parameter_overrides=[Parameter('confirm_delay_s', value=.1)])
+    ros.executor.add_node(node)
+    ros.spin(.5)
+    ros.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CAR_FLOOR, target_floor='5F', sequence=2))
+    assert ros.spin(2., lambda: ros.raw)
+    assert ros.raw[-1] == dict(kind=2, start_floor='', target_floor='5F', direction=0, sequence=2)
+    candidate(ros, '5F')
+    ros.status.publish(String(data=json.dumps(dict(moving=False, car_floor='5F', door='OPEN'))))
+    assert ros.spin(.8, lambda: ros.confirms)
+    assert ros.confirms[-1].accepted and ros.confirms[-1].candidate_id == 7
+
+
+def test_late_adapter_replays_only_latest_request(ros):
+    ros.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CALL, start_floor='4F',
+                                       target_floor='3F', direction=ElevatorRequest.DIR_DOWN, sequence=1))
+    ros.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CANCEL, sequence=2))
+    ros.spin(.2)
+    node = ElevatorSimNode(building=load_floor_config(), parameter_overrides=[
+        Parameter('start_floor', value='4F'), Parameter('press_delay_s', value=.1)])
+    ros.executor.add_node(node)
+    assert ros.spin(2., lambda: ros.statuses)
+    ros.spin(2.)
+    assert all(s['door'] == 'CLOSED' and not s['moving'] for s in ros.statuses)
+
+
+def test_late_relay_forwards_only_latest_request(ros):
+    ros.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CAR_FLOOR, target_floor='5F', sequence=1))
+    ros.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CANCEL, sequence=2))
+    ros.spin(.2)
+    node = ElevatorRelayNode()
+    ros.executor.add_node(node)
+    assert ros.spin(2., lambda: ros.raw)
     ros.spin(.3)
-    ros.command.publish(command(ElevatorCommand.CMD_CAR_FLOOR, 3, 0, 77))
-    assert ros.spin(2., lambda: ros.beacons)
-    ack = ros.beacons[0]
-    assert (ack.event, ack.location, ack.ack_sequence, ack.source) == \
-        (ElevatorBeacon.EVENT_BUTTON_ACK, ElevatorBeacon.LOCATION_CAR, 77, 'can')
-    assert node.link.bus.sent[0][1:5] == bytes([77, 2, 3, 0])
-    assert ros.spin(1., lambda: ros.command_statuses)
-    assert (ros.command_statuses[0].cmd_seq, ros.command_statuses[0].source) == (77, 'can')
-    assert ros.spin(1., lambda: ros.rf_statuses and ros.rf_statuses[-1]['last_command'])
-    assert ros.rf_statuses[-1]['last_command']['status'] == 'COMPLETED'
-    door = command(ElevatorCommand.CMD_DOOR_OPEN, 0, 0, 79)
-    door.repeat = 10
-    ros.command.publish(door)
-    assert ros.spin(1., lambda: len(node.link.bus.sent) == 2)
-    assert node.link.bus.sent[1][5] == 10  # repeat byte
-    ros.command.publish(command(ElevatorCommand.CMD_HALL_CALL, 3, 0, 78))  # invalid: no direction
-    ros.spin(.3)
-    assert len(node.link.bus.sent) == 2
-    node.close()
-    node.destroy_node()
+    assert ros.raw == [dict(kind=3, start_floor='', target_floor='', direction=0, sequence=2)]
+    assert node.raw_pub.qos_profile.depth == 1

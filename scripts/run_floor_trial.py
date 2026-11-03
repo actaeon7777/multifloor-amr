@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""One isolated multi-floor (elevator) trial in the stacked building, domain 107.
+"""Arrival confirmation relies on simulator auto_confirm=true.
+The operator-supplied --start-floor initializes /floor/set_current before missions.
+
+One isolated multi-floor (elevator) trial in the stacked building, domain 107.
 
 Starts ``experiment.sh sim world:=building``, initializes like run_sim_trial.py,
 sends one /floor_mission/navigate goal (optionally with elevator faults) and
@@ -22,6 +25,7 @@ import rclpy  # noqa: E402
 from action_msgs.msg import GoalStatus  # noqa: E402
 from amr_elevator_interfaces.action import NavigateToFloorPose  # noqa: E402
 from amr_elevator_interfaces.msg import ElevatorDoorState, FloorEvent, FloorState  # noqa: E402
+from amr_elevator_interfaces.srv import SetCurrentFloor  # noqa: E402
 from nav2_msgs.action import NavigateToPose  # noqa: E402
 from rclpy.action import ActionClient  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile  # noqa: E402
@@ -64,6 +68,19 @@ class FloorTrial(Trial):
         ]
         self.floor_samples, self.last_floor_sample = [], 0.
         self.triggers, self.injected = [], []
+
+    def set_start_floor(self, floor):
+        """Apply the operator-supplied --start-floor while stationary before starting missions."""
+        client = self.create_client(SetCurrentFloor, '/floor/set_current')
+        try:
+            self.until(client.service_is_ready, 30)
+            future = client.call_async(SetCurrentFloor.Request(floor=floor))
+            self.until(future.done, 10)
+            response = future.result()
+            if not response.success:
+                raise RuntimeError(f'Start floor rejected: {response.message}')
+        finally:
+            self.destroy_client(client)
 
     def on_event(self, message):
         self.events.append({'t': time.monotonic(), 'event': message.event, 'from': message.from_floor,
@@ -224,8 +241,8 @@ def main():
              '/clock', '/scan', '/odometry/filtered', '/wheel/odometry', '/amcl_pose', '/tf', '/tf_static', '/plan',
              '/local_costmap/costmap', '/cmd_vel', '/cmd_vel_auto', '/localization/status', '/navigation/status',
              '/sim/ground_truth', '/sim/status', '/sim/elevator/status', '/floor/state', '/floor/events',
-             '/floor/pose_estimate', '/floor_mission/status', '/elevator/door', '/elevator/beacon',
-             '/elevator/command', '/map', '/initialpose', '/rosout'],
+             '/floor/pose_estimate', '/floor_mission/status', '/elevator/door', '/floor/arrival_confirm',
+             '/elevator/request', '/map', '/initialpose', '/rosout'],
             stdout=bag_log, stderr=subprocess.STDOUT, start_new_session=True)
     report = {'passed': False, 'world': 'building', 'seed': args.seed, 'start_floor': args.start_floor,
               'goal_floor': args.floor, 'goal_room': room, 'goal': list(goal_pose),
@@ -237,7 +254,8 @@ def main():
         node.triggers.append({'phase': phase, 'inject': json.loads(payload)})
     try:
         node.initialize()
-        node.until(lambda: node.floor_state is not None and node.floor_state.confidence in ('BEACON', 'CONFIRMED'), 30)
+        node.set_start_floor(args.start_floor)
+        node.until(lambda: node.floor_state is not None and node.floor_state.confidence in ('CONFIRMED', 'VERIFIED'), 30)
         if report['fault']:
             node.inject({'faults': report['fault']})
         node.samples.clear()

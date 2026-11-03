@@ -19,13 +19,13 @@ def shared():
     state = SharedState(preview=True)
     floors = {}
     for name, room in [('3F', '302'), ('4F', '402')]:
-        floors[name] = SimpleNamespace(rooms={room: SimpleNamespace(goal=(1., 1., .5))}, real_enabled=True)
+        floors[name] = SimpleNamespace(name=name, level=int(name[0]), rooms={room: SimpleNamespace(goal=(1., 1., .5))}, real_enabled=True)
         state.floor_grids[name] = Grid(4, 4, 1., [0., 0., 0.], [0]*16)
         state.floor_grids[name].version = int(name[0]) * 2**40
-    state.building = SimpleNamespace(home=SimpleNamespace(floor='4F', room='402'), floors=floors, floor=lambda name: floors[name])
+    state.building = SimpleNamespace(home=SimpleNamespace(floor='4F', room='402'), floors=floors, pass_floors={'1F':SimpleNamespace(name='1F', level=1)}, floor=lambda name: floors[name])
     state.grids['map'] = Grid(4, 4, 1., [0., 0., 0.], [0]*16)
     state.grids['map'].version = 17
-    state.state['floor'] = dict(floor='4F', zone=1, confidence='BEACON')
+    state.state['floor'] = dict(floor='4F', zone=1, confidence='CONFIRMED')
     return state
 
 
@@ -96,7 +96,7 @@ def test_light_snapshot_uses_same_freshness_and_skips_heavy_parts(shared, http, 
                         goal=dict(request_id='goal_001', status='ACCEPTED', feedback_received_at=98.))
     expected = set('preview connection_epoch mode navigation action_ready floor_action_ready floor '
                    'floor_mission goal notice pending_request localization localization_reset_pending '
-                   'robot global_path tf_error estop telemetry acknowledged_request kiosk map_version hold task patrol'.split())
+                   'robot global_path tf_error estop telemetry acknowledged_request kiosk map_version hold task patrol elevator_request'.split())
     with http(shared) as request:
         full = request('/api/state')[1]
         assert full['kiosk'] == {'pin_required': True} and full['acknowledged_request'] is None
@@ -105,7 +105,7 @@ def test_light_snapshot_uses_same_freshness_and_skips_heavy_parts(shared, http, 
         def unexpected(*_args):
             pytest.fail('light snapshot built a heavy component')
 
-        for method in ('elevator_snapshot', 'transit_snapshot', 'camera_snapshot'):
+        for method in ('transit_snapshot', 'camera_snapshot'):
             monkeypatch.setattr(shared, method, unexpected)
         monkeypatch.setattr(shared.grids['map'], 'metadata', unexpected)
         status, light, _ = request('/api/kiosk/state')
@@ -1202,3 +1202,213 @@ def test_kiosk_patrol_expired_admin_token(shared, patrol_http_bytes, monkeypatch
                        headers={'X-AMR-Kiosk-Token': token})[:2] == (
                            403, {'error': '관리 모드 잠금을 먼저 해제하세요.'})
         assert not shared.operator_commands
+
+
+@pytest.mark.parametrize('accepted', [True, False])
+@pytest.mark.parametrize('kiosk', [True, False])
+def test_arrival_confirm_http_publishes_without_pin(shared, arrival_http, executor_stub, accepted, kiosk):
+    from builtin_interfaces.msg import Time
+    shared.kiosk_pin = '1234'
+    shared.state.update(preview=False, floor=dict(zone=2, floor='3F', confidence='ASSUMED', awaiting_confirm=True, candidate_id=7))
+    sent = []
+    executor_stub.arrival_pub = SimpleNamespace(publish=sent.append)
+    executor_stub.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=42)))
+    with arrival_http(shared) as request:
+        status, record, _ = request('/api/floor/arrival_confirm', {'floor':'3F', 'candidate_id':7, 'accepted':accepted}, kiosk=kiosk)
+        assert status == 202 and record['kind'] == 'arrival_confirm'
+        executor_stub.process_command(shared.commands.get_nowait())
+    assert len(sent) == 1
+    message = sent[0]
+    assert message.source == message.SOURCE_OPERATOR and message.floor == '3F'
+    assert message.candidate_id == 7
+    assert message.accepted is accepted and message.score == 1.0 and message.header.stamp.sec == 42
+
+
+@pytest.mark.parametrize('floor_state,requested', [
+    (None, '3F'), (dict(zone=2, floor='3F', awaiting_confirm=False, candidate_id=7), '3F'),
+    (dict(zone=1, floor='3F', awaiting_confirm=True, candidate_id=7), '3F'),
+    (dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7), '4F'),
+])
+def test_arrival_confirm_requires_current_candidate(shared, arrival_http, floor_state, requested):
+    shared.state['floor'] = floor_state
+    with arrival_http(shared) as request:
+        status, body, _ = request('/api/floor/arrival_confirm', {'floor':requested, 'candidate_id':7, 'accepted':True})
+    assert status == 409 and body['error'] == '지금은 도착 층을 확인할 단계가 아닙니다.'
+    assert shared.commands.empty()
+
+
+@pytest.mark.parametrize('value', [None, 0, 1, 'true', 'false', [], {}])
+def test_arrival_confirm_rejects_non_boolean(shared, arrival_http, value):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7)
+    with arrival_http(shared) as request:
+        assert request('/api/floor/arrival_confirm', {'floor':'3F', 'candidate_id':7, 'accepted':value})[0] == 400
+    assert shared.commands.empty()
+
+
+def test_arrival_candidate_rechecked_before_publish(shared, arrival_http, executor_stub):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7)
+    sent = []
+    executor_stub.arrival_pub = SimpleNamespace(publish=sent.append)
+    with arrival_http(shared) as request:
+        assert request('/api/floor/arrival_confirm', {'floor':'3F', 'candidate_id':7, 'accepted':True})[0] == 202
+    shared.state['floor']['candidate_id'] = 8
+    executor_stub.process_command(shared.commands.get_nowait())
+    assert not sent
+
+
+@pytest.mark.parametrize('kind,name', [(1,'CALL'), (2,'CAR_FLOOR'), (3,'CANCEL')])
+def test_elevator_request_in_kiosk_and_full_state(shared, arrival_http, kind, name):
+    with arrival_http(shared) as request:
+        assert request('/api/kiosk/state')[1]['elevator_request'] is None
+        shared.update_elevator_request(kind, '4F', '3F', 2, 123)
+        expected = dict(kind=name, start_floor='4F', target_floor='3F', direction=2, sequence=123)
+        for path in ('/api/state', '/api/kiosk/state'):
+            assert request(path)[1]['elevator_request'] == expected
+    shared.reset_connection('reconnect')
+    assert shared.snapshot(kiosk=True)['elevator_request'] is None
+
+
+@pytest.mark.parametrize('accepted', [True, False])
+def test_arrival_shared_state_and_fake_bridge_without_transport(shared, executor_stub, accepted):
+    shared.kiosk_pin = '1234'
+    shared.state.update(preview=False, floor=dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7))
+    payload = dict(floor='3F', candidate_id=7, accepted=accepted)
+    shared.check_kiosk_request('arrival_confirm', payload, None)
+    record = shared.request('arrival_confirm', payload)
+    assert record['kind'] == 'arrival_confirm'
+    sent = []
+    executor_stub.arrival_pub = SimpleNamespace(publish=sent.append)
+    executor_stub.process_command(shared.commands.get_nowait())
+    assert [(m.floor, m.candidate_id, m.accepted, m.source, m.score) for m in sent] == [('3F', 7, accepted, 1, 1.0)]
+    shared.request('arrival_confirm', payload)
+    shared.state['floor']['candidate_id'] = 8
+    executor_stub.process_command(shared.commands.get_nowait())
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize('state,payload,status', [
+    (None, dict(floor='3F', candidate_id=7, accepted=True), 409),
+    (dict(zone=2, floor='3F', awaiting_confirm=False, candidate_id=7), dict(floor='3F', candidate_id=7, accepted=True), 409),
+    (dict(zone=1, floor='3F', awaiting_confirm=True, candidate_id=7), dict(floor='3F', candidate_id=7, accepted=True), 409),
+    (dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7), dict(floor='4F', candidate_id=7, accepted=True), 409),
+    (dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7), dict(floor='3F', candidate_id=7, accepted=1), 400),
+    (dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7), dict(floor='3F', candidate_id=7, accepted='false'), 400),
+])
+def test_arrival_validation_without_transport(shared, state, payload, status):
+    from amr_web_ui.server import ApiError
+    shared.state['floor'] = state
+    with pytest.raises(ApiError) as error:
+        shared.request('arrival_confirm', payload)
+    assert error.value.status == status and shared.commands.empty()
+
+
+def test_request_snapshot_without_transport(shared):
+    assert shared.snapshot(kiosk=True)['elevator_request'] is None
+    for kind, name in ((1, 'CALL'), (2, 'CAR_FLOOR'), (3, 'CANCEL')):
+        shared.update_elevator_request(kind, '4F', '3F', 2, 123)
+        expected = dict(kind=name, start_floor='4F', target_floor='3F', direction=2, sequence=123)
+        assert shared.snapshot(kiosk=True)['elevator_request'] == expected
+        assert shared.snapshot()['elevator_request'] == expected
+    shared.reset_connection('test')
+    assert shared.snapshot(kiosk=True)['elevator_request'] is None
+
+
+@pytest.fixture(params=['tcp', 'stream'])
+def arrival_http(request, http, monkeypatch):
+    if request.param == 'tcp':
+        return http
+    @contextmanager
+    def serve(shared):
+        import io
+        import amr_web_ui.server as module
+        monkeypatch.setattr(module, 'ThreadingHTTPServer',
+                            lambda address, handler: SimpleNamespace(handler=handler))
+        server = module.create_http_server(shared, '/nonexistent')
+
+        def send(path, payload=None, kiosk=True):
+            body = json.dumps(payload).encode() if payload is not None else b''
+            headers = {'Host':'127.0.0.1', 'Connection':'close', 'Content-Type':'application/json',
+                       'X-AMR-Request':'1', 'Content-Length':str(len(body))}
+            if kiosk:
+                headers['X-AMR-Client'] = 'kiosk'
+            method = 'POST' if payload is not None else 'GET'
+            raw = (f'{method} {path} HTTP/1.1\r\n' + ''.join(f'{k}: {v}\r\n'
+                   for k, v in headers.items()) + '\r\n').encode() + body
+            output = bytearray()
+            stream = SimpleNamespace(makefile=lambda *_args: io.BytesIO(raw),
+                                     settimeout=lambda _timeout: None, sendall=output.extend)
+            server.handler(stream, ('127.0.0.1', 12345), server)
+            head, data = bytes(output).split(b'\r\n\r\n', 1)
+            return int(head.split(b' ', 2)[1]), json.loads(data), {}
+        yield send
+    return serve
+
+
+@pytest.mark.parametrize('value', [None, -1, 1.5, '7', True, False, [], {}])
+def test_arrival_candidate_id_must_be_nonnegative_integer(shared, arrival_http, value):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7)
+    payload = dict(floor='3F', accepted=True)
+    if value is not None:  # missing ID is invalid too
+        payload['candidate_id'] = value
+    with arrival_http(shared) as request:
+        assert request('/api/floor/arrival_confirm', payload)[0] == 400
+    assert shared.commands.empty()
+
+
+def test_arrival_candidate_id_mismatch_is_conflict(shared, arrival_http):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=8)
+    with arrival_http(shared) as request:
+        status, result, _ = request('/api/floor/arrival_confirm', dict(floor='3F', candidate_id=7, accepted=True))
+    assert status == 409 and result['error'] == '지금은 도착 층을 확인할 단계가 아닙니다.'
+    assert shared.commands.empty()
+
+
+@pytest.mark.parametrize('candidate_id', [0, 4294967295])
+def test_arrival_candidate_id_uint32_boundaries(shared, executor_stub, candidate_id):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=candidate_id)
+    sent = []
+    executor_stub.arrival_pub = SimpleNamespace(publish=sent.append)
+    shared.request('arrival_confirm', dict(floor='3F', candidate_id=candidate_id, accepted=True))
+    executor_stub.process_command(shared.commands.get_nowait())
+    assert sent[0].candidate_id == candidate_id
+
+
+def test_bridge_copies_candidate_id_to_both_snapshots(shared, executor_stub):
+    from amr_elevator_interfaces.msg import FloorState
+    from amr_web_ui.ros_bridge import WebBridge
+    WebBridge.on_floor_state(executor_stub, FloorState(zone=2, floor='3F', awaiting_confirm=True, candidate_id=42))
+    assert shared.snapshot()['floor']['candidate_id'] == 42
+    assert shared.snapshot(kiosk=True)['floor']['candidate_id'] == 42
+
+
+@pytest.mark.parametrize('actual', ['', '4F', '1F'])
+def test_arrival_actual_floor_published_without_transport(shared, executor_stub, actual):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7)
+    shared.request('arrival_confirm', dict(floor='3F', candidate_id=7, accepted=False, actual_floor=actual))
+    sent = []
+    executor_stub.arrival_pub = SimpleNamespace(publish=sent.append)
+    executor_stub.process_command(shared.commands.get_nowait())
+    assert len(sent) == 1 and sent[0].actual_floor == actual and not sent[0].accepted
+
+
+@pytest.mark.parametrize('accepted,actual', [(True,''), (True,'4F'), (False,'3F'),
+                                          (False,'99F'), (False,1), (False,None)])
+def test_arrival_actual_floor_rejected_without_transport(shared, accepted, actual):
+    from amr_web_ui.server import ApiError
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7)
+    with pytest.raises(ApiError) as error:
+        shared.request('arrival_confirm', dict(floor='3F', candidate_id=7, accepted=accepted, actual_floor=actual))
+    assert error.value.status == 400 and shared.commands.empty()
+
+
+@pytest.mark.parametrize('accepted,actual,status', [(False,'',202), (False,'4F',202), (False,'1F',202),
+    (True,'',400), (True,'4F',400), (False,'3F',400), (False,'99F',400), (False,None,400)])
+def test_arrival_actual_floor_http(shared, arrival_http, accepted, actual, status):
+    shared.state['floor'] = dict(zone=2, floor='3F', awaiting_confirm=True, candidate_id=7)
+    with arrival_http(shared) as request:
+        assert request('/api/floor/arrival_confirm', dict(floor='3F', candidate_id=7,
+                       accepted=accepted, actual_floor=actual))[0] == status
+
+
+def test_arrival_floors_state_contains_pass_floors_in_level_order(shared):
+    assert shared.snapshot()['arrival_floors'] == [dict(name='1F',level=1), dict(name='3F',level=3), dict(name='4F',level=4)]

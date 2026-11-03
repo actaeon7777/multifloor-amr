@@ -92,7 +92,7 @@ class Patrol:
             reason = '이미 순찰 중입니다'
         elif selected is None:
             reason = '알 수 없는 순찰 경로'
-        elif selected.floor != floor or confidence not in ('CONFIRMED', 'BEACON', 'ASSUMED'):
+        elif selected.floor != floor or confidence not in ('CONFIRMED', 'VERIFIED', 'ASSUMED'):
             reason = '순찰 경로의 층과 현재 확인된 층이 다릅니다'
         elif in_elevator:
             reason = '엘리베이터 안에서는 순찰을 시작할 수 없습니다'

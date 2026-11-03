@@ -1,0 +1,24 @@
+floor_mission_manager:
+  ros__parameters:
+    maneuver_speed: 0.45  # 2026-11-02 안A (이전 0.35).  직선 기동 최고 속도 (m/s)
+    maneuver_accel: 0.5  # 안A (이전 0.4).  직선 기동 가속도 (m/s²)
+    maneuver_decel: 0.4  # 안A (이전 0.3).  장애물·목표 접근 감속도 (m/s²)
+    maneuver_max_turn: 0.6  # 안A (이전 0.5). 0.6 이하여야 함: navigation_manager max_angular_speed 0.6을 넘는 명령은 버려져 회전이 멈춤(11-02 ALIGN_TIMEOUT).  제자리 회전 최고 각속도 (rad/s)
+    maneuver_turn_gain: 1.8  # 안A (이전 1.2).  제자리 회전 각도 오차 비례 이득
+    maneuver_min_turn: 0.15  # 제자리 회전 최소 각속도 (rad/s)
+    maneuver_heading_tolerance: 0.12  # 직진을 시작할 방향 오차 허용치 (rad)
+    maneuver_min_clearance: 0.15  # 범퍼 앞 정지 여유 거리 (m)
+    clear_confirm_s: 0.5  # 공간이 연속해서 비어 있어야 하는 시간 (s)
+    space_margin: 0.10  # 승하차 통로 검사 여유 폭 (m)
+    wall_margin: 0.12  # 벽을 공간 점유 검사에서 제외하는 여유 (m)
+    turn_margin: 0.05  # 회전 충돌 검사 차체 외곽 여유 (m)
+    scan_max_age: 0.5  # 라이다 수신 후 유효 시간 (s)
+    depth_max_age: 0.5  # 깊이 점군 수신 후 유효 시간 (s)
+    door_cancel_grace: 1.5  # 승차 준비 후 문 열림이 끊겨도 기다리는 시간 (s)
+    space_announce_delay: 1.0  # 승차 공간이 이 시간 넘게 점유돼야 "비켜주세요" 안내 (s)
+elevator_monitor:
+  ros__parameters:
+    door_open_ratio: 0.7  # 문 너머로 통과한 빔의 열림 판정 비율
+    door_closed_ratio: 0.2  # 문 닫힘 판정 통과 빔 비율
+    door_confirm_scans: 2  # 열림·닫힘 확정에 필요한 연속 스캔 수
+    arrival_settle_s: 0.5  # 2026-11-02 (이전 1.0). 이동 뒤 문이 이 시간 열려 있으면 도착 확인 화면 표시 (s)

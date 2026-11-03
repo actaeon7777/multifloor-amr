@@ -1,22 +1,18 @@
-"""ROS adapter for the simulated elevator (replaces RF -> STM32 -> CAN in simulation).
+"""Typed elevator requests, simulated human presses, and arrival recognition.
 
-Publishes the same /elevator/beacon and /elevator/command_status the real
-elevator_can_link does and consumes /elevator/command.  ``ElevatorRosAdapter`` can be attached to any node, so the
-Isaac runner can step it with physics; ``elevator_sim`` runs it standalone for
-ROS-only tests.  /sim/elevator/status (JSON) is ground truth for evaluation and
-must not be used by AMR logic.
+The standalone adapter and Isaac JSON relay share the same auto-confirm policy.
+/sim/elevator/status remains ground truth for animation and evaluation.
 """
 
 import json
 import math
 
-from amr_elevator_interfaces.msg import ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus
+from amr_elevator_interfaces.msg import ElevatorRequest, FloorArrivalConfirm, FloorState
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
-from rclpy.time import Time
 from std_msgs.msg import String
 
 from amr_sim_bridge.elevator_model import ElevatorSim
@@ -30,29 +26,66 @@ def point_in_polygon(x, y, polygon):
     return inside
 
 
+class ArrivalRecognizer:
+    """One answer per candidate ID; repeated states and withdrawn candidates do not rearm it."""
+    def __init__(self, node, auto_confirm=True, confirm_delay_s=1.0):
+        if not math.isfinite(confirm_delay_s) or confirm_delay_s < 0:
+            raise ValueError('confirm_delay_s must be nonnegative')
+        self.node, self.enabled, self.delay = node, auto_confirm, confirm_delay_s
+        self.candidate = None
+        self.answered_id = None
+        self.publisher = node.create_publisher(FloorArrivalConfirm, '/floor/arrival_confirm', 10)
+        node.create_subscription(FloorState, '/floor/state', self.on_state,
+                                 QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
+    def on_state(self, state):
+        if self.answered_id is not None and state.candidate_id < self.answered_id:
+            self.answered_id = None  # the monitor restarted and counts from 1 again
+        if not state.awaiting_confirm or state.zone != FloorState.ZONE_IN_ELEVATOR:
+            self.candidate = None
+        elif self.candidate is None or self.candidate['candidate_id'] != state.candidate_id:
+            self.candidate = dict(floor=state.floor, candidate_id=state.candidate_id,
+                                  due=self.now() + self.delay)
+
+    def now(self):
+        return self.node.get_clock().now().nanoseconds * 1e-9
+
+    def tick(self, status):
+        c = self.candidate
+        if not self.enabled or c is None or c['candidate_id'] == self.answered_id or self.now() < c['due'] or status is None:
+            return
+        message = FloorArrivalConfirm(source=FloorArrivalConfirm.SOURCE_SIM, floor=c['floor'],
+            candidate_id=c['candidate_id'],
+            accepted=(status.get('moving') is False and status.get('car_floor') == c['floor']
+                      and status.get('door') == 'OPEN'), score=1.0)
+        if not message.accepted and status.get('moving') is False and status.get('door') == 'OPEN':
+            message.actual_floor = status.get('car_floor') or ''
+        message.header.stamp = self.node.get_clock().now().to_msg()
+        self.publisher.publish(message)
+        self.answered_id = c['candidate_id']
+
+
 class ElevatorRosAdapter:
     def __init__(self, node, building, elevator_id='E1', start_floor=None, seed=0,
-                 reference_floor=None, **model_options):
+                 reference_floor=None, auto_confirm=True, confirm_delay_s=1.0, **model_options):
         self.node = node
         self.building = building
         self.elevator_id = elevator_id
-        ordered = sorted(building.floors.values(), key=lambda f: f.level)
+        ordered = sorted([*building.floors.values(), *building.pass_floors.values()], key=lambda f: f.level)
         self.names = [f.name for f in ordered]
         spec = building.elevators[elevator_id]
         self.reference_index = self.names.index(reference_floor or building.default_floor)
         self.model = ElevatorSim(
-            [(f.name, f.beacon_floor_code) for f in ordered],
+            self.names,
             floor_height_m=building.sim.floor_height_m, speed_m_s=building.sim.car_speed_m_s,
             accel_m_s2=building.sim.car_accel_m_s2, open_time_s=spec.door_open_time_s,
             seed=seed, start_floor=start_floor or building.default_floor, **model_options)
         self.model.set_robot(self.reference_index, False)
         self.robot_override = False
-        self.beacon_pub = node.create_publisher(ElevatorBeacon, 'elevator/beacon', 20)
-        self.command_status_pub = node.create_publisher(
-            ElevatorCommandStatus, 'elevator/command_status', 20)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = node.create_publisher(String, 'sim/elevator/status', latched)
-        node.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 10)
+        node.create_subscription(ElevatorRequest, '/elevator/request', self.on_request, latched)
+        self.recognizer = ArrivalRecognizer(node, auto_confirm, confirm_delay_s)
         node.create_subscription(String, 'sim/elevator/inject', self.on_inject, 10)
         node.create_subscription(Odometry, 'sim/ground_truth', self.on_ground_truth, 10)
         self.last_status = None
@@ -67,9 +100,9 @@ class ElevatorRosAdapter:
     def car_z(self):
         return self.floor_z(self.model.position)
 
-    def on_command(self, message):
-        self.model.command(self.now(), message.command, message.floor_code, message.direction,
-                           message.sequence, message.repeat)
+    def on_request(self, message):
+        self.model.request(self.now(), message.kind, message.start_floor, message.target_floor,
+                           message.direction)
 
     def on_inject(self, message):
         try:
@@ -90,7 +123,8 @@ class ElevatorRosAdapter:
             return
         position = message.pose.pose.position
         level = self.reference_index + position.z / self.building.sim.floor_height_m
-        index = min(range(len(self.names)), key=lambda i: abs(i - level))
+        index = min((i for i, name in enumerate(self.names) if name in self.building.floors),
+                    key=lambda i: abs(i - level))
         geometry = self.building.elevator_geometry(self.names[index], self.elevator_id)
         in_car = (point_in_polygon(position.x, position.y, list(geometry.car_polygon))
                   and abs(position.z - self.car_z()) < .5)
@@ -98,18 +132,11 @@ class ElevatorRosAdapter:
 
     def tick(self, now=None):
         now = self.now() if now is None else now
-        for frame in self.model.step(now):
-            beacon = ElevatorBeacon(
-                event=frame.event, location=frame.location, floor_code=frame.floor_code,
-                sequence=frame.sequence, ack_sequence=frame.ack_sequence,
-                rssi_dbm=max(-128, min(127, frame.rssi_dbm)), source='sim')
-            beacon.header.stamp = Time(nanoseconds=round(max(0., frame.stamp) * 1e9)).to_msg()
-            self.beacon_pub.publish(beacon)
-        for record in self.model.take_statuses():
-            self.command_status_pub.publish(command_status(record))
+        self.model.step(now)
         status = self.model.status()
         status.update(elevator_id=self.elevator_id, car_z_m=self.car_z(), sim_time=now,
                       robot_level=self.model.robot_level, robot_in_car=self.model.robot_in_car)
+        self.recognizer.tick(status)
         key = {k: v for k, v in status.items() if k not in ('sim_time', 'hold_remaining_s')}
         if key != self.last_status or now >= self.next_status:
             self.status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
@@ -125,10 +152,12 @@ class ElevatorSimNode(Node):
         path = self.declare_parameter('floors_config', '').value
         start = self.declare_parameter('start_floor', '').value or None
         seed = int(self.declare_parameter('seed', 0).value)
-        leak = float(self.declare_parameter('leak_probability', .2).value)
+        press = float(self.declare_parameter('press_delay_s', 1.0).value)
+        confirm = float(self.declare_parameter('confirm_delay_s', 1.0).value)
+        auto = bool(self.declare_parameter('auto_confirm', True).value)
         building = building or load_floor_config(path or None)
         self.adapter = ElevatorRosAdapter(self, building, start_floor=start, seed=seed,
-                                          leak_probability=leak)
+                                          press_delay_s=press, confirm_delay_s=confirm, auto_confirm=auto)
         self.create_timer(.02, self.tick)
         self.get_logger().info(
             f'Simulated elevator {self.adapter.elevator_id}: floors {self.adapter.names}, '
@@ -139,56 +168,36 @@ class ElevatorSimNode(Node):
             self.adapter.tick()
 
 
-def command_status(record):
-    """ElevatorSim CommandStatus (or its JSON dict) -> ElevatorCommandStatus."""
-    get = record.get if isinstance(record, dict) else lambda key: getattr(record, key)
-    message = ElevatorCommandStatus(
-        cmd_seq=int(get('cmd_seq')) & 0xff, status=int(get('status')),
-        device_result=int(get('device_result')) & 0xff, target=int(get('target')) & 0xff,
-        attempts=int(get('attempts')) & 0xff, source='sim')
-    message.header.stamp = Time(nanoseconds=round(max(0., float(get('stamp'))) * 1e9)).to_msg()
-    return message
-
-
 class ElevatorRelayNode(Node):
-    """Typed elevator topics <-> the Isaac process's JSON topics (Isaac has no custom msgs)."""
-
+    """Translate typed requests to Isaac JSON and recognize arrival from fresh ground truth."""
     def __init__(self, **kwargs):
         super().__init__('elevator_sim_relay', **kwargs)
-        self.beacon_pub = self.create_publisher(ElevatorBeacon, 'elevator/beacon', 50)
-        self.command_status_pub = self.create_publisher(
-            ElevatorCommandStatus, 'elevator/command_status', 20)
-        self.raw_pub = self.create_publisher(String, 'sim/elevator/command_raw', 20)
-        self.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 20)
-        self.create_subscription(String, 'sim/elevator/beacon_raw', self.on_raw, 50)
-        self.create_subscription(String, 'sim/elevator/command_status_raw', self.on_status_raw, 20)
+        auto = bool(self.declare_parameter('auto_confirm', True).value)
+        delay = float(self.declare_parameter('confirm_delay_s', 1.0).value)
+        self.recognizer = ArrivalRecognizer(self, auto, delay)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.raw_pub = self.create_publisher(String, '/sim/elevator/request_raw', latched)
+        self.create_subscription(ElevatorRequest, '/elevator/request', self.on_request, latched)
+        self.create_subscription(String, '/sim/elevator/status', self.on_status, latched)
+        self.status, self.status_at = None, -math.inf
+        self.create_timer(.05, self.tick)
 
-    def on_command(self, message):
-        self.raw_pub.publish(String(data=json.dumps({
-            'command': message.command, 'floor_code': message.floor_code,
-            'direction': message.direction, 'sequence': message.sequence,
-            'repeat': message.repeat})))
+    def on_request(self, message):
+        self.raw_pub.publish(String(data=json.dumps({key: getattr(message, key) for key in
+            ('kind', 'start_floor', 'target_floor', 'direction', 'sequence')})))
 
-    def on_status_raw(self, message):
+    def on_status(self, message):
         try:
-            for record in json.loads(message.data):
-                self.command_status_pub.publish(command_status(record))
-        except (ValueError, KeyError, TypeError) as error:
-            self.get_logger().error(f'Invalid simulated command status: {error}')
+            status = json.loads(message.data)
+            if not isinstance(status, dict):
+                return
+            self.status, self.status_at = status, self.recognizer.now()
+        except (ValueError, TypeError):
+            pass
 
-    def on_raw(self, message):
-        try:
-            frames = json.loads(message.data)
-            for frame in frames:
-                beacon = ElevatorBeacon(
-                    event=int(frame['event']), location=int(frame['location']),
-                    floor_code=int(frame['floor_code']), sequence=int(frame['sequence']) & 0xff,
-                    ack_sequence=int(frame['ack_sequence']) & 0xff,
-                    rssi_dbm=max(-128, min(127, int(frame['rssi_dbm']))), source='sim')
-                beacon.header.stamp = Time(nanoseconds=round(max(0., float(frame['stamp'])) * 1e9)).to_msg()
-                self.beacon_pub.publish(beacon)
-        except (ValueError, KeyError, TypeError) as error:
-            self.get_logger().error(f'Invalid simulated beacon frame: {error}')
+    def tick(self):
+        if 0 <= self.recognizer.now() - self.status_at < 1.0:
+            self.recognizer.tick(self.status)
 
 
 def relay_main(args=None):

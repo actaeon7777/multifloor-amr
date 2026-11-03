@@ -32,21 +32,28 @@ def raw():
     return yaml.safe_load(CONFIG.read_text(encoding='utf-8'))
 
 
-def test_three_floors_with_unique_beacons(config):
+def test_three_floors_with_unique_levels(config):
     assert config.default_floor == '4F'
     assert sorted(config.floors) == ['3F', '4F', '5F']
-    assert {f.beacon_floor_code for f in config.floors.values()} == {3, 4, 5}
-    assert config.floor_by_beacon_code(5).name == '5F'
-    assert config.floor_by_beacon_code(0) is None
+    assert {f.level for f in config.floors.values()} == {3, 4, 5}
+
+
+def test_sill_ignore_height_is_per_floor_and_bounded(config, raw, tmp_path):
+    assert config.elevator_geometry('3F', 'E1').sill_ignore_height_m == .10
+    assert config.elevator_geometry('4F', 'E1').sill_ignore_height_m == 0.
+    assert config.elevator_geometry('5F', 'E1').sill_ignore_height_m == 0.
+    bad = copy.deepcopy(raw)
+    bad['floors']['4F']['elevators']['E1']['sill_ignore_height_m'] = .2
+    path = tmp_path / 'floors.yaml'
+    path.write_text(yaml.safe_dump(bad, allow_unicode=True), encoding='utf-8')
+    with pytest.raises(FloorConfigError, match='sill_ignore_height_m'):
+        load_floor_config(path, package_root=PACKAGE)
 
 
 def test_floors_without_a_map_are_pass_floors(config):
-    # Hall beacons are installed on 1F-7F; floors without a map are only for floor tracking.
     assert sorted(config.pass_floors) == ['1F', '2F', '6F', '7F']
-    codes = {f.beacon_floor_code for f in (*config.floors.values(), *config.pass_floors.values())}
-    assert codes == set(range(1, 8))
-    assert config.pass_floor_by_beacon_code(6).name == '6F'
-    assert config.floor_by_beacon_code(6) is None and config.pass_floor_by_beacon_code(4) is None
+    levels = {f.level for f in (*config.floors.values(), *config.pass_floors.values())}
+    assert levels == set(range(1, 8))
     with pytest.raises(FloorConfigError):
         config.floor('6F')  # Never a mission goal or a map.
 
@@ -167,7 +174,8 @@ def test_elevator_door_matches_generated_layer(config):
         centres = [tuple(float(v) for v in c.split(',')) for c in closed]
         centre = (sum(c[0] for c in centres) / 2, sum(c[1] for c in centres) / 2)
         door = floor.elevators['E1'].door_center
-        assert math.dist(centre, door) < 0.05, (name, centre, door)
+        # The sim layers share one shaft; real door_center may differ by up to 0.10 m (3F).
+        assert math.dist(centre, door) < 0.10, (name, centre, door)
 
 
 def test_wait_and_exit_poses_face_the_right_way(config):
@@ -215,10 +223,11 @@ def _broken(raw, mutate):
 @pytest.mark.parametrize('mutate, message', [
     (lambda d: d.update(schema_version=2), 'schema_version'),
     (lambda d: d.update(default_floor='9F'), 'default_floor'),
-    (lambda d: d['floors']['5F'].update(beacon_floor_code=3), 'duplicate beacon_floor_code'),
     (lambda d: d['floors']['5F'].update(level=4), 'duplicate level'),
-    (lambda d: d['floors']['3F'].update(beacon_floor_code=0), 'non-zero int8'),
-    (lambda d: d['floors']['3F'].update(beacon_floor_code=200), 'non-zero int8'),
+    (lambda d: d['floors']['5F'].update(level=True), 'integer'),
+    (lambda d: d['pass_floors']['6F'].update(level=6.5), 'integer'),
+    (lambda d: d['pass_floors']['6F'].pop('level'), 'integer'),
+    (lambda d: d['pass_floors']['6F'].update(level=7), 'duplicate level'),
     (lambda d: d['floors']['3F'].update(provisional_copy_of='2F'), 'provisional_copy_of'),
     (lambda d: d['floors']['3F'].update(real_enabled='yes'), 'real_enabled'),
     (lambda d: d['floors']['3F'].update(map=''), 'map'),
@@ -231,12 +240,8 @@ def _broken(raw, mutate):
     (lambda d: d['elevators']['E1'].update(car_interior_m=[1.87, -1]), 'positive'),
     (lambda d: d['sim'].update(floor_height_m=0), 'floor_height_m'),
     (lambda d: d.update(floors={}), 'no floors'),
-    (lambda d: d['floors']['3F'].update(beacon_floor_code=21), '-8..20'),
-    (lambda d: d['pass_floors'].update({'4F': {'level': 9, 'beacon_floor_code': 9}}), 'also a mapped'),
+    (lambda d: d['pass_floors'].update({'4F': {'level': 9}}), 'also a mapped'),
     (lambda d: d['pass_floors']['6F'].update(level=5), 'duplicate level'),
-    (lambda d: d['pass_floors']['6F'].update(beacon_floor_code=4), 'duplicate beacon_floor_code'),
-    (lambda d: d['pass_floors']['6F'].update(beacon_floor_code=0), 'non-zero int8'),
-    (lambda d: d['pass_floors'].update({'8F': {'level': 8}}), 'non-zero int8'),
 ])
 def test_invalid_configs_are_rejected(raw, mutate, message):
     with pytest.raises(FloorConfigError, match=message):

@@ -283,6 +283,25 @@ def test_manual_rejects_maneuver_lease(h):
     assert not h.manager.lease_active()
 
 
+def test_over_limit_maneuver_command_is_dropped_with_a_warning(h, monkeypatch):
+    """2026-11-02: a 0.7 rad/s turn above max_angular_speed 0.6 silently stopped the robot."""
+    from unittest.mock import Mock
+    logger = Mock()
+    monkeypatch.setattr(h.manager, 'get_logger', lambda: logger)
+    h.set_mode('AUTO')
+    assert h.manager.on_maneuver_lease(SetBool.Request(data=True), SetBool.Response()).success
+    command = Twist()
+    command.angular.z = h.manager.settings['max_angular_speed'] + .1
+    h.manager.on_maneuver_command(command)
+    assert h.manager.maneuver_command is None
+    logger.warning.assert_called_once()
+    assert 'Dropping maneuver command' in logger.warning.call_args.args[0]
+    command.angular.z = h.manager.settings['max_angular_speed']
+    h.manager.on_maneuver_command(command)
+    assert h.manager.maneuver_command is command
+    assert logger.warning.call_count == 1
+
+
 def test_cancel_topic_goal_without_nav2_rviz_panel(h):
     """Standard RViz SetGoal plus the documented cancel-all service."""
     cancel = h.probe.create_client(CancelGoal, '/navigate_to_pose/_action/cancel_goal')

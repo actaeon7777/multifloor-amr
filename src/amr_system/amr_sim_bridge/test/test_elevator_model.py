@@ -1,229 +1,233 @@
-"""Simulated elevator devices: only beacon/ack frames out, car and doors move plausibly."""
-
+"""Delayed human requests and car/door dynamics without ROS."""
 import pytest
-
 from amr_sim_bridge.elevator_model import (
-    CMD_CAR_FLOOR, CMD_DOOR_OPEN, CMD_HALL_CALL, DIR_DOWN, DIR_NONE, DIR_UP, EVENT_BUTTON_ACK,
-    EVENT_PRESENCE, LOCATION_CAR, LOCATION_HALL, STATUS_COMPLETED, STATUS_NO_ROUTE, ElevatorSim,
+    ElevatorSim, KIND_CALL, KIND_CAR_FLOOR, KIND_CANCEL, DIR_DOWN, DIR_NONE, DIR_UP,
 )
 
-FLOORS = [('3F', 3), ('4F', 4), ('5F', 5)]
+FLOORS = ['3F', '4F', '5F']
 
 
 def sim(**kwargs):
-    kwargs.setdefault('start_floor', '3F')
-    model = ElevatorSim(FLOORS, **kwargs)
-    model.set_robot(1., False)  # robot standing in the 4F hall
-    return model
+    return ElevatorSim(FLOORS, **kwargs)
 
 
-def run(model, until, start=None, dt=.05):
-    frames, t = [], model.now if start is None else start
-    while t < until - 1e-9:
-        t = round(t + dt, 6)
-        frames.extend(model.step(t))
-    return frames
+def run(model, until, dt=.05):
+    while model.now < until - 1e-9:
+        model.step(round(model.now + dt, 6))
 
 
-def acks(frames):
-    return [f for f in frames if f.event == EVENT_BUTTON_ACK]
-
-
-def presence(frames, code=None, location=LOCATION_HALL):
-    return [f for f in frames if f.event == EVENT_PRESENCE and f.location == location
-            and (code is None or f.floor_code == code)]
-
-
-def test_hall_call_brings_the_car_and_door_cycles():
-    model = sim(seed=3)
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_DOWN, 17)
-    frames = run(model, .3)
-    (ack,) = acks(frames)
-    assert (ack.location, ack.floor_code, ack.ack_sequence) == (LOCATION_HALL, 4, 17)
-    assert model.status()['moving']
-    run(model, 6.)  # 3.6 m at 1 m/s, 0.5 m/s^2: 5.6 s
-    status = model.status()
-    assert status['car_floor'] == '4F' and not status['moving'] and status['door'] in ('OPENING', 'OPEN')
-    assert status['hall_calls'] == []
-    run(model, 6. + 1.5 + 5.9)  # opened, minimum hold not yet over
-    assert model.status()['door'] == 'OPEN'
-    run(model, 6. + 1.5 + 10. + 1.6)
+def test_press_delay_then_hall_call_arrives_and_opens():
+    model = sim(press_delay_s=2.)
+    model.request(0., KIND_CALL, '4F', '3F', DIR_DOWN)
+    run(model, 1.95)
+    assert not model.status()['moving'] and model.status()['hall_calls'] == []
+    run(model, 2.)
+    assert model.status()['moving'] and model.status()['hall_calls'] == ['4F']
+    assert model.hall_directions[1] == DIR_DOWN
+    run(model, 9.2)
+    assert model.status()['car_floor'] == '4F' and model.status()['door'] == 'OPEN'
+    assert model.status()['hall_calls'] == []
+    run(model, 25.)
     assert model.status()['door'] == 'CLOSED'
+
+
+def test_car_call_travels_to_named_target():
+    model = sim(start_floor='4F')
+    model.request(0., KIND_CAR_FLOOR, '', '5F', DIR_NONE)
+    run(model, .95)
+    assert model.status()['car_floor'] == '4F'
+    run(model, 1.)
+    assert model.status()['moving']
+    run(model, 8.2)
+    assert model.status()['car_floor'] == '5F' and model.status()['door'] == 'OPEN'
+
+
+def test_cancel_does_not_erase_registered_or_pending_calls():
+    model = sim()
+    model.request(0., KIND_CAR_FLOOR, '', '5F', DIR_NONE)
+    model.request(.5, KIND_CANCEL, '', '', DIR_NONE)
+    run(model, 1.)
+    model.request(1., KIND_CANCEL, '', '', DIR_NONE)
+    assert model.status()['car_calls'] == ['5F']
+    run(model, 12.)
+    assert model.status()['car_floor'] == '5F'
 
 
 @pytest.mark.parametrize('seed', range(20))
-def test_door_hold_time_stays_in_the_configured_range(seed):
+def test_configured_door_hold_and_obstruction(seed):
     model = sim(seed=seed, start_floor='4F')
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_UP, 1)
-    run(model, .2)
-    hold = model.status()['hold_remaining_s'] - 1.5
-    assert 6. - .06 <= hold <= 10.
-
-
-def test_hall_beacons_announce_every_second_with_leakage():
-    model = sim(seed=1, leak_probability=.5)
-    frames = run(model, 20., start=0.)
-    own = presence(frames, 4)
-    assert len(own) == 20 and all(-53 <= f.rssi_dbm <= -47 for f in own)
-    assert [f.sequence for f in own] == list(range(20))
-    leaked = presence(frames, 3) + presence(frames, 5)
-    assert 0 < len(leaked) < 40 and all(f.rssi_dbm <= -79 for f in leaked)
-    assert all(f.location == LOCATION_HALL for f in frames)
-
-
-def test_inside_the_car_only_the_open_floor_is_heard_clearly():
-    model = sim(seed=2, leak_probability=0., start_floor='4F')
-    model.set_robot(1., True)
-    model.step(0.)
-    model.command(0., CMD_CAR_FLOOR, 5, DIR_NONE, 3)
-    frames = run(model, .3)
-    (ack,) = acks(frames)
-    assert (ack.location, ack.floor_code) == (LOCATION_CAR, 0)
-    travel = run(model, 6.)
-    assert presence(travel) == []  # doors closed / moving: metal car
-    model.set_robot(2., True)
-    arrived = run(model, 9.)
-    assert model.status()['car_floor'] == '5F'
-    heard = presence(arrived)
-    assert heard and {f.floor_code for f in heard} == {5} and all(f.rssi_dbm <= -55 for f in heard)
-
-
-def test_door_open_button_and_obstruction_keep_the_door_open():
-    model = sim(start_floor='4F', faults={'hold_time_s': 6.})
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_UP, 1)
-    run(model, 7.)
-    model.command(7., CMD_DOOR_OPEN, 0, DIR_NONE, 2)
-    run(model, 12.)
-    assert model.status()['door'] == 'OPEN'  # 7.2 + 6 s hold
-    run(model, 13.8)
-    assert model.status()['door'] == 'CLOSING'
+    model.request(0., KIND_CALL, '4F', '5F', DIR_UP)
+    run(model, 1.)
+    assert 6. <= model.status()['hold_remaining_s'] - model.door_move_s <= 10.
+    run(model, 3.)
     model.obstruct(True)
-    run(model, 14.5)
-    assert model.status()['door'] in ('OPENING', 'OPEN')
-    model.obstruct(False)
     run(model, 30.)
+    assert model.status()['door'] == 'OPEN'
+    model.obstruct(False)
+    run(model, 45.)
     assert model.status()['door'] == 'CLOSED'
 
 
-def test_unknown_floor_and_malformed_commands_do_nothing():
-    model = sim()
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 9, DIR_UP, 1)
-    model.command(0., CMD_HALL_CALL, 4, DIR_NONE, 2)
-    model.command(0., CMD_CAR_FLOOR, 9, DIR_NONE, 3)
-    model.command(0., 77, 4, DIR_NONE, 4)
-    model.command(0., CMD_DOOR_OPEN, 0, DIR_NONE, 5, repeat=16)
-    assert acks(run(model, 2.)) == [] and not model.status()['moving']
-    # The relay reports a hall call it cannot route (0x311 NO_ROUTE).
-    assert [(s.cmd_seq, s.status) for s in model.take_statuses()] == [(1, STATUS_NO_ROUTE)]
-
-
-def test_door_open_repeat_presses_every_period_and_restarts():
-    model = sim(start_floor='4F', faults={'hold_time_s': 6.})
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_UP, 1)
-    run(model, 7.)
-    model.command(7., CMD_DOOR_OPEN, 0, DIR_NONE, 2, repeat=10)
-    frames = run(model, 8.)
-    assert len(acks(frames)) == 1  # One acknowledgement: the repeats have started.
-    statuses = model.take_statuses()
-    assert [(s.cmd_seq, s.status, s.target) for s in statuses][-1] == (2, STATUS_COMPLETED, 0x21)
-    run(model, 19.)  # Last of 10 presses at ~16.2 s, then the 6 s hold.
-    assert model.status()['door'] == 'OPEN' and model.status()['door_open_repeats_left'] == 0
-    run(model, 24.)
-    assert model.status()['door'] in ('CLOSING', 'CLOSED')
-    model.command(24., CMD_DOOR_OPEN, 0, DIR_NONE, 3, repeat=3)
-    run(model, 26.)
-    assert model.status()['door_open_repeats_left'] == 1
-    model.command(26., CMD_DOOR_OPEN, 0, DIR_NONE, 4, repeat=5)  # Restart, not add.
-    run(model, 26.5)
-    assert model.status()['door_open_repeats_left'] == 4
-
-
-def test_car_beacon_is_heard_inside_or_through_the_open_door():
-    model = sim(start_floor='4F', leak_probability=0., faults={'hold_time_s': 6.})
-    model.step(0.)
-    assert presence(run(model, 3.), location=LOCATION_CAR) == []  # Door closed, robot in the hall.
-    model.command(3., CMD_HALL_CALL, 4, DIR_UP, 1)
-    heard = presence(run(model, 7.), location=LOCATION_CAR)
-    assert heard and {f.floor_code for f in heard} == {0}
-    model.set_robot(1., True)
-    run(model, 20.)
-    inside = presence(run(model, 23.), location=LOCATION_CAR)
-    assert model.status()['door'] == 'CLOSED' and inside
-
-
-def test_faults_drop_delay_duplicate_and_lag():
-    model = sim(start_floor='4F', faults={'drop_ack_probability': 1.})
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_UP, 1)
-    assert acks(run(model, 1.)) == []
-    assert model.status()['door'] in ('OPENING', 'OPEN')  # pressed, only the report was lost
-
-    model = sim(start_floor='4F', faults={'ack_extra_delay_s': 3., 'duplicate_probability': 1.,
-                                          'stamp_lag_s': 2.})
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_UP, 9)
-    assert acks(run(model, 3.)) == []
-    late = acks(run(model, 3.5))
-    assert len(late) == 2 and late[0] is late[1]
-    assert late[0].stamp == pytest.approx(3.2 - 2., abs=.06)
-
-
-def test_reordered_frames_are_delivered_later():
-    model = sim(seed=0, faults={'reorder_probability': 1.})
-    frames = run(model, 5., start=0.)
-    sequences = [f.sequence for f in presence(frames, 4)]
-    assert sorted(sequences) == list(range(len(sequences))) and sequences != sorted(sequences)
-
-
-def test_unexpected_stop_door_failure_and_wrong_floor():
-    model = sim(start_floor='3F', faults={'stop_at_floor_code': 4})
-    model.set_robot(0., True)
-    model.step(0.)
-    model.command(0., CMD_CAR_FLOOR, 5, DIR_NONE, 1)
-    run(model, 6.5)
-    assert model.status()['car_floor'] == '4F'      # someone else's stop
-    assert model.status()['car_calls'] == ['5F']    # our call is kept
+def test_other_passenger_stop_preserves_target_call():
+    model = sim(faults={'stop_at_floor': '4F'})
+    model.request(0., KIND_CAR_FLOOR, '', '5F', DIR_NONE)
+    run(model, 8.2)
+    assert model.status()['car_floor'] == '4F' and model.status()['door'] == 'OPEN'
+    assert model.status()['car_calls'] == ['5F']
     run(model, 40.)
     assert model.status()['car_floor'] == '5F'
 
-    model = sim(start_floor='3F', faults={'door_never_opens': True})
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_DOWN, 1)
+
+def test_door_and_press_failure():
+    model = sim(faults={'door_never_opens': True})
+    model.request(0., KIND_CALL, '4F', '3F', DIR_DOWN)
     run(model, 20.)
     assert model.status()['car_floor'] == '4F' and model.status()['door'] == 'CLOSED'
-
     model = sim(faults={'button_fails': True})
-    model.step(0.)
-    model.command(0., CMD_HALL_CALL, 4, DIR_DOWN, 1)
-    assert acks(run(model, 10.)) == [] and model.status()['car_floor'] == '3F'
-
-    model = sim(faults={'wrong_floor_code': 5}, leak_probability=0.)
-    assert {f.floor_code for f in presence(run(model, 3., start=0.))} == {4, 5}
+    model.request(0., KIND_CALL, '4F', '3F', DIR_DOWN)
+    run(model, 20.)
+    assert model.status()['car_floor'] == '3F'
 
 
-@pytest.mark.parametrize('kwargs', [
-    dict(floors=[]), dict(floors=[('3F', 3), ('3F', 4)]), dict(floors=[('3F', 0)]),
-    dict(floors=FLOORS, floor_height_m=0.), dict(floors=FLOORS, open_time_s=(10., 6.)),
-])
-def test_invalid_setup_is_rejected(kwargs):
+def test_unknown_floor_and_invalid_requests_are_ignored():
+    model = sim()
+    for args in [(KIND_CALL, '9F', '3F', DIR_UP), (KIND_CALL, '4F', '3F', DIR_NONE),
+                 (KIND_CAR_FLOOR, '', '9F', DIR_NONE), (77, '4F', '5F', DIR_UP)]:
+        model.request(0., *args)
+    run(model, 20.)
+    assert model.status()['car_floor'] == '3F' and model.status()['door'] == 'CLOSED'
+
+
+@pytest.mark.parametrize('kwargs', [dict(floors=[]), dict(floors=['3F','3F']), dict(floors=['']),
+    dict(floors=FLOORS, floor_height_m=0), dict(floors=FLOORS, open_time_s=(10,6)),
+    dict(floors=FLOORS, press_delay_s=-1), dict(floors=FLOORS, press_delay_s=float('nan'))])
+def test_invalid_setup(kwargs):
     with pytest.raises(ValueError):
         ElevatorSim(**kwargs)
-    model = ElevatorSim(FLOORS)
     with pytest.raises(ValueError):
-        model.set_faults(no_such_fault=1)
+        sim().set_faults(no_such_fault=1)
 
 
-def test_drop_next_acks_is_deterministic():
-    model = sim(start_floor='4F', faults={'drop_next_acks': 2})
-    model.step(0.)
-    frames = []
-    for sequence in (1, 2, 3):
-        model.command(model.now, CMD_HALL_CALL, 4, DIR_UP, sequence)
-        frames += run(model, model.now + .5)
-    assert [f.ack_sequence for f in acks(frames)] == [3]
-    assert 'drop_next_acks' not in model.status()['faults']
+@pytest.fixture
+def recognizer():
+    """Generated messages and a fake clock/publisher; no ROS node or executor is started."""
+    pytest.importorskip('rclpy')
+    from types import SimpleNamespace
+    from builtin_interfaces.msg import Time
+    from amr_sim_bridge.elevator_node import ArrivalRecognizer
+    sent, callbacks = [], []
+    clock = SimpleNamespace(nanoseconds=0, to_msg=lambda: Time(sec=clock.nanoseconds // 10**9))
+    node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: clock),
+                           create_publisher=lambda *_args: SimpleNamespace(publish=sent.append),
+                           create_subscription=lambda _type, _topic, callback, _qos: callbacks.append(callback))
+    return ArrivalRecognizer(node), clock, sent
+
+
+def test_auto_confirm_delay_truth_and_once_per_candidate(recognizer):
+    from types import SimpleNamespace
+    model, clock, sent = recognizer
+    state = SimpleNamespace(awaiting_confirm=True, zone=2, floor='4F', candidate_id=7)
+    model.on_state(state)
+    truth = dict(car_floor='4F', moving=False, door='OPEN')
+    clock.nanoseconds = 999_000_000
+    model.tick(truth)
+    assert not sent
+    clock.nanoseconds = 1_000_000_000
+    model.tick(truth)
+    assert sent[0].accepted and sent[0].source == 3 and sent[0].header.stamp.sec == 1
+    assert sent[0].candidate_id == 7 and sent[0].actual_floor == ''
+    for _ in range(3):
+        clock.nanoseconds += 1_000_000_000
+        model.on_state(state)
+        model.tick(truth)
+    assert len(sent) == 1
+    state.awaiting_confirm = False
+    model.on_state(state)
+    state.awaiting_confirm = True
+    model.on_state(state)
+    clock.nanoseconds += 1_000_000_000
+    model.tick(truth)
+    assert len(sent) == 1  # awaiting false/true cannot rearm the same ID
+    state.candidate_id = 8  # same floor, no intervening false required
+    model.on_state(state)
+    model.tick(truth)
+    assert len(sent) == 1  # new candidate starts a fresh delay
+    clock.nanoseconds += 1_000_000_000
+    model.tick(dict(car_floor='3F', moving=False, door='OPEN'))
+    assert len(sent) == 2 and not sent[-1].accepted and sent[-1].candidate_id == 8
+    assert sent[-1].actual_floor == '3F'
+
+
+@pytest.mark.parametrize('truth', [dict(car_floor='4F', moving=True, door='OPEN'),
+                                    dict(car_floor='4F', moving=False, door='CLOSED'),
+                                    dict(car_floor='4F', moving=False, door='OPENING')])
+def test_auto_confirm_requires_stopped_car_and_open_door(recognizer, truth):
+    from types import SimpleNamespace
+    model, clock, sent = recognizer
+    model.on_state(SimpleNamespace(awaiting_confirm=True, zone=2, floor='4F', candidate_id=7))
+    clock.nanoseconds = 1_000_000_000
+    model.tick(truth)
+    assert len(sent) == 1 and not sent[0].accepted and sent[0].actual_floor == ''
+
+
+def test_auto_confirm_disabled_or_withdrawn_candidate(recognizer):
+    from types import SimpleNamespace
+    model, clock, sent = recognizer
+    state = SimpleNamespace(awaiting_confirm=True, zone=2, floor='4F', candidate_id=7)
+    model.enabled = False
+    model.on_state(state)
+    clock.nanoseconds = 1_000_000_000
+    model.tick(dict(car_floor='4F', moving=False, door='OPEN'))
+    assert not sent
+    model.enabled = True
+    state.awaiting_confirm = False
+    model.on_state(state)
+    model.tick(dict(car_floor='4F', moving=False, door='OPEN'))
+    assert not sent
+
+
+def test_new_candidate_replaces_pending_confirmation_for_same_floor(recognizer):
+    from types import SimpleNamespace
+    model, clock, sent = recognizer
+    state = SimpleNamespace(awaiting_confirm=True, zone=2, floor='4F', candidate_id=7)
+    model.on_state(state)
+    clock.nanoseconds = 500_000_000
+    state.candidate_id = 8
+    model.on_state(state)
+    truth = dict(car_floor='4F', moving=False, door='OPEN')
+    clock.nanoseconds = 1_000_000_000
+    model.tick(truth)
+    assert not sent
+    clock.nanoseconds = 1_500_000_000
+    model.tick(truth)
+    assert [m.candidate_id for m in sent] == [8]
+
+
+def test_adapter_request_subscription_retains_only_latest():
+    pytest.importorskip('rclpy')
+    from types import SimpleNamespace
+    from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+    from amr_sim_bridge.elevator_node import ElevatorRosAdapter
+    from amr_stack.floor_config import load_floor_config
+    subscriptions = {}
+    node = SimpleNamespace(
+        create_publisher=lambda *_args: SimpleNamespace(publish=lambda _message: None),
+        create_subscription=lambda _type, topic, _callback, qos: subscriptions.update({topic: qos}))
+    ElevatorRosAdapter(node, load_floor_config())
+    qos = subscriptions['/elevator/request']
+    assert qos.depth == 1 and qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
+    assert qos.reliability == ReliabilityPolicy.RELIABLE
+
+
+def test_auto_confirm_pass_floor_and_restart(recognizer):
+    from types import SimpleNamespace
+    model, clock, sent = recognizer
+    model.on_state(SimpleNamespace(awaiting_confirm=True, zone=2, floor='4F', candidate_id=7))
+    clock.nanoseconds = 1_000_000_000
+    model.tick(dict(car_floor='1F', moving=False, door='OPEN'))
+    assert sent[-1].actual_floor == '1F' and not sent[-1].accepted
+    model.on_state(SimpleNamespace(awaiting_confirm=False, zone=2, floor='', candidate_id=0))
+    model.on_state(SimpleNamespace(awaiting_confirm=True, zone=2, floor='4F', candidate_id=1))
+    clock.nanoseconds = 2_000_000_000
+    model.tick(dict(car_floor='4F', moving=False, door='OPEN'))
+    assert len(sent) == 2 and sent[-1].accepted and sent[-1].actual_floor == ''

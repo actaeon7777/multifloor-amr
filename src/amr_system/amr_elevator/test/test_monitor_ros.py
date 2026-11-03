@@ -12,13 +12,14 @@ if os.environ.get('AMR_RUN_ELEVATOR_MONITOR_TESTS') != '1':
     pytest.skip('Set AMR_RUN_ELEVATOR_MONITOR_TESTS=1 in domain 195', allow_module_level=True)
 
 from amr_elevator_interfaces.msg import (
-    ElevatorBeacon, ElevatorCommand, ElevatorDoorState, FloorEvent, FloorState,
+    ElevatorRequest, FloorArrivalConfirm, ElevatorDoorState, FloorEvent, FloorState, FloorVisionGuess,
 )
 from amr_elevator_interfaces.srv import SetCurrentFloor
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
@@ -89,8 +90,10 @@ def ros():
         scan=probe.create_publisher(LaserScan, 'scan', qos_profile_sensor_data),
         odom=probe.create_publisher(Odometry, 'odometry/filtered', 10),
         status=probe.create_publisher(String, 'localization/status', latched),
-        beacon=probe.create_publisher(ElevatorBeacon, 'elevator/beacon', 10),
-        command=probe.create_publisher(ElevatorCommand, 'elevator/command', 10))
+        confirm=probe.create_publisher(FloorArrivalConfirm, '/floor/arrival_confirm', 10),
+        guess=probe.create_publisher(FloorVisionGuess, '/floor/vision_guess', 5),
+        request=probe.create_publisher(ElevatorRequest, '/elevator/request',
+            QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)))
     static = StaticTransformBroadcaster(probe)
     transforms = []
     for parent, child in (('map', 'odom'), ('base_footprint', 'laser')):
@@ -115,10 +118,11 @@ def ros():
     rclpy.shutdown()
 
 
-def test_full_ride_and_operator_override(ros):
-    node = ElevatorMonitor(building=load_floor_config())
+@pytest.mark.parametrize('vision_floor', [None, '4F', '2F'])
+def test_full_ride_and_operator_override(ros, vision_floor):
+    overrides = [] if vision_floor is None else [Parameter('vision_wait_s', value=1.5)]
+    node = ElevatorMonitor(building=load_floor_config(), parameter_overrides=overrides)
     ros.executor.add_node(node)
-    seq = {'n': 0}
 
     def place(pose, doors_open, ready):
         odom = Odometry()
@@ -132,21 +136,15 @@ def test_full_ride_and_operator_override(ros):
             ros.pubs.scan.publish(scan(pose, doors_open))
             ros.spin(.12)
 
-    def beacon(code, event=ElevatorBeacon.EVENT_PRESENCE, location=ElevatorBeacon.LOCATION_HALL, ack=0):
-        seq['n'] += 1
-        message = ElevatorBeacon(event=event, location=location, floor_code=code,
-                                 sequence=seq['n'] & 0xff, ack_sequence=ack, rssi_dbm=-55, source='sim')
-        message.header.stamp = node.get_clock().now().to_msg()
-        ros.pubs.beacon.publish(message)
-        ros.spin(.2)
-
     def names():
         return [e.event for e in ros.events]
 
     hall = (10.575, 3.31, math.pi)
     place(hall, False, True)
-    beacon(4)
-    assert ros.spin(2., lambda: ros.states and ros.states[-1].confidence == 'BEACON')
+    assert ros.set_floor.wait_for_service(timeout_sec=2.)
+    future = ros.set_floor.call_async(SetCurrentFloor.Request(floor='4F'))
+    assert ros.spin(2., future.done) and future.result().success
+    assert ros.spin(2., lambda: ros.states and ros.states[-1].confidence == 'CONFIRMED')
     assert ros.doors[-1].state == ElevatorDoorState.CLOSED
 
     place(hall, True, True)
@@ -155,32 +153,49 @@ def test_full_ride_and_operator_override(ros):
     place(car, True, False)  # localization suspended inside the car
     assert ros.spin(2., lambda: ros.states[-1].zone == FloorState.ZONE_IN_ELEVATOR)
 
-    ros.pubs.command.publish(ElevatorCommand(command=ElevatorCommand.CMD_CAR_FLOOR, floor_code=3, sequence=40))
-    ros.spin(.2)
-    beacon(0, ElevatorBeacon.EVENT_BUTTON_ACK, ElevatorBeacon.LOCATION_CAR, ack=40)
+    ros.pubs.request.publish(ElevatorRequest(kind=ElevatorRequest.KIND_CAR_FLOOR,
+                                             target_floor='3F', sequence=40))
+    assert ros.spin(2., lambda: node.machine.car_target == '3F')
     for _ in range(5):
         place(car, False, False)
     assert ros.spin(3., lambda: ros.states[-1].confidence == 'TRANSIT')
     assert ros.states[-1].transit_to == '3F'
-    beacon(4)  # still heard while travelling: ignored
+    ros.spin(3.5)  # Minimum closed-door travel before opening.
     assert ros.states[-1].confidence == 'TRANSIT'
 
     place(car, True, False)
-    beacon(3)
-    assert ros.spin(2., lambda: ros.states[-1].floor == '3F' and ros.states[-1].confidence == 'BEACON')
+    if vision_floor is not None:
+        assert node.machine.t.arrival_wait_since is not None
+        guess = FloorVisionGuess(floor=vision_floor, score=.9, margin=.2, frames=4)
+        guess.header.stamp = ros.probe.get_clock().now().to_msg()
+        ros.pubs.guess.publish(guess)
+    assert ros.spin(2., lambda: ros.states[-1].awaiting_confirm)
+    asked_floor = vision_floor or '3F'
+    assert ros.states[-1].floor == asked_floor and ros.states[-1].confidence == 'ASSUMED'
+    assert ros.states[-1].candidate_source == ('VISION' if vision_floor else 'TARGET')
+    if vision_floor == '2F':
+        assert node.anchor_floor == '4F' and node.current_floor() == '4F'
+        assert node.geometry() == node.geometry('4F')  # no map exists for a pass floor
+    ros.pubs.confirm.publish(FloorArrivalConfirm(source=FloorArrivalConfirm.SOURCE_SIM,
+                                               floor=asked_floor, candidate_id=ros.states[-1].candidate_id,
+                                               accepted=vision_floor is None,
+                                               actual_floor='3F' if vision_floor else '', score=1.))
+    assert ros.spin(2., lambda: ros.states[-1].confidence == 'VERIFIED')
+    assert ros.states[-1].floor == '3F' and ros.states[-1].candidate_source == ''
+    if vision_floor:
+        # The event and the state are separate topics: wait for the event too.
+        assert ros.spin(2., lambda: any(e.event == 'ARRIVED' and e.detail == f'SIM corrected {vision_floor}->3F'
+                                        for e in ros.events)), [(e.event, e.detail) for e in ros.events]
     exit_pose = (10.775, 3.31, 0.)
     place((9.6, 3.31, 0.), True, False)
     place(exit_pose, True, False)
     assert ros.spin(2., lambda: ros.states[-1].zone == FloorState.ZONE_OUTSIDE)
     place(exit_pose, True, True)
     assert ros.spin(2., lambda: ros.states[-1].confidence == 'CONFIRMED')
-    assert names()[:6] == ['FLOOR_BEACON', 'ENTERED_ELEVATOR', 'DEPARTED', 'ARRIVED',
-                           'EXITED_ELEVATOR', 'FLOOR_CONFIRMED']
+    assert [name for name in names() if name != 'ARRIVED_OTHER_FLOOR'][:7] == [
+                           'FLOOR_SET_BY_OPERATOR', 'ENTERED_ELEVATOR', 'DEPARTED',
+                           'ARRIVAL_CANDIDATE', 'ARRIVED', 'EXITED_ELEVATOR', 'FLOOR_CONFIRMED']
 
-    # A warning event after info events must not crash the node (rclpy call-site severity).
-    beacon(5)
-    assert ros.spin(2., lambda: ros.states[-1].floor_conflict)
-    assert 'FLOOR_CONFLICT' in names()
     assert ros.set_floor.wait_for_service(timeout_sec=2.)
     future = ros.set_floor.call_async(SetCurrentFloor.Request(floor='5F'))
     assert ros.spin(2., future.done)

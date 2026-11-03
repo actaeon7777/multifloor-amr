@@ -90,7 +90,7 @@ class PatrolManager(Node):
     def on_floor(self, message):
         self.floor_state = message
         if self.patrol.active and (message.floor != self.patrol.route.floor
-                or message.confidence not in ('CONFIRMED', 'BEACON', 'ASSUMED')
+                or message.confidence not in ('CONFIRMED', 'VERIFIED', 'ASSUMED')
                 or message.zone == FloorState.ZONE_IN_ELEVATOR):
             self.abort('현재 층을 확인할 수 없어 순찰 중단')
 

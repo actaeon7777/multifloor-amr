@@ -142,3 +142,56 @@ def test_drive_heading_correction_scales_with_speed(error, speed):
     assert linear == pytest.approx(speed)
     assert abs(angular) == pytest.approx(min(.5, 1.5 * abs(error), max(.1, speed/.2)))
     assert (angular < 0.) == (error < 0.)
+
+
+@pytest.mark.parametrize('error', [-2., -.2, -.05, .05, .2, 2.])
+def test_default_turn_limits_reproduce_previous_command(error):
+    maneuver = LineManeuver((0., 1.))
+    assert maneuver._turn(error) == math.copysign(max(.15, min(.5, 1.2 * abs(error))), error)
+
+
+def test_turn_gain_and_minimum_turn_are_configurable():
+    from amr_elevator.maneuver import ManeuverLimits
+    maneuver = LineManeuver((0., 1.), limits=ManeuverLimits(turn_gain=2., min_turn=.08))
+    assert maneuver._turn(.2) == pytest.approx(.4)
+    assert maneuver._turn(-.01) == pytest.approx(-.08)
+    assert maneuver._turn(2.) == pytest.approx(.5)
+
+
+def test_shipped_tuning_matches_the_chosen_values():
+    from pathlib import Path
+    from types import SimpleNamespace
+    import yaml
+    from amr_elevator.door_detector import DoorDetector
+    from amr_elevator.maneuver import ManeuverLimits
+    from amr_elevator.mission_node import FloorMissionManager
+
+    config = yaml.safe_load((Path(__file__).resolve().parents[1] / 'config/elevator_tuning.yaml').read_text())
+    params = config['floor_mission_manager']['ros__parameters']
+    # 2026-11-02 plan A after the first recorded real rides (defaults stay the old values).
+    assert FloorMissionManager.limits(SimpleNamespace(p=params)) == ManeuverLimits(
+        max_speed=.45, accel=.5, decel=.4, max_turn=.6, turn_gain=1.8)
+    assert config['elevator_monitor']['ros__parameters']['arrival_settle_s'] == .5
+    assert params['space_announce_delay'] == 1.
+    door = DoorDetector()
+    sensor = config['elevator_monitor']['ros__parameters']
+    assert (sensor['door_open_ratio'], sensor['door_closed_ratio'], sensor['door_confirm_scans']) == (
+        door.open_ratio, door.closed_ratio, door.confirm_scans)
+    assert {key: params[key] for key in ('clear_confirm_s', 'space_margin', 'wall_margin', 'turn_margin',
+                                       'scan_max_age', 'depth_max_age', 'door_cancel_grace')} == {
+        'clear_confirm_s': .5, 'space_margin': .10, 'wall_margin': .12, 'turn_margin': .05,
+        'scan_max_age': .5, 'depth_max_age': .5, 'door_cancel_grace': 1.5,
+    }
+
+
+def test_tuning_stays_within_navigation_manager_forwarding_limits():
+    """navigation_manager drops maneuver commands above its limits (11-02 ALIGN_TIMEOUT)."""
+    from pathlib import Path
+    import yaml
+    root = Path(__file__).resolve().parents[2]  # src/amr_system
+    tuning = yaml.safe_load((root / 'amr_elevator/config/elevator_tuning.yaml').read_text())
+    nav = yaml.safe_load((root / 'amr_stack/config/navigation.yaml').read_text())
+    limits = nav['navigation_manager']['ros__parameters']
+    params = tuning['floor_mission_manager']['ros__parameters']
+    assert params['maneuver_speed'] <= limits['max_linear_speed']
+    assert params['maneuver_max_turn'] <= limits['max_angular_speed']

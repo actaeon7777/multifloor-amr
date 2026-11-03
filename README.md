@@ -89,7 +89,7 @@ Isaac Sim이 실차 드라이버 대신 같은 토픽을 발행한다 (`amr_sim_
 |---|---|
 | `amr_stack` | bringup·experiment·localization·navigation·slam·lidar launch와 설정 YAML, 지도. `navigation_manager`, `navigation_startup`, `localization_quality`, `joy_autoselect` 노드 |
 | `amr_control` | `control_mux`(수동/자율 선택, 바퀴 속도 제한), 시간 감시, 직진·회전 시험 노드 |
-| `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(휠 오도메트리·관절·IMU 수신), 구동 프로토콜, 엘리베이터 RF 중계 `elevator_can_link`(기본 꺼짐) |
+| `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(휠 오도메트리·관절·IMU 수신), 구동 프로토콜 |
 | `amr_web_ui` | 터치 지도 기반 목표 지정 웹 UI + 로컬 ROS 2 HTTP 브리지 (포트 8080) |
 | `amr_remote_bridge` | AMR → 중앙 서버 상태·지도 전송, 명령 중계 (Tailscale 사설망) |
 | `amr_vehicle_status` / `amr_vehicle_interfaces` | UI와 독립된 공용 차량 상태 발행(10 Hz)과 메시지 정의. CPU 부하로 bringup 기본값은 꺼짐(`start_vehicle_status:=true`로 켬) |
@@ -120,7 +120,7 @@ Isaac Sim이 실차 드라이버 대신 같은 토픽을 발행한다 (`amr_sim_
 | `reports/` | 원본 형상 해시(`source_snapshot.json`). 그 밖의 검증 JSON은 스크립트가 재생성 (git 제외) |
 | `logs/` | 시뮬레이션 시험·벤치마크 결과 |
 | `runtime/` | Isaac Sim 런타임 링크와 캐시 (git 제외) |
-| `firmware/stm32/main.c` | 실차 STM32 펌웨어의 `Core/Src/main.c` 사본(E-stop·RF 중계 포함, 2026-10-23 업로드본). `estop.c`·`elevator_rf.c`·`nrf24.c`는 STM32 프로젝트에만 있다. 주행 변환 함수를 `amr_control` 테스트가 직접 컴파일해 검증. CAN 동작은 [E-stop](docs/ESTOP_CAN_PROTOCOL.md)·[엘리베이터 CAN](docs/ELEVATOR_CAN_PROTOCOL.md) 문서가 기준 |
+| `firmware/stm32/main.c` | 실차 STM32 펌웨어의 `Core/Src/main.c` 사본(E-stop 포함, 2026-10-23 업로드본. 들어 있는 엘리베이터 RF 중계는 2026-11-02부터 Jetson이 쓰지 않는다). `estop.c`·`elevator_rf.c`·`nrf24.c`는 STM32 프로젝트에만 있다. 주행 변환 함수를 `amr_control` 테스트가 직접 컴파일해 검증. CAN 동작은 [E-stop](docs/ESTOP_CAN_PROTOCOL.md) 문서가 기준 |
 | `deploy/jetson/` | Jetson 시스템 설정 (`can0.service`) |
 | 루트 `*.sh` | Isaac Sim 진입점 (`env.sh`, `isaac-sim.sh`, `python.sh`, `run_amr.sh`, `build_scene.sh`) |
 

@@ -12,67 +12,6 @@
     FAILED:'주행 실패', REJECTED:'목표 거절', SENDING:'목표 전송 중', CANCELING:'취소 중'};
 
   let latestState = null, latestOnline = false, latestConnectionIssue = '';
-  const rfLevels = {OK:['정상', 'good'], WARN:['주의', 'warn'], ERROR:['이상', 'bad']};
-  const rfCommands = {DELIVERED:'전달됨', COMPLETED:'눌림', DEVICE_REJECTED:'거절됨', RF_TIMEOUT:'무선 전달 실패',
-    NO_RESULT:'결과 없음', NO_ROUTE:'대상 비콘 없음', BAD_FRAME:'명령 형식 오류', REPLACED:'새 명령으로 대체'};
-  const rfFlags = {BATT_LOW:['배터리 부족', 'warn'], BUTTON_FAULT:['버튼 고장', 'bad'], CONFIG_ERR:['설정 오류', 'bad'],
-    BOOT:['재부팅 직후', '']};
-  let rfSignature = '';
-  // RF node_id: car 0x20 + n, hall 0x40 + floor (docs/ELEVATOR_RF_PROTOCOL.md 4).
-  const rfNode = id => !Number.isInteger(id) || id === 0 ? '' : id > 0x20 && id < 0x30 ? `E${id-0x20}` :
-    id - 0x40 > 0 ? `${id-0x40}F` : `B${0x40-id}`;
-  const ago = seconds => !Number.isFinite(seconds) ? '—' : seconds < 60 ? `${Math.round(seconds)}초 전` :
-    seconds < 3600 ? `${Math.round(seconds/60)}분 전` : '1시간 이상';
-
-  function renderRf(e) {
-    const live = Boolean(e?.fresh && Number.isFinite(e.age) && e.age < (e.timeout ?? 3));
-    const [label, tone] = !e ? ['미구성', ''] : live ? rfLevels[e.level] || ['확인 필요', 'warn'] :
-      e.received ? ['수신 지연', 'bad'] : ['미수신', ''];
-    badge('rf-state', label, tone);
-    const link = live ? e.link : null;
-    text('rf-radio', link ? link.radio_ok ? '정상' : '레지스터 검증 실패' : '—');
-    text('rf-rx', link ? `${link.rx_ok} / ${link.rx_bad}` : '—');
-    text('rf-tx', link ? `${link.tx_fail} · ${link.pending}건` : '—');
-    const c = e?.last_command;
-    text('rf-command', !c ? '—' : `#${c.cmd_seq} ${rfNode(c.target)} ${rfCommands[c.status] || c.status}` +
-      (c.device_result && !['NONE', 'PRESSED'].includes(c.device_result) ? ` (${c.device_result})` : '') + ` · ${ago(c.age)}`);
-    const extra = live ? e.age : NaN;
-    const rows = (e?.beacons || []).map(b => {
-      const flags = (b.flags || []).filter(f => rfFlags[f]);
-      return [
-        b.label + (b.role === 'car' ? ' · 카' : b.mapped ? '' : ' · 통과층'),
-        b.heard && Number.isFinite(b.presence_age) ? ago(b.presence_age + extra) : b.heard ? '상태만 수신' : '—',
-        !Number.isInteger(b.rssi_dbm) ? '—' : b.rssi_dbm === -60 ? '강' : b.rssi_dbm === -80 ? '약' : `${b.rssi_dbm} dBm`,
-        Number.isInteger(b.battery_mv) && b.battery_mv > 0 ? `${(b.battery_mv/1000).toFixed(2)} V` : '—',
-        flags.length ? flags.map(f => rfFlags[f][0]).join(', ') : Array.isArray(b.flags) ? '정상' : '—',
-        flags.some(f => rfFlags[f][1] === 'bad') ? 'bad' : flags.some(f => rfFlags[f][1] === 'warn') ? 'warn' : '',
-      ];
-    });
-    const signature = JSON.stringify(rows);
-    if (signature !== rfSignature) {
-      rfSignature = signature;
-      $('rf-beacons').replaceChildren(...rows.map(cells => {
-        const tr = document.createElement('tr');
-        cells.slice(0, 5).forEach((value, index) => {
-          const cell = document.createElement(index ? 'td' : 'th');
-          if (!index) cell.scope = 'row';
-          if (index === 4 && cells[5]) {
-            const span = document.createElement('span');
-            span.className = `health-badge ${cells[5]}`;
-            span.textContent = value;
-            cell.append(span);
-          } else cell.textContent = value;
-          tr.append(cell);
-        });
-        return tr;
-      }));
-    }
-    text('rf-detail', !e ? '층간 이동 설정이 없습니다.' : live ? e.problems?.length ? e.problems.join(' · ') :
-      '하위제어기 RF 중계와 비콘 상태가 정상입니다. 홀 비콘은 그 층 가까이에서만 수신됩니다.' :
-      e.received ? 'RF 중계 상태 수신이 끊겼습니다. elevator_can_link와 CAN 연결을 확인하세요.' :
-      'RF 중계 상태가 없습니다. 실차는 start_elevator_link:=true가 필요하며, 시뮬레이션은 버튼 명령 결과만 표시합니다.');
-  }
-
   function menu(open) {
     $('main-menu').classList.toggle('open', open);
     $('menu-toggle').setAttribute('aria-expanded', String(open));
@@ -197,7 +136,6 @@
       text('estop-health-detail', !e ? 'E-stop 상태를 기다리고 있습니다.' : e.rx_error ||
         (estopLive ? (e.reboot_suspected ? `${e.detail} STM32 재부팅이 의심됩니다.` : e.detail) : '') ||
         (e.required ? 'E-stop 상태가 수신되지 않아 주행이 차단됩니다.' : 'E-stop 확인이 필요하지 않은 구성입니다.'));
-      renderRf(online && !s?.preview ? s?.elevator : null);
       const healthy = ready && received === 4 && time?.healthy && pose && estopOk;
       const summaryClass = `health-summary ${s?.preview || !online ? 'neutral' : healthy ? 'good' : 'warn'}`;
       if ($('health-summary').className !== summaryClass) $('health-summary').className = summaryClass;

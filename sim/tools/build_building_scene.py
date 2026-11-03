@@ -51,6 +51,8 @@ LIGHT_SPACING = 2.5
 CAR_LIGHT_INTENSITY = 12000.
 
 
+DOOR_TOLERANCE_M = 0.10  # per-floor door_center spread the stacked scene accepts
+
 def prim_name(floor):
     return 'Floor_' + ''.join(c if c.isalnum() else '_' for c in floor)
 
@@ -298,9 +300,10 @@ def build(config_path: Path, output: Path, elevator_id='E1'):
     layout = local_layout(spec)
     stops = {f.name: f.elevators[elevator_id] for f in floors}
     first = stops[reference.name]
+    # Real maps place the door a few cm apart per floor (3F: +0.07 m); the one
+    # shaft follows the default floor, and the car absorbs that difference.
     for name, stop in stops.items():
-        if (abs(stop.door_center[0] - first.door_center[0]) > 1e-6
-                or abs(stop.door_center[1] - first.door_center[1]) > 1e-6
+        if (math.dist(stop.door_center, first.door_center) > DOOR_TOLERANCE_M
                 or abs(stop.car_inward_yaw - first.car_inward_yaw) > 1e-6):
             raise SystemExit(f'{name}: the stacked scene needs the elevator at the same map pose on every floor')
     if abs(math.sin(2 * first.car_inward_yaw)) > 1e-6:

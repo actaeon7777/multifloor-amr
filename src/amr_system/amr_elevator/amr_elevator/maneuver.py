@@ -28,6 +28,8 @@ class ManeuverLimits:
     heading_tolerance: float = .12
     heading_gain: float = 1.5
     min_clearance: float = .15
+    turn_gain: float = 1.2
+    min_turn: float = .15
 
 
 class LineManeuver:
@@ -124,7 +126,7 @@ class LineManeuver:
 
     def _turn(self, error):
         lim = self.limits
-        rate = max(.15, min(lim.max_turn, 1.2 * abs(error)))
+        rate = max(lim.min_turn, min(lim.max_turn, lim.turn_gain * abs(error)))
         return math.copysign(rate, error)
 
 

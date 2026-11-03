@@ -27,6 +27,11 @@ def cloud_points_xy(xyz, transform, min_height=.06, max_height=1., max_range=3.)
     Filter height and horizontal range *after* transformation. The upstream
     persistence filter also passes floor, ceiling and distant points unchanged.
     """
+    return cloud_points_xyz(xyz, transform, min_height, max_height, max_range)[:, :2]
+
+
+def cloud_points_xyz(xyz, transform, min_height=.06, max_height=1., max_range=3.):
+    """Same filter as ``cloud_points_xy`` but keeps the base-frame height."""
     points = np.asarray(xyz, dtype=float).reshape(-1, 3)
     points = points[np.all(np.isfinite(points), axis=1)]
     translation, rotation = transform
@@ -34,7 +39,7 @@ def cloud_points_xy(xyz, transform, min_height=.06, max_height=1., max_range=3.)
     valid = (np.all(np.isfinite(points), axis=1)
              & (points[:, 2] >= min_height) & (points[:, 2] <= max_height)
              & (np.hypot(points[:, 0], points[:, 1]) <= max_range))
-    return points[valid, :2]
+    return points[valid]
 
 
 def strip_clearance(points, reverse, half_length=.328, half_width=.307):
@@ -132,6 +137,19 @@ class SpaceRegion:
             half_width = max(0., min(self.half_width, door_half_width - max(self.wall_margin, .15)))
             corridor &= ~in_tunnel | (lateral < half_width - 1e-9)
         return corridor & allowed
+
+
+def sill_band(points_map, geometry, half_band=.08):
+    """Mask of map points within ``half_band`` of the car door line and inside the door width."""
+    points = np.asarray(points_map, dtype=float).reshape(-1, 2)
+    a, b = (np.asarray(p, dtype=float) for p in geometry.car_door)
+    centre, span = (a + b) / 2, b - a
+    half_width = np.linalg.norm(span) / 2
+    lateral_axis = span / (2 * half_width)
+    offset = points - centre
+    lateral = offset @ lateral_axis
+    normal = offset[:, 0] * lateral_axis[1] - offset[:, 1] * lateral_axis[0]
+    return (np.abs(normal) <= half_band) & (np.abs(lateral) <= half_width)
 
 
 def door_tunnel(geometry):

@@ -22,7 +22,7 @@ import numpy as np
 from action_msgs.msg import GoalStatus
 from amr_elevator_interfaces.action import NavigateToFloorPose
 from amr_elevator_interfaces.msg import (
-    ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorEvent,
+    ElevatorRequest, ElevatorDoorState, FloorEvent,
     FloorState,
 )
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
@@ -58,8 +58,9 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from amr_control.operator_hold import HOLD_DETAIL, held_value
 from amr_control.time_guard import HealthLease
 from amr_elevator.announcements import ANNOUNCEMENTS
+from amr_elevator.door_detector import NAMES as DOOR_NAMES
 from amr_elevator.clearance import (
-    boarding_region, cloud_points_xy, exit_region, scan_points, strip_clearance, sweep_hits,
+    boarding_region, cloud_points_xyz, exit_region, scan_points, sill_band, strip_clearance, sweep_hits,
 )
 from amr_elevator.geometry import depth_beyond, wrap
 from amr_elevator.maneuver import DONE, TURN, LineManeuver, ManeuverLimits, travel_clearances
@@ -67,49 +68,13 @@ from amr_elevator.maneuver import DONE, TURN, LineManeuver, ManeuverLimits, trav
 ACTIVE = ('NAV_TO_HALL', 'CALL_ELEVATOR', 'WAIT_DOOR_OPEN', 'BOARDING', 'BACKING_OUT',
           'IN_CAR_ALIGN', 'SELECT_FLOOR', 'RIDING', 'SWITCH_MAP', 'ALIGHTING', 'RETURN_TO_CAR',
           'RELOCALIZE', 'NAV_TO_GOAL')
-# Phases where the robot may stand in the doorway; stopping there holds the door open.
-DOORWAY = ('BOARDING', 'BACKING_OUT', 'ALIGHTING', 'RETURN_TO_CAR')
 DEPTH_PHASES = ('WAIT_DOOR_OPEN', 'BOARDING', 'BACKING_OUT', 'IN_CAR_ALIGN',
                 'ALIGHTING', 'RETURN_TO_CAR')
 HALF_LENGTH = .32
-STATUS_NAMES = {
-    ElevatorCommandStatus.STATUS_DELIVERED: 'DELIVERED',
-    ElevatorCommandStatus.STATUS_COMPLETED: 'COMPLETED',
-    ElevatorCommandStatus.STATUS_DEVICE_REJECTED: 'DEVICE_REJECTED',
-    ElevatorCommandStatus.STATUS_RF_TIMEOUT: 'RF_TIMEOUT',
-    ElevatorCommandStatus.STATUS_NO_RESULT: 'NO_RESULT',
-    ElevatorCommandStatus.STATUS_NO_ROUTE: 'NO_ROUTE',
-    ElevatorCommandStatus.STATUS_BAD_FRAME: 'BAD_FRAME',
-    ElevatorCommandStatus.STATUS_REPLACED: 'REPLACED',
-}
-RESULT_NAMES = {
-    ElevatorCommandStatus.RESULT_WRONG_DEVICE: 'WRONG_DEVICE',
-    ElevatorCommandStatus.RESULT_UNSUPPORTED: 'UNSUPPORTED',
-    ElevatorCommandStatus.RESULT_BUTTON_FAULT: 'BUTTON_FAULT',
-    ElevatorCommandStatus.RESULT_BAD_REQUEST: 'BAD_REQUEST',
-}
-# The press can never succeed as sent: retrying with a new sequence would not help.
-FATAL_STATUSES = (ElevatorCommandStatus.STATUS_DEVICE_REJECTED,
-                  ElevatorCommandStatus.STATUS_NO_ROUTE, ElevatorCommandStatus.STATUS_BAD_FRAME)
 
 
 def yaw_of(q):
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
-
-
-@dataclass
-class PendingAck:
-    sequence: int
-    location: int
-    command: tuple
-    sent: float
-    attempts: int = 1
-    acked: bool = False
-    # A late acknowledgement of an earlier press of the same button still counts.
-    sequences: set = field(default_factory=set)
-    repeat: int = 0
-    acked_at: float = None
-    rejected: str = ''
 
 
 @dataclass
@@ -127,6 +92,7 @@ class Mission:
     counters: dict = field(default_factory=dict)
     timings: dict = field(default_factory=dict)
     finished: bool = False
+    error_code: str = ''
 
 
 class FloorMissionManager(Node):
@@ -135,17 +101,19 @@ class FloorMissionManager(Node):
         from amr_stack.floor_config import load_floor_config
         p = {k: self.declare_parameter(k, v).value for k, v in {
             'floors_config': '', 'elevator_id': 'E1', 'simulation': False,
-            'use_door_open_button': False, 'ack_timeout': 3., 'ack_attempts': 3,
             'door_wait_timeout': 120., 'ride_timeout': 180., 'relocalize_timeout': 30.,
+            # 2026-11-02 (5F): the car door stayed open 42 s and the hall check failed on
+            # beams into the car; re-checking the same hall pose passes once it closes.
+            'relocalize_reseed_period': 10., 'relocalize_reseeds': 5,
             'boarding_timeout': 30., 'max_boarding_attempts': 3, 'lease_renew_period': 10.,
             # 0.3 m: the hall pose was 0.37 m off after a ride (2026-10-26); AMCL
             # must be able to reach the true pose when refinement is skipped.
             'initial_pose_xy_variance': .09, 'initial_pose_yaw_variance': .0076,
             'maneuver_speed': .35, 'tick_period': .05, 'floor_state_timeout': 3.,
+            'maneuver_accel': .4, 'maneuver_decel': .3, 'maneuver_max_turn': .5,
+            'maneuver_turn_gain': 1.2, 'maneuver_min_turn': .15, 'maneuver_heading_tolerance': .12,
+            'maneuver_min_clearance': .15,
             'localization_recovery_timeout': 45., 'require_estop': False, 'base_frame': 'base_footprint',
-            # Door-open presses about 1 s apart, repeated by the car beacon itself.
-            'door_open_repeat_board': 6, 'door_open_repeat_exit': 10, 'door_open_repeat_hold': 15,
-            'door_open_rearm_s': 8., 'door_open_rearm_max': 2,
             'use_depth': True, 'depth_topic': '/camera/depth/points_filtered', 'depth_max_age': .5,
             'space_margin': .10, 'wall_margin': .12, 'turn_margin': .05, 'clear_confirm_s': .5,
             'announce_period': 5., 'board_block_timeout': 15., 'alight_block_timeout': 20.,
@@ -155,6 +123,8 @@ class FloorMissionManager(Node):
             'scan_max_age': .5,
             # Brief brushes past the robot stay silent; only a hold this long is announced.
             'obstacle_announce_delay': 1.5,
+            # Boarding space must stay occupied this long before "please make room".
+            'space_announce_delay': 1.,
         }.items()}
         for key in ('depth_max_age', 'space_margin', 'wall_margin', 'turn_margin', 'clear_confirm_s',
                     'announce_period', 'board_block_timeout', 'alight_block_timeout', 'turn_block_timeout',
@@ -162,15 +132,30 @@ class FloorMissionManager(Node):
                     'depth_max_range', 'door_cancel_grace', 'scan_max_age'):
             if not math.isfinite(p[key]) or p[key] <= 0.:
                 raise ValueError(f'{key} must be positive and finite')
-        if not math.isfinite(p['obstacle_announce_delay']) or p['obstacle_announce_delay'] < 0.:
-            raise ValueError('obstacle_announce_delay must be non-negative and finite')
+        for key in ('maneuver_speed', 'maneuver_accel', 'maneuver_decel', 'maneuver_max_turn',
+                    'maneuver_turn_gain', 'maneuver_min_turn', 'maneuver_heading_tolerance', 'maneuver_min_clearance'):
+            if not math.isfinite(p[key]) or p[key] <= 0.:
+                raise ValueError(f'{key} must be positive and finite')
+        # navigation_manager drops (not clamps) maneuver commands above its
+        # max_linear_speed 1.0 / max_angular_speed 0.6 (navigation.yaml): stay below them.
+        for key, maximum in (('maneuver_speed', .8), ('maneuver_max_turn', .6)):
+            if p[key] > maximum:
+                raise ValueError(f'{key} must be <= {maximum}')
+        if p['maneuver_min_turn'] > p['maneuver_max_turn']:
+            raise ValueError('maneuver_min_turn must be <= maneuver_max_turn')
+        if p['maneuver_min_clearance'] < .10:
+            raise ValueError('maneuver_min_clearance must be >= 0.10')
+        if not math.isfinite(p['relocalize_reseed_period']) or p['relocalize_reseed_period'] <= 0.:
+            raise ValueError('relocalize_reseed_period must be positive and finite')
+        if type(p['relocalize_reseeds']) is not int or p['relocalize_reseeds'] < 0:
+            raise ValueError('relocalize_reseeds must be a non-negative integer')
+        for key in ('obstacle_announce_delay', 'space_announce_delay'):
+            if not math.isfinite(p[key]) or p[key] < 0.:
+                raise ValueError(f'{key} must be non-negative and finite')
         if type(p['max_alighting_attempts']) is not int:
             raise ValueError('max_alighting_attempts must be an integer')
         if p['depth_min_height'] >= p['depth_max_height']:
             raise ValueError('depth_min_height must be less than depth_max_height')
-        for key in ('door_open_repeat_board', 'door_open_repeat_exit', 'door_open_repeat_hold'):
-            if type(p[key]) is not int or not 0 <= p[key] <= ElevatorCommand.DOOR_OPEN_REPEAT_MAX:
-                raise ValueError(f'{key} must be an integer in [0, {ElevatorCommand.DOOR_OPEN_REPEAT_MAX}]')
         self.p = p
         self.building = building or load_floor_config(p['floors_config'] or None)
         self.elevator_id = p['elevator_id']
@@ -180,6 +165,7 @@ class FloorMissionManager(Node):
         self.floor_state = None
         self.floor_state_time = -math.inf
         self.door = ElevatorDoorState()
+        self.door_open_since = None
         self.pose = None
         self.scan = None
         self.scan_received = -math.inf  # monotonic receive time, independent of ROS clock jumps
@@ -188,6 +174,7 @@ class FloorMissionManager(Node):
         self.laser_pose = None     # laser (x, y, yaw) in base_frame, from TF once
         self._scan_points = np.empty((0, 2))
         self._depth_points = np.empty((0, 2))
+        self._depth_heights = np.empty(0)
         self._depth_clearances = (math.inf, math.inf)
         self.depth_received = -math.inf
         self.depth_transform = None
@@ -200,8 +187,6 @@ class FloorMissionManager(Node):
         self.estop_event = False
         self.localization = {}
         self.sequence = 0
-        self.pending = None        # HALL_CALL / CAR_FLOOR awaiting BUTTON_ACK
-        self.door_pending = None   # DOOR_OPEN awaiting BUTTON_ACK (repeats started)
         self.maneuver = None
         self.lease_renewed = -math.inf
         self.nav = None            # {'future', 'handle', 'status'}
@@ -209,18 +194,25 @@ class FloorMissionManager(Node):
         self.last_status = None
         self.last_feedback_time = -math.inf
         self.seed_after_resume = False
+        self._debug_last_publish = -math.inf
+        self._debug_twist = (0., 0.)
+        self._debug_clearances = (None, None)
+        self._debug_space_clear = None
+        self._debug_turn_blocked = False
+        self._debug_door_hold = False
+        self._debug_lease_ok = False
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.status_pub = self.create_publisher(String, 'floor_mission/status', latched)
+        self.debug_pub = self.create_publisher(
+            String, 'floor_mission/debug', QoSProfile(depth=5, durability=DurabilityPolicy.VOLATILE))
         self.announcement_pub = self.create_publisher(String, 'robot/announcement', 10)
-        self.command_pub = self.create_publisher(ElevatorCommand, 'elevator/command', 10)
+        requests = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.request_pub = self.create_publisher(ElevatorRequest, '/elevator/request', requests)
         self.twist_pub = self.create_publisher(Twist, 'cmd_vel_maneuver', 1)
         self.initial_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.create_subscription(FloorState, 'floor/state', self.on_floor_state, latched)
         self.create_subscription(FloorEvent, 'floor/events', self.on_floor_event, 20)
         self.create_subscription(ElevatorDoorState, 'elevator/door', self.on_door, 10)
-        self.create_subscription(ElevatorBeacon, 'elevator/beacon', self.on_beacon, 50)
-        self.create_subscription(ElevatorCommandStatus, 'elevator/command_status',
-                                 self.on_command_status, 20)
         self.create_subscription(PoseStamped, 'floor/pose_estimate', self.on_pose, 10)
         self.create_subscription(LaserScan, 'scan', self.on_scan, qos_profile_sensor_data)
         if p['use_depth']:
@@ -259,22 +251,28 @@ class FloorMissionManager(Node):
         s = self.floor_state
         return '' if s is None else s.floor
 
+    def at_confirmed_target(self):
+        s = self.floor_state
+        return (s is not None and s.floor == self.mission.floor
+                and s.confidence in ('VERIFIED', 'CONFIRMED'))
+
     def set_phase(self, phase, detail=''):
         m = self.mission
         now = self.now()
         if m.phase in ACTIVE:
             m.timings[m.phase] = m.timings.get(m.phase, 0.) + now - m.phase_since
         m.phase, m.phase_since, m.detail = phase, now, detail
+        self._debug_space_clear = None
+        self._debug_clearances = (None, None)
+        self._debug_turn_blocked = False
+        self._debug_door_hold = False
         for key in ('_clear_since', '_blocked_since', '_align_active_since', '_exit_started',
                     '_exit_started_at', '_return_wait_since', '_return_arrived', '_prepared',
                     '_alight_announced',
                     '_door_not_open_since'):
             m.counters.pop(key, None)
         if phase == 'RIDING':
-            for key in ('_last_transit', '_assumed_since', '_assumed_hold'):
-                m.counters.pop(key, None)
-        if phase == 'RETURN_TO_CAR':
-            m.counters.pop('return_open_press', None)
+            m.counters.pop('_car_request_since', None)
         self.maneuver = None
         for key in {'BOARDING': ('board_start',), 'SWITCH_MAP': ('arrival',)}.get(phase, ()):
             self.announce(key)
@@ -317,19 +315,32 @@ class FloorMissionManager(Node):
             return np.concatenate((self._scan_points, self._depth_points))
         return self._scan_points
 
-    def space_clear(self, region):
-        """Require a continuous clear interval with a known pose and laser frame."""
+    def space_clear(self, region, geometry=None):
+        """Require a continuous clear interval with a known pose and laser frame.
+
+        With ``geometry``, low depth points on that floor's car-door sill (below
+        ``sill_ignore_height_m``) are ignored; LiDAR points never are.
+        """
         clear = False
         if self.pose is not None and self.scan_fresh():
             x, y, yaw = self.pose
             c, s = math.cos(yaw), math.sin(yaw)
-            points = self.obstacle_points() @ np.array(((c, s), (-s, c))) + (x, y)
+            to_map = np.array(((c, s), (-s, c)))
+            points = self._scan_points @ to_map + (x, y)
+            if self.depth_fresh() and len(self._depth_points):
+                depth = self._depth_points @ to_map + (x, y)
+                sill = getattr(geometry, 'sill_ignore_height_m', 0.)
+                if sill > 0. and len(self._depth_heights) == len(depth):
+                    depth = depth[~(sill_band(depth, geometry) & (self._depth_heights < sill))]
+                points = np.concatenate((points, depth))
             clear = not np.any(region.contains(points))
         if not clear:
+            self._debug_space_clear = False
             self.mission.counters.pop('_clear_since', None)
             return False
         since = self.mission.counters.setdefault('_clear_since', self.now())
-        return self.now() - since >= self.p['clear_confirm_s']
+        self._debug_space_clear = self.now() - since >= self.p['clear_confirm_s']
+        return self._debug_space_clear
 
     def announce_blocked(self, duration):
         if duration >= self.p['obstacle_announce_delay']:
@@ -377,68 +388,20 @@ class FloorMissionManager(Node):
         except Exception:  # noqa: BLE001
             return False
 
-    def send_elevator(self, command, floor_code=0, direction=ElevatorCommand.DIR_NONE, attempts=1,
-                      earlier=(), repeat=0):
-        self.sequence = (self.sequence + 1) & 0xff
-        message = ElevatorCommand(command=command, floor_code=floor_code, direction=direction,
-                                  sequence=self.sequence, repeat=repeat)
+    def request_elevator(self, kind, start_floor='', target_floor='', direction=ElevatorRequest.DIR_NONE):
+        self.sequence = (self.sequence + 1) & 0xffffffff
+        message = ElevatorRequest(kind=kind, start_floor=start_floor, target_floor=target_floor,
+                                  direction=direction, sequence=self.sequence)
         message.header.stamp = self.get_clock().now().to_msg()
-        self.command_pub.publish(message)
-        location = (ElevatorBeacon.LOCATION_HALL if command == ElevatorCommand.CMD_HALL_CALL
-                    else ElevatorBeacon.LOCATION_CAR)
-        pending = PendingAck(self.sequence, location, (command, floor_code, direction), self.now(), attempts,
-                             sequences={self.sequence, *earlier}, repeat=repeat)
-        if command == ElevatorCommand.CMD_DOOR_OPEN:
-            self.door_pending = pending  # Never replaces a pending hall or car-floor press.
-        else:
-            self.pending = pending
-
-    def hold_door(self, repeat):
-        """Ask the car beacon to press door-open ``repeat`` times, about 1 s apart.
-
-        One command covers the whole hold; BUTTON_ACK only means the presses started,
-        and the door state still comes from the LiDAR.
-        """
-        if self.p['use_door_open_button']:
-            self.send_elevator(ElevatorCommand.CMD_DOOR_OPEN, repeat=repeat)
-
-    def retry_door_open(self):
-        """Resend an unacknowledged door-open with a new sequence; giving up is not fatal."""
-        pending = self.door_pending
-        if pending is None or pending.acked or self.now() - pending.sent < self.p['ack_timeout']:
-            return
-        if pending.attempts >= self.p['ack_attempts']:
-            self.count('door_open_unacked')
-            self.get_logger().warning(
-                f'Door-open not acknowledged after {pending.attempts} presses; relying on the LiDAR')
-            self.door_pending = None
-            return
-        self.send_elevator(ElevatorCommand.CMD_DOOR_OPEN, attempts=pending.attempts + 1,
-                           earlier=pending.sequences, repeat=pending.repeat)
-
-    def retry_pending(self, failure_code):
-        """Resend an unacknowledged command; True while still trying."""
-        pending = self.pending
-        if pending is None or pending.acked:
-            return True
-        if pending.rejected:
-            code = ('HALL_REJECTED' if pending.command[0] == ElevatorCommand.CMD_HALL_CALL
-                    else 'CAR_REJECTED')
-            self.fail(code, pending.rejected)
-            return False
-        if self.now() - pending.sent < self.p['ack_timeout']:
-            return True
-        if pending.attempts >= self.p['ack_attempts']:
-            self.fail(failure_code, f'no acknowledgement after {pending.attempts} presses')
-            return False
-        self.count('button_retries')
-        self.send_elevator(*pending.command, attempts=pending.attempts + 1, earlier=pending.sequences)
-        return True
+        self.request_pub.publish(message)
+        self.get_logger().info(
+            f'Elevator request {self.sequence}: kind={kind} {start_floor} -> {target_floor}')
 
     def publish_twist(self, linear=0., angular=0.):
         message = Twist()
         message.linear.x, message.angular.z = float(linear), float(angular)
         self.twist_pub.publish(message)
+        self._debug_twist = (float(linear), float(angular))
 
     def renew_lease(self):
         if self.now() - self.lease_renewed >= self.p['lease_renew_period'] and 'lease' not in self.calls:
@@ -446,7 +409,10 @@ class FloorMissionManager(Node):
                 self.lease_renewed = self.now()
         response = self.result('lease')
         if response is False or (response is not None and not response.success):
+            self._debug_lease_ok = False
             self.lease_renewed = -math.inf  # retry next tick
+        elif response is not None:
+            self._debug_lease_ok = True
 
     def release_lease(self):
         self.publish_twist()
@@ -454,6 +420,7 @@ class FloorMissionManager(Node):
         if self.lease_client.service_is_ready():
             self.lease_client.call_async(SetBool.Request(data=False))
         self.lease_renewed = -math.inf
+        self._debug_lease_ok = False
 
     def door_state(self):
         return self.door.state
@@ -466,6 +433,7 @@ class FloorMissionManager(Node):
         # Received scans always carry a timestamp. Preserve the legacy lazy
         # projection path for callers that directly supply an unreceived scan.
         if hasattr(self, 'scan_received') and not FloorMissionManager.scan_fresh(self):
+            self._debug_clearances = (0., 0.)
             return 0.
         if self.scan is None:
             if getattr(self, 'depth_transform', None) is not None and self.depth_fresh():
@@ -482,10 +450,13 @@ class FloorMissionManager(Node):
                 scan.ranges, scan.angle_min, scan.angle_increment,
                 HALF_LENGTH, laser_pose=self.laser_pose)
             self._clearance_scan = scan
-        depth = math.inf
+        depth_values = (math.inf, math.inf)
         if getattr(self, 'depth_transform', None) is not None and self.depth_fresh():
-            depth = self._depth_clearances[bool(reverse)]
-        return min(self._clearances[bool(reverse)], depth)
+            depth_values = self._depth_clearances
+        # Both directions use the same cached scan/depth pair; no extra projection.
+        self._debug_clearances = tuple(min(lidar, d) for lidar, d in zip(
+            self._clearances, depth_values))
+        return self._debug_clearances[bool(reverse)]
 
     def drive(self):
         """Advance the current maneuver; True once done."""
@@ -504,6 +475,7 @@ class FloorMissionManager(Node):
             half_length=math.ceil((.328 + .02 + self.p['turn_margin']) * 100) / 100,
             half_width=math.ceil((.287 + .02 + self.p['turn_margin']) * 100) / 100,
             body_half_length=.328, body_half_width=.287))
+        self._debug_turn_blocked = bool(turn_blocked)
         linear, angular = self.maneuver.command(
             self.pose, self.p['tick_period'], self.clearance(self.maneuver.reverse),
             turn_blocked=turn_blocked)
@@ -515,7 +487,12 @@ class FloorMissionManager(Node):
         return self.maneuver.phase == DONE
 
     def limits(self):
-        return ManeuverLimits(max_speed=self.p['maneuver_speed'])
+        return ManeuverLimits(max_speed=self.p['maneuver_speed'], accel=self.p['maneuver_accel'],
+                              decel=self.p['maneuver_decel'], max_turn=self.p['maneuver_max_turn'],
+                              turn_gain=self.p['maneuver_turn_gain'],
+                              min_turn=self.p['maneuver_min_turn'],
+                              heading_tolerance=self.p['maneuver_heading_tolerance'],
+                              min_clearance=self.p['maneuver_min_clearance'])
 
     # Nav2 legs -----------------------------------------------------------------
 
@@ -607,6 +584,11 @@ class FloorMissionManager(Node):
                 self.fail('FLOOR_RULE_VIOLATION', message.detail)
 
     def on_door(self, message):
+        if message.state == ElevatorDoorState.OPEN:
+            if self.door_open_since is None:
+                self.door_open_since = self.now()
+        else:
+            self.door_open_since = None
         self.door = message
 
     def on_pose(self, message):
@@ -661,9 +643,10 @@ class FloorMissionManager(Node):
         cloud = np.ndarray((message.height, message.width), dtype=dtype, buffer=message.data,
                            strides=(message.row_step, message.point_step))
         points = np.column_stack([cloud[name].ravel() for name in ('x', 'y', 'z')])
-        self._depth_points = cloud_points_xy(
+        depth_xyz = cloud_points_xyz(
             points, self.depth_transform, self.p['depth_min_height'],
             self.p['depth_max_height'], self.p['depth_max_range'])
+        self._depth_points, self._depth_heights = depth_xyz[:, :2], depth_xyz[:, 2]
         self._depth_clearances = tuple(strip_clearance(self._depth_points, reverse, HALF_LENGTH)
                                        for reverse in (False, True))
         self.depth_received = self.now()
@@ -693,36 +676,6 @@ class FloorMissionManager(Node):
             self.localization = json.loads(message.data)
         except ValueError:
             self.localization = {}
-
-    def on_beacon(self, message):
-        for pending in (self.pending, self.door_pending):
-            if (pending is not None and not pending.acked
-                    and message.event == ElevatorBeacon.EVENT_BUTTON_ACK
-                    and message.location == pending.location
-                    and message.ack_sequence in pending.sequences):
-                pending.acked, pending.acked_at = True, self.now()
-
-    def on_command_status(self, message):
-        """STM32 RF relay progress (0x311): fail fast when a press can never succeed."""
-        status = STATUS_NAMES.get(message.status, str(message.status))
-        result = RESULT_NAMES.get(message.device_result, f'0x{message.device_result:02X}')
-        for pending, door in ((self.pending, False), (self.door_pending, True)):
-            if pending is None or pending.acked or message.cmd_seq not in pending.sequences:
-                continue
-            if message.status in FATAL_STATUSES:
-                detail = f'{status} {result} (target 0x{message.target:02X}, seq {message.cmd_seq})'
-                if door:
-                    self.count('door_open_rejected')
-                    self.get_logger().warning(f'Door-open rejected: {detail}')
-                    self.door_pending = None
-                else:
-                    pending.rejected = detail
-            elif message.status in (ElevatorCommandStatus.STATUS_RF_TIMEOUT,
-                                    ElevatorCommandStatus.STATUS_NO_RESULT):
-                if self.mission is not None and not self.mission.finished:
-                    self.count('rf_timeouts')
-                self.get_logger().info(f'Elevator press seq {message.cmd_seq}: {status}; '
-                                       'the mission retries with a new sequence')
 
     def ready(self):
         return self.localization.get('state') == 'READY' and self.localization.get('ready') is True
@@ -760,8 +713,12 @@ class FloorMissionManager(Node):
             return GoalResponse.REJECT
         state = self.floor_state
         if (state is None or state.zone != FloorState.ZONE_OUTSIDE
-                or state.confidence not in ('BEACON', 'CONFIRMED') or not state.floor):
+                or state.confidence not in ('CONFIRMED', 'VERIFIED') or not state.floor):
             self.get_logger().warning('Rejecting floor mission: current floor is not confirmed')
+            return GoalResponse.REJECT
+        if state.floor not in self.building.floors:
+            # A pass floor (no map) can be verified in the car and then left by hand.
+            self.get_logger().warning(f'Rejecting floor mission: {state.floor} has no map; set the floor first')
             return GoalResponse.REJECT
         pose = request.pose.pose
         values = (pose.position.x, pose.position.y, pose.orientation.z, pose.orientation.w)
@@ -797,14 +754,14 @@ class FloorMissionManager(Node):
         now = self.now()
         if m.phase in ACTIVE:
             m.timings[m.phase] = m.timings.get(m.phase, 0.) + now - m.phase_since
-        if outcome != 'SUCCEEDED' and m.phase in DOORWAY and self.in_doorway():
-            # The robot stops where the door would close on it: keep the door open.
-            self.hold_door(self.p['door_open_repeat_hold'])
         m.finished = True
+        m.error_code = error_code
+        try:
+            self.request_elevator(ElevatorRequest.KIND_CANCEL)
+        except Exception as error:  # request transport must never prevent mission cleanup
+            self.get_logger().warning(f'Elevator cancellation unavailable: {error!r}')
         self.cancel_nav()
         self.maneuver = None
-        self.pending = None
-        self.door_pending = None
         result = NavigateToFloorPose.Result(success=outcome == 'SUCCEEDED', error_code=error_code,
                                             message=message or json.dumps({'timings': m.timings}))
         if outcome == 'SUCCEEDED':
@@ -818,21 +775,6 @@ class FloorMissionManager(Node):
             f'{error_code} {message}'.strip(), now
         m.completion.set_result(result)
         self.publish_status(force=True)
-
-    def in_doorway(self):
-        """True unless the pose shows the whole body clear of the hall-car threshold."""
-        m = self.mission
-        floor = m.floor if m.phase in ('ALIGHTING', 'RETURN_TO_CAR') else (
-            self.current_floor() or m.start_floor)
-        if self.pose is None:
-            return True
-        try:
-            geometry = self.geometry(floor)
-            past_hall = self.depth(floor, geometry.hall_door)   # inward of the hall door plane
-            past_car = self.depth(floor, geometry.car_door)     # inward of the car door plane
-        except ValueError:
-            return True
-        return past_hall + HALF_LENGTH > 0. and past_car - HALF_LENGTH < 0.
 
     def fail(self, code, detail=''):
         if self.mission is None or self.mission.finished:
@@ -856,6 +798,7 @@ class FloorMissionManager(Node):
         status = {
             'phase': 'IDLE' if m is None else m.phase,
             'detail': '' if m is None else m.detail,
+            'error_code': '' if m is None else getattr(m, 'error_code', ''),
             'goal_floor': '' if m is None else m.floor,
             'goal_room': '' if m is None else m.room,
             'start_floor': '' if m is None else m.start_floor,
@@ -882,7 +825,86 @@ class FloorMissionManager(Node):
 
     # State machine ------------------------------------------------------------------
 
+    def debug_hold(self):
+        """Explain observed holds only; never run geometry or modify controller state."""
+        m = self.mission
+        if m.phase not in DEPTH_PHASES or any(self._debug_twist):
+            return None
+        if self.mode != 'AUTO':
+            return 'not_auto'
+        if not self.estop_ready():
+            return 'estop'
+        prepared = m.counters.get('_prepared')
+        # The lease is only required after door-open preparation begins. A closed
+        # door at the hall must not be mislabeled as a missing maneuver lease.
+        if (m.phase != 'WAIT_DOOR_OPEN' or prepared is True) and not self._debug_lease_ok:
+            return 'no_lease'
+        if prepared == 'pending' or (m.phase == 'WAIT_DOOR_OPEN'
+                                    and self.door_state() == ElevatorDoorState.OPEN and not prepared):
+            return 'prepare_pending'
+        if self._debug_door_hold:
+            return 'door_not_open'
+        if self.pose is None:
+            return 'no_pose'
+        if self.laser_pose is None:
+            return 'no_laser_tf'
+        if not self.scan_fresh():
+            return 'scan_stale'
+        if self._debug_space_clear is False:
+            return 'clear_confirm' if '_clear_since' in m.counters else 'space_occupied'
+        if self._debug_turn_blocked:
+            return 'sweep_blocked'
+        if self.maneuver is not None and self.maneuver.blocked:
+            return 'obstacle'
+        if (self.floor_state is not None and self.floor_state.awaiting_confirm
+                or self.maneuver is not None and self.maneuver.phase == DONE):
+            return 'waiting_confirm'
+        return 'other'
+
+    def publish_debug(self):
+        m = self.mission
+        wall_now = monotonic()
+        if (m is None or m.finished or m.phase not in ACTIVE
+                or wall_now - self._debug_last_publish < .1):
+            return
+        self._debug_last_publish = wall_now
+        now = self.now()
+
+        def finite(value):
+            # JSON has no infinity; null also represents an unbounded clearance.
+            return value if value is not None and math.isfinite(value) else None
+
+        lidar = self._clearances if self.scan_fresh() else (None, None)
+        depth = self._depth_clearances if self.depth_fresh() else (None, None)
+        since = m.counters.get('_clear_since')
+        data = {
+            't': now, 'phase': m.phase,
+            'maneuver_phase': None if self.maneuver is None else self.maneuver.phase,
+            'cmd_v': self._debug_twist[0], 'cmd_w': self._debug_twist[1],
+            'clear_fwd': finite(self._debug_clearances[0]),
+            'clear_rev': finite(self._debug_clearances[1]),
+            'lidar_fwd': finite(lidar[0]), 'lidar_rev': finite(lidar[1]),
+            'depth_fwd': finite(depth[0]), 'depth_rev': finite(depth[1]),
+            'blocked': bool(self.maneuver is not None and self.maneuver.blocked),
+            'turn_blocked': self._debug_turn_blocked, 'space_clear': self._debug_space_clear,
+            'clear_since_age': None if since is None else now - since,
+            'scan_age': finite(wall_now - self.scan_received),
+            'depth_age': finite(now - self.depth_received),
+            'door': DOOR_NAMES.get(self.door_state(), 'UNKNOWN'),
+            'pose': None if self.pose is None else [finite(v) for v in self.pose],
+            'hold': self.debug_hold(),
+        }
+        self.debug_pub.publish(String(data=json.dumps(data, allow_nan=False)))
+
     def tick(self):
+        self._debug_turn_blocked = False
+        self._debug_door_hold = False
+        try:
+            self._tick()
+        finally:
+            self.publish_debug()
+
+    def _tick(self):
         m = self.mission
         if self.seed_after_resume:
             response = self.result('suspend')
@@ -896,7 +918,6 @@ class FloorMissionManager(Node):
         if m is None or m.finished:
             self.estop_event = False
             return
-        self.retry_door_open()
         if m.handle.is_cancel_requested or self.held:
             self.cancel()
             return
@@ -940,24 +961,18 @@ class FloorMissionManager(Node):
 
     def phase_call_elevator(self):
         m = self.mission
-        here = self.building.floor(self.current_floor() or m.start_floor)
-        if (self.pending is not None and self.pending.acked
-                and self.pending.command[0] == ElevatorCommand.CMD_HALL_CALL):
-            self.announce('call')
-            self.announce('waiting')
         if self.door_state() == ElevatorDoorState.OPEN:
-            self.pending = None
             self.set_phase('WAIT_DOOR_OPEN', 'car already here')
             return
-        if self.pending is None or self.pending.command[0] != ElevatorCommand.CMD_HALL_CALL:
-            up = self.building.floor(m.floor).level > here.level
-            self.send_elevator(ElevatorCommand.CMD_HALL_CALL, here.beacon_floor_code,
-                               ElevatorCommand.DIR_UP if up else ElevatorCommand.DIR_DOWN)
-            return
-        if self.pending.acked:
-            self.set_phase('WAIT_DOOR_OPEN')
-            return
-        self.retry_pending('NO_HALL_ACK')
+        here = self.building.floor(self.current_floor() or m.start_floor)
+        up = self.building.floor(m.floor).level > here.level
+        self.request_elevator(ElevatorRequest.KIND_CALL, here.name, m.floor,
+                              ElevatorRequest.DIR_UP if up else ElevatorRequest.DIR_DOWN)
+        # Each re-entry is a fresh call, even within the announcement rate limit.
+        for key in ('call', 'waiting'):
+            self._announced.pop(key, None)
+            self.announce(key)
+        self.set_phase('WAIT_DOOR_OPEN')
 
     def phase_wait_door_open(self):
         m = self.mission
@@ -989,8 +1004,10 @@ class FloorMissionManager(Node):
                 self.fail('PREPARE_FAILED', 'localization suspend or maneuver lease refused')
                 return
             m.counters['_prepared'] = prepared = True
+            self._debug_lease_ok = True
             self.lease_renewed = self.now()
         if prepared and not opened:
+            self._debug_door_hold = True
             self.publish_twist()
             self.renew_lease()
             since = m.counters['_door_not_open_since']
@@ -1004,10 +1021,10 @@ class FloorMissionManager(Node):
             elif prepared:
                 self.cancel_wait_boarding('boarding space wait expired')
             else:
-                self.pending = None
                 self.set_phase('CALL_ELEVATOR', 'calling again')
             return
         if not opened:
+            self._debug_door_hold = True
             return
         if not prepared:
             if ('suspend' not in self.calls and 'lease' not in self.calls
@@ -1022,11 +1039,15 @@ class FloorMissionManager(Node):
         # The approach from the wait pose counts too: people leaving the car go first.
         region = boarding_region(geometry, self.p['space_margin'], self.p['wall_margin'],
                                  approach_from=self.pose)
-        if not self.space_clear(region):
+        if not self.space_clear(region, geometry):
             self.publish_twist()
-            self.announce('board_space')
+            # Door panels still sliding open read as occupied for a moment: ask
+            # people to make room only when the space stays taken.
+            if '_clear_since' in m.counters:
+                m.counters.pop('_occupied_since', None)
+            elif self.now() - m.counters.setdefault('_occupied_since', self.now()) >= self.p['space_announce_delay']:
+                self.announce('board_space')
             return
-        self.hold_door(self.p['door_open_repeat_board'])
         self.set_phase('BOARDING')
         self.maneuver = LineManeuver(geometry.car_pose, final_yaw=geometry.car_pose[2],
                                      limits=self.limits())
@@ -1037,13 +1058,13 @@ class FloorMissionManager(Node):
         if self.count('boarding_attempts') >= self.p['max_boarding_attempts']:
             self.fail('BOARDING_FAILED', reason)
             return
-        self.pending = None
         self.mission.counters['_after_relocalize'] = 'CALL_ELEVATOR'
         self.set_phase('RELOCALIZE', reason)
 
     def back_out(self, reason, require_open=True):
         self.publish_twist()
         if require_open and self.door_state() != ElevatorDoorState.OPEN:
+            self._debug_door_hold = True
             if self.mission.phase == 'BOARDING':
                 inside = self.floor_state is not None and self.floor_state.zone == FloorState.ZONE_IN_ELEVATOR
                 if inside:
@@ -1052,9 +1073,7 @@ class FloorMissionManager(Node):
                     self.fail('BOARDING_FAILED', 'door not open for safe retreat')
             return False
         self.announce('board_cancel')
-        self.hold_door(self.p['door_open_repeat_board'])
         self.count('boarding_aborts')
-        self.pending = None  # a previous hall ACK cannot acknowledge the next call
         stop = self.stop_geometry(self.mission.start_floor)
         # After a partial 180-degree turn, ALIGN first faces into the car so that
         # reverse travel still leads to the hall. Its sweep is checked as usual.
@@ -1097,6 +1116,7 @@ class FloorMissionManager(Node):
         outside = (self.pose is not None
                    and self.depth(floor, geometry.hall_door) + HALF_LENGTH <= 0.)
         if self.door_state() != ElevatorDoorState.OPEN and not outside:
+            self._debug_door_hold = True
             self.publish_twist()
             self.renew_lease()
             if self.maneuver is not None:
@@ -1148,14 +1168,8 @@ class FloorMissionManager(Node):
     def phase_select_floor(self):
         self.renew_lease()
         self.publish_twist()
-        target = self.building.floor(self.mission.floor)
-        if self.pending is None or self.pending.command[0] != ElevatorCommand.CMD_CAR_FLOOR:
-            self.send_elevator(ElevatorCommand.CMD_CAR_FLOOR, target.beacon_floor_code)
-            return
-        if self.pending.acked:
-            self.set_phase('RIDING')
-            return
-        self.retry_pending('NO_CAR_ACK')
+        self.request_elevator(ElevatorRequest.KIND_CAR_FLOOR, target_floor=self.mission.floor)
+        self.set_phase('RIDING')
 
     def phase_riding(self):
         m = self.mission
@@ -1165,32 +1179,19 @@ class FloorMissionManager(Node):
         if state is None:
             return
         door_open = self.door_state() == ElevatorDoorState.OPEN
-        if state.floor == m.floor and door_open:
-            if state.confidence in ('BEACON', 'CONFIRMED'):
-                # One command holds the door for the whole exit; never one per second.
-                self.hold_door(self.p['door_open_repeat_exit'])
-                m.counters['_door_rearms'] = 0
-                self.set_phase('SWITCH_MAP')
-                return
-            if state.confidence == 'ASSUMED':
-                waited = m.counters.setdefault('_assumed_since', self.now())
-                if self.now() - waited > 6.:
-                    self.fail('ARRIVAL_UNCONFIRMED', 'no hall beacon at the arrival floor')
-                elif m.counters.get('_assumed_hold') is None:
-                    m.counters['_assumed_hold'] = True
-                    self.hold_door(self.p['door_open_repeat_exit'])
-                return
-        if state.confidence == 'TRANSIT':
-            m.counters['_last_transit'] = self.now()
-        last_motion = m.counters.get('_last_transit', m.phase_since)
-        if state.floor and state.floor != m.floor and door_open and self.now() - last_motion > 20.:
-            # Stopped at another floor and the car is not moving on: press the target again.
-            if self.count('car_repress') > 2:
-                self.fail('RIDE_STALLED', f'car stays at {state.floor}')
-                return
-            m.counters['_last_transit'] = self.now()
-            self.pending = None
-            self.send_elevator(ElevatorCommand.CMD_CAR_FLOOR, self.building.floor(m.floor).beacon_floor_code)
+        confirmed = self.at_confirmed_target()
+        if confirmed and door_open:
+            self.set_phase('SWITCH_MAP')
+            return
+        if door_open and self.door_open_since is not None and not state.awaiting_confirm and not confirmed:
+            # Even a rejected stop (TRANSIT with no floor) needs a bounded re-request.
+            since = max(self.door_open_since, m.counters.get('_car_request_since', -math.inf))
+            if self.now() - since > 20.:
+                if self.count('car_repress') > 2:
+                    self.fail('RIDE_STALLED', 'door stays open without a confirmed arrival')
+                    return
+                m.counters['_car_request_since'] = self.now()
+                self.request_elevator(ElevatorRequest.KIND_CAR_FLOOR, target_floor=m.floor)
         if self.elapsed() > self.p['ride_timeout']:
             self.fail('RIDE_TIMEOUT', 'did not reach the target floor')
 
@@ -1198,6 +1199,9 @@ class FloorMissionManager(Node):
         m = self.mission
         self.renew_lease()
         self.publish_twist()
+        if not self.at_confirmed_target():
+            self.set_phase('RIDING', 'arrival no longer confirmed')
+            return
         if m.counters.get('_loaded_map') == m.floor:
             self.start_alighting()
             return
@@ -1230,10 +1234,6 @@ class FloorMissionManager(Node):
             self.fail('ALIGHTING_FAILED', reason)
             return
         geometry = self.geometry(self.mission.floor)
-        if not already_in_car:
-            # Only a body in the doorway needs the door held; from the car centre the
-            # door must be allowed to close so the target floor can be pressed again.
-            self.hold_door(self.p['door_open_repeat_exit'])
         self.set_phase('RETURN_TO_CAR', reason)
         if already_in_car:
             self.mission.counters['_return_arrived'] = True
@@ -1243,6 +1243,10 @@ class FloorMissionManager(Node):
 
     def phase_alighting(self):
         m = self.mission
+        if not m.counters.get('_exit_started') and not self.at_confirmed_target():
+            self.publish_twist()
+            self.set_phase('RIDING', 'arrival no longer confirmed')
+            return
         geometry = self.geometry(m.floor)
         if self.pose is not None:
             front = -self.depth(m.floor, geometry.car_door) + HALF_LENGTH
@@ -1250,7 +1254,6 @@ class FloorMissionManager(Node):
                 self.return_to_car('door closing before the threshold',
                                    already_in_car=not m.counters.get('_exit_started'))
                 return
-            self.rearm_door_open(geometry)
         self.renew_lease()
         if not m.counters.get('_exit_started'):
             if self.elapsed() >= self.p['alight_block_timeout']:
@@ -1258,7 +1261,7 @@ class FloorMissionManager(Node):
                 return
             stop = self.stop_geometry(m.floor)
             region = exit_region(geometry, stop.hall_exit_pose, self.p['space_margin'], self.p['wall_margin'])
-            clear = self.space_clear(region)
+            clear = self.space_clear(region, geometry)
             # A clear-confirmation interval is still a hold, but not an obstacle.
             blocked = not clear and '_clear_since' not in m.counters
             duration = self.blocked_for(blocked)
@@ -1324,27 +1327,14 @@ class FloorMissionManager(Node):
         self.renew_lease()
         since = m.counters.setdefault('_return_wait_since', self.now())
         if self.door_state() == ElevatorDoorState.OPEN:
-            self.start_alighting()
-        elif self.now() - since > 15.:
-            if self.p['use_door_open_button'] and self.count('return_open_press') <= 2:
-                self.hold_door(self.p['door_open_repeat_exit'])
-                m.counters['_return_wait_since'] = self.now()
+            if self.at_confirmed_target():
+                self.start_alighting()
             else:
-                self.pending = None
-                self.set_phase('SELECT_FLOOR', 'requesting target floor again after canceled exit')
-
-    def rearm_door_open(self, geometry):
-        """A slow exit outlasts the repeats: extend them once more, not every second."""
-        m = self.mission
-        pending = self.door_pending
-        rear_in_doorway = self.depth(m.floor, geometry.hall_door) + HALF_LENGTH > 0.
-        if (not rear_in_doorway or pending is None or not pending.acked
-                or self.now() - pending.acked_at < self.p['door_open_rearm_s']
-                or m.counters.get('_door_rearms', 0) >= self.p['door_open_rearm_max']):
-            return
-        m.counters['_door_rearms'] = m.counters.get('_door_rearms', 0) + 1
-        self.count('door_open_rearms')
-        self.hold_door(self.p['door_open_repeat_exit'])
+                self.set_phase('RIDING', 'arrival no longer confirmed')
+        elif self.now() - since > 15.:
+            self.set_phase('SELECT_FLOOR', 'requesting target floor again after canceled exit')
+        else:
+            self._debug_door_hold = True
 
     def publish_initial_pose(self):
         if self.pose is None:
@@ -1381,12 +1371,22 @@ class FloorMissionManager(Node):
         elif step == 'seed':
             if self.localization.get('state') == 'WAITING_INITIAL_POSE' and self.publish_initial_pose():
                 m.counters['_relocalize'] = 'verify'
-                m.counters['_seeded_at'] = self.now()
+                m.counters['_seeded_at'] = m.counters['_last_seed'] = self.now()
         elif step == 'verify':
             if self.ready():
-                m.counters.pop('_relocalize', None)
-                m.counters.pop('_seeded_at', None)
+                for key in ('_relocalize', '_seeded_at', '_last_seed'):
+                    m.counters.pop(key, None)
                 self.set_phase(m.counters.pop('_after_relocalize', 'NAV_TO_GOAL'))
+                return
+            # Before the global search, re-check the same hall pose: a door left open
+            # (people, long dwell) only spoils the scan while it stays open.
+            if (m.counters.get('relocalize_reseeds', 0) < self.p['relocalize_reseeds']
+                    and self.now() - m.counters['_last_seed'] >= self.p['relocalize_reseed_period']
+                    and self.localization.get('state') in ('VERIFYING', 'WAITING_INITIAL_POSE')
+                    and self.publish_initial_pose()):
+                attempt = self.count('relocalize_reseeds')
+                m.counters['_seeded_at'] = m.counters['_last_seed'] = self.now()
+                self.get_logger().info(f'Hall pose not verified yet; re-checking it ({attempt}/{self.p["relocalize_reseeds"]})')
                 return
             if self.now() - m.counters['_seeded_at'] > self.p['relocalize_timeout']:
                 if self.count('tim_relocalize') > 1:

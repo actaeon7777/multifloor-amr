@@ -52,6 +52,9 @@ class FloorElevator:
     car_inward_yaw: float
     hall_wait_pose: Pose
     hall_exit_pose: Pose
+    # Depth points lower than this inside the car-door sill band are ignored by the
+    # boarding/exit space checks: a hall lower than the car makes the sill read as an obstacle.
+    sill_ignore_height_m: float = 0.
 
 
 @dataclass(frozen=True)
@@ -65,7 +68,6 @@ class Room:
 class Floor:
     name: str
     level: int
-    beacon_floor_code: int
     real_enabled: bool
     provisional_copy_of: Optional[str]
     map: str
@@ -81,12 +83,11 @@ class Floor:
 class PassFloor:
     """A floor the car stops at but the AMR has no map for (``pass_floors``).
 
-    Its hall beacon only tells the floor state that the car is at another floor,
-    so the ride continues; it can never be a mission goal.
+    Names and levels are retained for floor recognition; these floors can never
+    be mission goals.
     """
     name: str
     level: int
-    beacon_floor_code: int
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ class ElevatorGeometry:
     car_polygon: Tuple[Point, Point, Point, Point]
     car_pose: Pose
     hall_entry: Optional[Tuple[Point, Point]] = None
+    sill_ignore_height_m: float = 0.
 
 
 @dataclass(frozen=True)
@@ -138,12 +140,6 @@ class BuildingConfig:
             return self.floors[name]
         except KeyError:
             raise FloorConfigError(f'unknown floor {name!r}') from None
-
-    def floor_by_beacon_code(self, code: int) -> Optional[Floor]:
-        return next((f for f in self.floors.values() if f.beacon_floor_code == code), None)
-
-    def pass_floor_by_beacon_code(self, code: int) -> Optional[PassFloor]:
-        return next((f for f in self.pass_floors.values() if f.beacon_floor_code == code), None)
 
     def find_room(self, room_id: str, floor: Optional[str] = None) -> Tuple[Floor, Room]:
         """Return the floor and room; ``floor`` is required only if ambiguous."""
@@ -189,6 +185,7 @@ def elevator_geometry(spec: ElevatorSpec, stop: FloorElevator) -> ElevatorGeomet
         car_polygon=(at(near, right), at(far, right), at(far, left), at(near, left)),
         car_pose=(centre[0], centre[1], outward),
         hall_entry=(at(-spec.hall_recess_m, half_door), at(-spec.hall_recess_m, -half_door)),
+        sill_ignore_height_m=stop.sill_ignore_height_m,
     )
 
 
@@ -239,16 +236,15 @@ def parse_floor_config(raw, source: Optional[Path] = None,
     default_floor = str(data.get('default_floor'))
     if default_floor not in floors:
         raise FloorConfigError(f'{where}: default_floor {default_floor!r} is not a floor')
-    pass_floors = {str(k): PassFloor(str(k), *_level_and_code(
+    pass_floors = {str(k): PassFloor(str(k), _level(
                        f'pass floor {k}', _mapping(v, f'{where}.pass_floors.{k}')))
                    for k, v in _mapping(data.get('pass_floors', {}), f'{where}.pass_floors').items()}
     for name in pass_floors:
         if name in floors:
             raise FloorConfigError(f'{where}: pass floor {name!r} is also a mapped floor')
-    for key in ('level', 'beacon_floor_code'):
-        values = [getattr(f, key) for f in (*floors.values(), *pass_floors.values())]
-        if len(set(values)) != len(values):
-            raise FloorConfigError(f'{where}: duplicate {key}')
+    levels = [f.level for f in (*floors.values(), *pass_floors.values())]
+    if len(set(levels)) != len(levels):
+        raise FloorConfigError(f'{where}: duplicate level')
     for item in floors.values():
         if item.provisional_copy_of is not None and item.provisional_copy_of not in floors:
             raise FloorConfigError(f'floor {item.name}: provisional_copy_of is not a floor')
@@ -288,22 +284,16 @@ def _elevator_spec(name, data) -> ElevatorSpec:
     return ElevatorSpec(name, width, depth, door, offset, threshold, (open_min, open_max), recess)
 
 
-def _level_and_code(label, data):
-    code = data.get('beacon_floor_code')
-    if not isinstance(code, int) or isinstance(code, bool) or not -128 <= code <= 127 or code == 0:
-        raise FloorConfigError(f'{label}: beacon_floor_code must be a non-zero int8 (0 is the car)')
-    if not -8 <= code <= 20:
-        # Hall beacon RF node 0x40 + code must stay in 0x38-0x54 (ELEVATOR_RF_PROTOCOL.md 4).
-        raise FloorConfigError(f'{label}: beacon_floor_code must be in -8..20')
+def _level(label, data):
     level = data.get('level')
     if not isinstance(level, int) or isinstance(level, bool):
         raise FloorConfigError(f'{label}: level must be an integer')
-    return level, code
+    return level
 
 
 def _floor(name, data, elevators) -> Floor:
     label = f'floor {name}'
-    level, code = _level_and_code(label, data)
+    level = _level(label, data)
     real_enabled = data.get('real_enabled', False)
     if not isinstance(real_enabled, bool):
         raise FloorConfigError(f'{label}: real_enabled must be true or false')
@@ -319,6 +309,7 @@ def _floor(name, data, elevators) -> Floor:
             _number(value.get('car_inward_yaw'), f'{label}.{key}.car_inward_yaw'),
             _numbers(value.get('hall_wait_pose'), 3, f'{label}.{key}.hall_wait_pose'),
             _numbers(value.get('hall_exit_pose'), 3, f'{label}.{key}.hall_exit_pose'),
+            _sill_height(value.get('sill_ignore_height_m', 0.), f'{label}.{key}.sill_ignore_height_m'),
         )
     rooms: Dict[str, Room] = {}
     for key, value in _mapping(data.get('rooms', {}), f'{label}.rooms').items():
@@ -329,7 +320,7 @@ def _floor(name, data, elevators) -> Floor:
             None if door is None else _numbers(door, 2, f'{label}.rooms.{key}.door'))
     copy_of = data.get('provisional_copy_of')
     return Floor(
-        name=name, level=level, beacon_floor_code=code, real_enabled=real_enabled,
+        name=name, level=level, real_enabled=real_enabled,
         provisional_copy_of=None if copy_of is None else str(copy_of),
         map=_text(data.get('map'), f'{label}.map'),
         annotations=None if data.get('annotations') is None else _text(data['annotations'], f'{label}.annotations'),
@@ -356,6 +347,13 @@ def _number(value, where):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise FloorConfigError(f'{where}: expected a finite number')
     return float(value)
+
+
+def _sill_height(value, where):
+    value = _number(value, where)
+    if not 0. <= value <= .15:
+        raise FloorConfigError(f'{where}: expected 0 to 0.15 m')
+    return value
 
 
 def _positive(value, where):

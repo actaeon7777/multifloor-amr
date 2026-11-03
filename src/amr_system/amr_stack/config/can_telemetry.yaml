@@ -19,9 +19,10 @@ can_telemetry:
     # If the sensor range is changed, these MUST match the actual registers.
     accel_range_g: 2
     gyro_range_dps: 125
-    # Measured stationary on the floor for 60 s, 2026-09-29; subtract XYZ in rad/s.
-    # Source: diagnostics/stationary_2026-09-29_015102/result.json
-    gyro_bias: [-0.012650764556, 0.001503619331, 0.000257072454]
+    # Measured stationary for 120 s, 2026-11-02 (previous 2026-09-29: [-0.012650764556, 0.001503619331, 0.000257072454]).
+    # Z had grown 0.000257 -> 0.000427 rad/s; while driving it was ~0.00065, so the zero rate still wanders.
+    # Source: diagnostics/stationary_2026-11-02_062001/result.json
+    gyro_bias: [-0.012862142370, 0.001159585901, 0.000427299724]
     odom_frame: odom
     base_frame: base_footprint
     imu_frame: imu_link

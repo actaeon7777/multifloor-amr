@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Watch multi-floor missions in the Isaac Sim GUI (stacked building, domain 107).
+"""Arrival confirmation relies on simulator auto_confirm=true.
+The operator-supplied --start-floor initializes /floor/set_current before missions.
+
+Watch multi-floor missions in the Isaac Sim GUI (stacked building, domain 107).
 
 Starts ``experiment.sh sim world:=building`` with the Isaac window, waits for AUTO
 (no joystick is started) as in run_sim_trial.py, then sends the given
@@ -69,7 +72,8 @@ def main():
     try:
         print('Isaac Sim, 위치 추정, Nav2를 기다립니다 (GUI 첫 실행은 몇 분 걸릴 수 있음)...', flush=True)
         node.initialize()
-        node.until(lambda: node.floor_state is not None and node.floor_state.confidence in ('BEACON', 'CONFIRMED'), 60)
+        node.set_start_floor(args.start_floor)
+        node.until(lambda: node.floor_state is not None and node.floor_state.confidence in ('CONFIRMED', 'VERIFIED'), 60)
         print(f'AUTO 전환 완료. 현재 층 {node.floor_state.floor}.', flush=True)
         event('ready', floor=node.floor_state.floor)
         for floor, room, pose in stops:

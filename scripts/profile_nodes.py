@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PATTERNS = [
     'navigation_startup', 'navigation_manager', 'scan_body_filter', 'joy_autoselect',
     'joy_node', 'joy_teleop', 'control_mux', 'time_health', 'can_telemetry',
-    'cmd_vel_to_can', 'elevator_can_link', 'vehicle_status', 'ekf_node',
+    'cmd_vel_to_can', 'vehicle_status', 'ekf_node',
     'web_ui', 'remote_client', 'remote_bridge', 'elevator_monitor', 'floor_mission',
     'mission_node', 'monitor_node', 'controller_server', 'planner_server',
     'bt_navigator', 'behavior_server', 'smoother_server', 'velocity_smoother',

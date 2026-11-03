@@ -51,15 +51,15 @@ test('only owned, unacknowledged room results appear, before readiness', () => {
     assert.equal(K.selectScreen(ready({goal:goal(status,{room:''})}),own), 'idle');
   }
 });
-test('every readiness gate locks picker; confirmed, beacon and assumed floors work', () => {
+test('every readiness gate locks picker; confirmed, verified and assumed floors work', () => {
   for (const change of [{localization:null},{localization:{ready:false}}, {localization:{ready:true,age:2}},
     {action_ready:false}, {floor:null}, {floor:{floor:'4F',confidence:'ASSUMED',zone:2}},
     {floor:{floor:'4F',confidence:'TRANSIT',zone:2}}, {floor:{floor:'4F',confidence:'UNKNOWN',zone:0}},
     {floor:{floor:null,confidence:'TRANSIT'}},{tf_error:'missing'}, {localization_reset_pending:true},
     {pending_request:{request_id:'admin_123'}}]) assert.equal(K.selectScreen(ready(change)), 'localizing');
   assert.equal(K.selectScreen(ready()), 'idle');
-  assert.equal(K.selectScreen(ready({floor:{floor:'3F',confidence:'BEACON'}})), 'idle');
-  // No hall beacon since startup: same-floor rooms open, other floors wait for confirmation.
+  assert.equal(K.selectScreen(ready({floor:{floor:'3F',confidence:'VERIFIED'}})), 'idle');
+  // No operator confirmation since startup: same-floor rooms open, other floors wait for confirmation.
   assert.equal(K.selectScreen(ready({floor:{floor:'4F',confidence:'ASSUMED',zone:1}})), 'idle');
   assert.equal(K.floorConfirmed(ready({floor:{floor:'4F',confidence:'ASSUMED',zone:1}})), false);
   assert.equal(K.floorConfirmed(ready()), true);
@@ -173,6 +173,7 @@ function browserFixture() {
     }
     get innerHTML(){return this.html;}
     set innerHTML(value){
+      this.htmlWrites=(this.htmlWrites || 0)+1;
       this.children.forEach(id=>elements.delete(id));this.children=[];this.html=value;
       for(const m of value.matchAll(/<(\w+)\b([^>]*)>/g)) {
         const id=m[2].match(/\bid="([^"]*)"/)?.[1] || (m[1]==='button'?`button-${++serial}`:null);
@@ -190,7 +191,8 @@ function browserFixture() {
   const floors=[{name:'4F',level:4,selectable:true,map:{width:100,height:100,resolution:0.1,
     origin:[0,0,0],render_origin:[0,0,0],transform_valid:true,version:1},rooms:[{id:'402',x:2,y:3,yaw:0}]}];
   floors.push({...copy(floors[0]), name:'3F',level:3,map:{...copy(floors[0].map),version:17},rooms:[{id:'301',x:4,y:5,yaw:0.7}]});
-  let failState=false, rejectAdmin=false;
+  let failState=false, rejectAdmin=false, patrolError=null, arrivalPending=[], arrivalError=null;
+  let holdArrival=false;
   const env={window:{}, document:{hidden:false,getElementById:id=>elements.get(id)||null,
     addEventListener:(name,fn)=>{handlers[name]=fn;},
     querySelectorAll(selector){const attr=selector.slice(6,-1).replace(/-([a-z])/g,(_,c)=>c.toUpperCase());return [...elements.values()].filter(e=>e.dataset[attr]!==undefined);}},
@@ -203,10 +205,21 @@ function browserFixture() {
     fetch:async(url,options={})=>{
       requests.push({url,options});
       if(url==='/api/kiosk/state'){if(failState)throw Error('offline');return {ok:true,json:async()=>copy(state)};}
-      if(url==='/api/floors')return {ok:true,json:async()=>({floors,current_floor:'4F'})};
+      if(url==='/api/floors')return {ok:true,json:async()=>({floors,pass_floors:[{name:'2F',level:2},{name:'1F',level:1}],current_floor:'4F'})};
       if(url.includes('/map.png'))return {ok:true,headers:{get:()=> '1'},blob:async()=>({})};
       if(url==='/api/acknowledge'){state.acknowledged_request=JSON.parse(options.body).request_id;return {ok:true,json:async()=>({})};}
+      if(url==='/api/floor/arrival_confirm') {
+        if(holdArrival) return await new Promise(resolve=>{arrivalPending.push(resolve);});
+        return arrivalError ? {ok:false,json:async()=>({error:arrivalError})} : {ok:true,json:async()=>({})};
+      }
       if(url==='/api/kiosk/unlock')return {ok:true,json:async()=>({token:'memory-only',expires_in:600})};
+      if(url==='/api/patrol/start' || url==='/api/patrol/stop') {
+        if(patrolError)return {ok:false,status:patrolError.status,json:async()=>({error:patrolError.detail})};
+        const body=JSON.parse(options.body), active=url.endsWith('/start');
+        state.patrol={...state.patrol,active,route:body.route || state.patrol?.route,phase:active?'NAV':'ABORTED',index:1,total:12,age:0};
+        state.notice={request_id:body.request_id,status:'SUCCEEDED',detail:''};
+        return {ok:true,status:202,json:async()=>({request_id:body.request_id})};
+      }
       if(url==='/api/initialpose' && rejectAdmin)return {ok:false,status:403,json:async()=>({error:'토큰 만료'})};
       return {ok:true,json:async()=>({})};
     },
@@ -218,6 +231,9 @@ function browserFixture() {
   return {env,elements,requests,timers,frames,handlers,intervals,settle,
     get draws(){return draws;}, get storage(){return storage;},
     setState:s=>{state=s;},fail:()=>{failState=true;},rejectAdmin:()=>{rejectAdmin=true;},
+    holdArrival:()=>{holdArrival=true;}, finishArrival:(error=null)=>{arrivalPending.shift()({ok:!error,json:async()=>error?{error}:{}});},
+    rejectArrival:detail=>{arrivalError=detail;},
+    rejectPatrol:(status,detail)=>{patrolError={status,detail};},
     setTime:n=>{time=n;},
     draw(){const queued=[...frames.values()];frames.clear();queued.forEach(fn=>fn());},
     async poll(){const entry=[...timers.entries()].find(([,v])=>v.ms===500);assert(entry,'scheduled polling');timers.delete(entry[0]);await entry[1].fn();await settle();},
@@ -369,7 +385,7 @@ test('assumed floor opens same-floor rooms and locks other floors until confirme
   assert.equal(room('402').disabled,false);
   await b.click('floor','3F');
   assert.equal(room('301').disabled,true);assert.match(b.elements.get('rooms').innerHTML,/현재 층 확인 후 다른 층/);
-  b.setState(ready({floor:{floor:'4F',confidence:'BEACON',zone:1}}));await b.poll();
+  b.setState(ready({floor:{floor:'4F',confidence:'CONFIRMED',zone:1}}));await b.poll();
   assert.equal(room('301').disabled,false);assert.doesNotMatch(b.elements.get('rooms').innerHTML,/lock-note/);
   await b.click('floor','4F');await b.click('room','402');await b.click('action','depart');await fireDeparture(b);
   assert.equal(JSON.parse(b.requests.find(r=>r.url==='/api/goal').options.body).room,'402');
@@ -455,4 +471,248 @@ test('held admin remains reachable and return home hides delivery stop', async (
     assert.equal(b.elements.get('stop-wrap').hidden,true);
     assert.equal(b.elements.get(kind==='goal'?'drive-label':'transit-label').textContent,'관리자 호출로 복귀 중');
   }
+});
+
+test('fresh patrol locks deliveries after held and before transit', () => {
+  const patrol={active:true,route:'4F_full',phase:'NAV',index:1,total:12,age:0.2};
+  const s=ready({patrol,goal:goal('ACCEPTED',{kind:'floor_goal'})});
+  assert.equal(K.selectScreen(s),'patrol');
+  assert.equal(K.readyForGoal(s),false);
+  assert.equal(K.selectScreen({...s,hold:{held:true}}),'held');
+  assert.equal(K.selectScreen({...s,mode:'MANUAL'}),'manual');
+  assert.equal(K.selectScreen({...s,estop:{state:'ESTOP'}}),'estop');
+  for(const age of [3,4,null,undefined,'0',NaN,-1]) {
+    const stale=ready({patrol:{...patrol,age}});
+    assert.equal(K.selectScreen(stale),'idle');
+    assert.equal(K.readyForGoal(stale),true);
+  }
+  for(const phase of ['DONE','ABORTED']) assert.equal(K.selectScreen(ready({patrol:{...patrol,active:false,phase}})),'idle');
+});
+
+test('patrol warning renders progress, keeps admin reachable and removes delivery controls', async () => {
+  const b=browserFixture();await b.settle();
+  b.setState(ready({patrol:{active:true,route:'4F_full',phase:'DWELL',index:3,total:12,age:0},
+    kiosk:{pin_required:false},goal:goal()}));await b.poll();
+  assert.equal(b.elements.get('status-label').textContent,'야간 순찰 중');
+  assert(b.elements.get('status-pill').className.includes('warn'));
+  assert(b.elements.get('screen').innerHTML.includes('순찰이 끝날 때까지 배송을 받지 않습니다.'));
+  assert.equal(b.elements.get('patrol-progress').textContent,'4F_full · 3/12 · 관측');
+  assert.equal(b.elements.get('stop'),undefined);
+  assert.equal(b.elements.get('admin-button').disabled,false);
+  await b.click('action','admin');
+  assert.equal(b.elements.get('app').className,'app admin');
+});
+
+test('patrol admin status reports waiting, progress and terminal results defensively', () => {
+  assert.equal(K.patrolAdminStatus(null),'대기');
+  for(const [phase,label] of [['NAV','이동'],['DWELL','관측'],['RETURN','복귀']]) {
+    const s=ready({patrol:{active:true,age:0,route:'4F_full',index:2,total:12,phase}});
+    assert.equal(K.patrolAdminStatus(s),`4F_full 2/12 · ${label}`);
+    assert.equal(K.patrolAdminStatus({...s,patrol:{...s.patrol,age:3}}),'대기');
+  }
+  assert.equal(K.patrolAdminStatus({patrol:{phase:'DONE'}}),'완료');
+  assert.equal(K.patrolAdminStatus({patrol:{phase:'ABORTED',detail:'관리자 요청'}}),'중단: 관리자 요청');
+});
+
+test('patrol admin start and stop have independent enable rules', () => {
+  const s=ready({patrol:{active:false,routes:['4F_full'],age:0}}), live={online:true};
+  assert.deepEqual(copy(K.patrolAdminControls(s,live)),{start:true,stop:false});
+  for(const options of [{}, {online:false}, {...live,busy:true}, {...live,blocked:true}])
+    assert.equal(K.patrolAdminControls(s,options).start,false);
+  for(const changes of [{hold:{held:true}}, {goal:goal()}, {patrol:{routes:[]}}, {patrol:{routes:null}}])
+    assert.equal(K.patrolAdminControls({...s,...changes},live).start,false);
+  const active={...s,goal:goal(),hold:{held:true},patrol:{...s.patrol,active:true}};
+  assert.deepEqual(copy(K.patrolAdminControls(active,{...live,blocked:true})),{start:false,stop:true});
+  assert.equal(K.patrolAdminControls(active,{...live,busy:true}).stop,false);
+  assert.equal(K.patrolAdminControls(active,{online:false}).stop,false);
+  assert.equal(K.patrolAdminControls({...active,patrol:{...active.patrol,age:3}},live).stop,false);
+});
+
+test('patrol route choices retain selection and only rewrite options when routes change', async () => {
+  const b=browserFixture();await b.settle();
+  const s=ready({kiosk:{pin_required:false},patrol:{routes:['4F_full','4F_short'],active:false}});
+  b.setState(s);await b.poll();await b.click('action','admin');
+  const route=b.elements.get('patrol-route'), writes=route.htmlWrites;
+  assert.equal(route.value,'4F_full');
+  route.value='4F_short';b.elements.get('app').listeners.change({target:route});
+  await b.poll();assert.equal(route.htmlWrites,writes);assert.equal(route.value,'4F_short');
+  b.setState({...s,patrol:{...s.patrol,routes:['4F_short','new_route']}});await b.poll();
+  assert.equal(route.htmlWrites,writes+1);assert.equal(route.value,'4F_short');
+  await b.click('action','exit');await b.click('action','admin');
+  assert.equal(b.elements.get('patrol-route').value,'4F_short');
+  b.setState({...s,patrol:{routes:[]}});await b.poll();
+  assert.equal(b.elements.get('patrol-start').disabled,true);
+  assert.equal(b.elements.get('patrol-route').value,'');
+});
+
+for(const pin of [false,true]) test(`patrol admin sends kiosk commands with PIN=${pin} and exits only on start`, async () => {
+  const b=browserFixture();await b.settle();
+  b.setState(ready({kiosk:{pin_required:pin},patrol:{routes:['4F_full'],active:false,phase:'IDLE'}}));await b.poll();
+  const enter=async()=>{await b.click('action','admin');if(pin){await b.click('pin','1');await b.click('action','unlock');}};
+  await enter();assert.equal(b.elements.get('patrol-admin-status').textContent,'대기');
+  await b.click('action','patrol-start');
+  assert.equal(b.elements.get('app').className,'app');
+  assert.equal(b.elements.get('status-label').textContent,'야간 순찰 중');
+  // Stop must work while the existing adminBlocked() rejects moving/active goals.
+  b.setState(ready({kiosk:{pin_required:pin},navigation:'RUNNING',goal:goal(),
+    patrol:{routes:['4F_full'],active:true,phase:'NAV',age:0,route:'4F_full',index:1,total:12}}));await b.poll();
+  await enter();assert.equal(b.elements.get('patrol-start').disabled,true);
+  assert.equal(b.elements.get('patrol-stop').disabled,false);
+  assert.equal(b.elements.get('patrol-admin-status').textContent,'4F_full 1/12 · 이동');
+  // The fake server will finish the navigation before the next state update.
+  b.setState(ready({kiosk:{pin_required:pin},patrol:{routes:['4F_full'],active:true,phase:'NAV',age:0,route:'4F_full'}}));
+  await b.click('action','patrol-stop');
+  assert.equal(b.elements.get('app').className,'app admin');
+  assert.equal(b.elements.get('patrol-stop').disabled,true);
+  const sent=b.requests.filter(r=>r.url.startsWith('/api/patrol/'));
+  assert.deepEqual(sent.map(r=>r.url),['/api/patrol/start','/api/patrol/stop']);
+  for(const [i,r] of sent.entries()) {
+    assert.equal(r.options.headers['X-AMR-Client'],'kiosk');
+    assert.equal(r.options.headers['X-AMR-Kiosk-Token'],pin?'memory-only':undefined);
+    const payload=JSON.parse(r.options.body);assert.match(payload.request_id,/^[A-Za-z0-9_-]{8,80}$/);
+    assert.deepEqual(Object.keys(payload).sort(),i===0?['request_id','route']:['request_id']);
+    if(i===0)assert.equal(payload.route,'4F_full');
+  }
+});
+
+for(const [status,detail] of [[409,'등록되지 않은 순찰 경로입니다.'],[403,'관리 모드 잠금을 먼저 해제하세요.']])
+  test(`patrol admin surfaces HTTP ${status} and handles rejected start`, async () => {
+    const b=browserFixture();await b.settle();
+    b.setState(ready({kiosk:{pin_required:false},patrol:{routes:['4F_full'],active:false}}));await b.poll();
+    await b.click('action','admin');b.rejectPatrol(status,detail);await b.click('action','patrol-start');
+    assert.equal(b.elements.get('toast').textContent,detail);
+    assert.equal(b.elements.get('app').className,status===403?'app':'app admin');
+  });
+
+
+test('arrival card renders, disables both buttons in flight, submits without PIN and hides',async()=>{
+  const b=browserFixture();await b.settle();
+  assert.equal(b.elements.get('arrival-confirm').hidden,true);
+  b.setState(ready({floor:{floor:'3F',zone:2,confidence:'ASSUMED',awaiting_confirm:true,candidate_id:7}}));await b.poll();
+  assert.equal(b.elements.get('arrival-confirm').hidden,false);
+  assert.equal(b.elements.get('arrival-title').textContent,'엘리베이터가 3F에 도착했나요?');
+  assert.equal(b.elements.get('arrival-yes').textContent,'네, 3F입니다');
+  b.holdArrival();const click=b.click('action','arrival-yes');await b.settle();
+  assert.equal(b.elements.get('arrival-yes').disabled,true);
+  assert.equal(b.elements.get('arrival-no').disabled,true);
+  await b.poll();assert.equal(b.elements.get('arrival-no').disabled,true);
+  const req=b.requests.find(r=>r.url==='/api/floor/arrival_confirm');
+  assert.deepEqual(JSON.parse(req.options.body),{floor:'3F',candidate_id:7,accepted:true});
+  assert.equal(req.options.headers['X-AMR-Client'],'kiosk');
+  assert.equal(req.options.headers['X-AMR-Kiosk-Token'],undefined);
+  b.finishArrival();await click;
+  assert.equal(b.elements.get('arrival-no').disabled,false);
+  b.setState(ready());await b.poll();assert.equal(b.elements.get('arrival-confirm').hidden,true);
+});
+
+test('arrival rejection sends false and shows server error, cleared for next candidate',async()=>{
+  const b=browserFixture();await b.settle();
+  b.setState(ready({floor:{floor:'3F',zone:2,awaiting_confirm:true,candidate_id:7}}));await b.poll();
+  b.rejectArrival('지금은 도착 층을 확인할 단계가 아닙니다.');await b.click('action','arrival-no');
+  await b.click('actualFloor','');
+  assert.deepEqual(JSON.parse(b.requests.find(r=>r.url==='/api/floor/arrival_confirm').options.body),{floor:'3F',candidate_id:7,accepted:false,actual_floor:''});
+  assert.equal(b.elements.get('arrival-error').textContent,'지금은 도착 층을 확인할 단계가 아닙니다.');
+  assert.equal(b.elements.get('arrival-yes').disabled,false);
+  b.setState(ready());await b.poll();
+  b.setState(ready({floor:{floor:'3F',zone:2,awaiting_confirm:true,candidate_id:7}}));await b.poll();
+  assert.equal(b.elements.get('arrival-error').textContent,'');
+  b.fail();await b.poll();assert.equal(b.elements.get('arrival-confirm').hidden,true);
+});
+
+test('request hint follows active mission request and hides on cancel or completion',async()=>{
+  const b=browserFixture();await b.settle();
+  for(const [r,expected] of [
+    [{kind:'CALL',direction:1},'엘리베이터 ▲ 위로 버튼을 눌러 주세요'],
+    [{kind:'CALL',direction:2},'엘리베이터 ▼ 아래로 버튼을 눌러 주세요'],
+    [{kind:'CAR_FLOOR',target_floor:'5F'},'엘리베이터 안에서 5F 버튼을 눌러 주세요'],
+    [{kind:'CANCEL'},'']]) {
+    b.setState(ready({floor_mission:{phase:'RIDING'},elevator_request:r}));await b.poll();
+    assert.equal(b.elements.get('elevator-request-hint').textContent,expected);
+    assert.equal(b.elements.get('elevator-request-hint').hidden,!expected);
+  }
+  b.setState(ready({floor_mission:{phase:'SUCCEEDED'},elevator_request:{kind:'CALL',direction:1}}));await b.poll();
+  assert.equal(b.elements.get('elevator-request-hint').hidden,true);
+});
+
+test('new candidate ID resets same-floor card and ignores the prior in-flight response',async()=>{
+  const b=browserFixture();await b.settle();
+  const candidate=id=>ready({floor:{floor:'3F',zone:2,awaiting_confirm:true,candidate_id:id}});
+  b.setState(candidate(7));await b.poll();
+  b.holdArrival();const first=b.click('action','arrival-yes');await b.settle();
+  assert.equal(b.elements.get('arrival-yes').disabled,true);
+  b.setState(candidate(8));await b.poll();
+  assert.equal(b.elements.get('arrival-yes').disabled,false);
+  assert.equal(b.elements.get('arrival-no').disabled,false);
+  assert.equal(b.elements.get('arrival-error').textContent,'');
+  await b.click('action','arrival-no');const second=b.click('actualFloor','');await b.settle();
+  b.finishArrival('이전 후보 응답 거절');await first;
+  assert.equal(b.elements.get('arrival-error').textContent,'');
+  assert.equal(b.elements.get('arrival-yes').disabled,true,'old response must not enable the current request');
+  assert.equal(b.elements.get('arrival-no').disabled,true);
+  b.finishArrival('새 후보 응답 오류');await second;
+  assert.equal(b.elements.get('arrival-error').textContent,'새 후보 응답 오류');
+  b.setState(candidate(9));await b.poll();
+  assert.equal(b.elements.get('arrival-error').textContent,'');
+  assert.equal(b.elements.get('arrival-yes').disabled,false);
+  const bodies=b.requests.filter(r=>r.url==='/api/floor/arrival_confirm').map(r=>JSON.parse(r.options.body));
+  assert.deepEqual(bodies,[{floor:'3F',candidate_id:7,accepted:true},{floor:'3F',candidate_id:8,accepted:false,actual_floor:''}]);
+});
+
+test('admin arrival card resets same-floor candidate and isolates delayed responses',async()=>{
+  const elements=new Map(), pending=[], requests=[];
+  const element=id=>{if(!elements.has(id))elements.set(id,{hidden:false,disabled:false,textContent:'',
+    children:[],replaceChildren(){this.children=[];},appendChild(child){this.children.push(child);},
+    addEventListener(_name,fn){this.click=fn;}});return elements.get(id);};
+  element('transit-view').hidden=true; // Exercise the persistent confirmation controls alone.
+  const env={window:{},document:{getElementById:element,createElement:()=>({addEventListener(_name,fn){this.click=fn;}})},AbortSignal,
+    fetch:async(_url,options)=>{requests.push(JSON.parse(options.body));return await new Promise(resolve=>pending.push(resolve));}};
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../web/transit.js'),'utf8'),env);
+  const update=id=>env.window.AMRTransit.update({floor:{floor:'3F',awaiting_confirm:true,candidate_id:id,candidate_source:'VISION'},
+    arrival_floors:[{name:'4F',level:4},{name:'3F',level:3},{name:'1F',level:1}]},true);
+  update(7);const first=element('transit-confirm-yes').click();
+  update(8);assert.equal(element('transit-confirm-yes').disabled,false);
+  element('transit-confirm-no').click();
+  const picker=element('transit-confirm-picker');
+  assert.deepEqual(picker.children.map(b=>b.textContent),['1F','4F','모르겠음','뒤로']);
+  assert.equal(element('transit-confirm-source').textContent,'카메라 판단');
+  const firstButton=picker.children[0];update(8);
+  assert.equal(picker.children[0],firstButton,'polling preserves touch targets');
+  picker.children.find(b=>b.textContent==='뒤로').click();
+  assert.equal(picker.hidden,true);
+  element('transit-confirm-no').click();
+  const second=element('transit-confirm-picker').children.find(b=>b.textContent==='모르겠음').click();
+  pending.shift()({ok:false,json:async()=>({error:'old'})});await first;
+  assert.equal(element('transit-confirm-error').textContent,'');
+  assert.equal(element('transit-confirm-yes').disabled,true);
+  pending.shift()({ok:false,json:async()=>({error:'current'})});await second;
+  assert.equal(element('transit-confirm-error').textContent,'current');
+  update(9);assert.equal(element('transit-confirm-error').textContent,'');
+  assert.equal(element('transit-confirm-no').disabled,false);
+  assert.deepEqual(requests,[{floor:'3F',candidate_id:7,accepted:true},{floor:'3F',candidate_id:8,accepted:false,actual_floor:''}]);
+});
+
+
+test('kiosk no opens ordered floor picker, supports back, pass floor and candidate reset',async()=>{
+  const b=browserFixture();await b.settle();
+  const candidate=(id,source)=>ready({floor:{floor:'3F',zone:2,awaiting_confirm:true,candidate_id:id,candidate_source:source}});
+  b.setState(candidate(7,'VISION'));await b.poll();
+  assert.equal(b.elements.get('arrival-source').textContent,'카메라 판단');
+  await b.click('action','arrival-no');
+  assert.equal(b.requests.filter(r=>r.url==='/api/floor/arrival_confirm').length,0);
+  assert.equal(b.elements.get('arrival-actions').hidden,true);
+  assert.equal(b.elements.get('arrival-picker').hidden,false);
+  const html=b.elements.get('arrival-picker').innerHTML;
+  assert(!html.includes('data-actual-floor="3F"'));
+  assert(html.indexOf('data-actual-floor="1F"')<html.indexOf('data-actual-floor="2F"'));
+  assert(html.indexOf('data-actual-floor="2F"')<html.indexOf('data-actual-floor="4F"'));
+  await b.click('action','arrival-back');
+  assert.equal(b.elements.get('arrival-picker').hidden,true);
+  await b.click('action','arrival-no');
+  b.setState(candidate(8,'TARGET'));await b.poll();
+  assert.equal(b.elements.get('arrival-picker').hidden,true);
+  assert.equal(b.elements.get('arrival-source').textContent,'목적층');
+  await b.click('action','arrival-no');
+  await b.click('actualFloor','1F');
+  const body=JSON.parse(b.requests.find(r=>r.url==='/api/floor/arrival_confirm').options.body);
+  assert.deepEqual(body,{floor:'3F',candidate_id:8,accepted:false,actual_floor:'1F'});
 });

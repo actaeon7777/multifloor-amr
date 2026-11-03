@@ -17,7 +17,7 @@ import math
 from action_msgs.msg import GoalStatus
 from amr_elevator_interfaces.action import NavigateToFloorPose
 from amr_elevator_interfaces.msg import (
-    ElevatorBeacon, ElevatorCommand, ElevatorCommandStatus, ElevatorDoorState, FloorState,
+    ElevatorRequest, FloorArrivalConfirm, ElevatorDoorState, FloorState,
 )
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped, Twist
 from nav2_msgs.action import NavigateToPose
@@ -46,12 +46,22 @@ def ros():
     # isolate TF, whose default topics are absolute rather than relative.
     namespace = f'/mission_test_{uuid4().hex}'
     rclpy.init(args=['--ros-args', '-r', f'__ns:={namespace}',
-                     '-r', '/tf:=tf', '-r', '/tf_static:=tf_static'])
+                     '-r', '/tf:=tf', '-r', '/tf_static:=tf_static',
+                     '-r', '/elevator/request:=elevator/request',
+                     '-r', '/floor/arrival_confirm:=floor/arrival_confirm'])
     executor = SingleThreadedExecutor()
     peer = rclpy.create_node('mission_test_peer')
     executor.add_node(peer)
-    commands, statuses, announcements, twists, initial_poses = [], [], [], [], []
-    peer.create_subscription(ElevatorCommand, 'elevator/command', commands.append, 20)
+    requests, statuses, announcements, twists, initial_poses = [], [], [], [], []
+    fake_floor = SimpleNamespace(machine=None, state=None)
+
+    def elevator_request(message):
+        requests.append(message)
+        if fake_floor.machine is not None and message.kind == ElevatorRequest.KIND_CAR_FLOOR:
+            fake_floor.machine.on_car_target(message.target_floor)
+
+    peer.create_subscription(ElevatorRequest, 'elevator/request', elevator_request,
+                             QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     peer.create_subscription(String, 'robot/announcement',
                              lambda m: announcements.append(json.loads(m.data)), 10)
     peer.create_subscription(Twist, 'cmd_vel_maneuver', twists.append, 10)
@@ -61,8 +71,7 @@ def ros():
         floor=peer.create_publisher(FloorState, 'floor/state', LATCHED),
         pose=peer.create_publisher(PoseStamped, 'floor/pose_estimate', 10),
         door=peer.create_publisher(ElevatorDoorState, 'elevator/door', 10),
-        beacon=peer.create_publisher(ElevatorBeacon, 'elevator/beacon', 10),
-        command_status=peer.create_publisher(ElevatorCommandStatus, 'elevator/command_status', 10),
+        confirm=peer.create_publisher(FloorArrivalConfirm, 'floor/arrival_confirm', 10),
         localization=peer.create_publisher(String, 'localization/status', LATCHED),
         mode=peer.create_publisher(String, 'control_mux/mode', LATCHED),
         scan=peer.create_publisher(LaserScan, 'scan', qos_profile_sensor_data))
@@ -97,8 +106,21 @@ def ros():
                 return True
         return until is None
 
-    def floor_state(floor='4F', zone=FloorState.ZONE_OUTSIDE, confidence='BEACON'):
-        pubs.floor.publish(FloorState(zone=zone, floor=floor, confidence=confidence))
+    def floor_state(floor='4F', zone=FloorState.ZONE_OUTSIDE, confidence='CONFIRMED'):
+        if fake_floor.machine is not None:
+            pubs.floor.publish(FloorState(**dataclasses.asdict(fake_floor.machine.state)))
+        elif fake_floor.state is not None:
+            pubs.floor.publish(fake_floor.state)
+        else:
+            pubs.floor.publish(FloorState(zone=zone, floor=floor, confidence=confidence))
+
+    def arrival_confirm(message):
+        if fake_floor.machine is not None:
+            fake_floor.machine.on_arrival_confirm(
+                message.source, message.floor, message.candidate_id, message.accepted, fake_floor.now)
+            floor_state()
+
+    peer.create_subscription(FloorArrivalConfirm, 'floor/arrival_confirm', arrival_confirm, 10)
 
     pubs.localization.publish(String(data=json.dumps({'state': 'READY', 'ready': True})))
     pubs.mode.publish(String(data='AUTO'))
@@ -109,11 +131,11 @@ def ros():
         StaticTransformBroadcaster(peer).sendTransform(t)
 
     try:
-        yield SimpleNamespace(executor=executor, peer=peer, pubs=pubs, laser_tf=laser_tf, spin=spin, commands=commands,
+        yield SimpleNamespace(executor=executor, peer=peer, pubs=pubs, laser_tf=laser_tf, spin=spin, requests=requests,
                               statuses=statuses, announcements=announcements, twists=twists, initial_poses=initial_poses,
                               navigation_goals=navigation_goals, calls=calls,
                               nav_server=nav_server, nav_outcomes=nav_outcomes,
-                              floor_state=floor_state, scan_state=scan_state)
+                              floor_state=floor_state, scan_state=scan_state, fake_floor=fake_floor)
     finally:
         scan_state.enabled = False
         scan_timer.cancel()
@@ -171,7 +193,7 @@ def send(ros, floor, room='302'):
 
 def manager(ros, simulation=True, building=None, **overrides):
     node = FloorMissionManager(building=building or load_floor_config(), parameter_overrides=[
-        Parameter('simulation', value=simulation), Parameter('ack_timeout', value=.4),
+        Parameter('simulation', value=simulation),
         *[Parameter(k, value=v) for k, v in overrides.items()]])
     ros.executor.add_node(node)
     # Discovery of floor_mission/navigate alone says nothing about Nav2.
@@ -195,8 +217,8 @@ def test_goal_admission(ros):
     assert not send(ros, '9F').accepted          # unknown floor
 
 
-def test_dead_button_device_stops_safely_at_the_hall(ros):
-    manager(ros)
+def test_unopened_door_recalls_then_stops_safely_at_the_hall(ros):
+    manager(ros, door_wait_timeout=.5)
     ros.floor_state()
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
     ros.spin(.3)
@@ -207,31 +229,33 @@ def test_dead_button_device_stops_safely_at_the_hall(ros):
     assert ros.spin(6., result.done)
     keep_alive.cancel()
     assert result.result().status == GoalStatus.STATUS_ABORTED
-    assert result.result().result.error_code == 'NO_HALL_ACK'
-    calls = [c for c in ros.commands if c.command == ElevatorCommand.CMD_HALL_CALL]
-    assert len(calls) == 3 and {c.floor_code for c in calls} == {4}
-    assert {c.direction for c in calls} == {ElevatorCommand.DIR_DOWN}
+    assert result.result().result.error_code == 'DOOR_NOT_OPENED'
+    calls = [c for c in ros.requests if c.kind == ElevatorRequest.KIND_CALL]
+    assert len(calls) == 2 and {c.start_floor for c in calls} == {'4F'}
+    assert {c.target_floor for c in calls} == {'3F'}
+    assert len({c.sequence for c in calls}) == 2
+    assert sum(a['key'] == 'call' for a in ros.announcements) == 2
+    assert sum(a['key'] == 'waiting' for a in ros.announcements) == 2
+    assert ros.spin(1., lambda: sum(c.kind == ElevatorRequest.KIND_CANCEL for c in ros.requests) == 1)
+    assert {c.direction for c in calls} == {ElevatorRequest.DIR_DOWN}
     assert len(ros.navigation_goals) == 1  # only the hall leg was driven
     assert ros.statuses[-1]['phase'] == 'FAILED_SAFE'
 
 
-def test_acknowledged_call_waits_for_the_door_then_prepares_boarding(ros):
+def test_call_waits_for_the_door_then_prepares_boarding(ros):
     manager(ros)
     ros.floor_state()
     ros.spin(.3)
     handle = send(ros, '5F', '502')
     keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
-    assert ros.spin(3., lambda: ros.commands)
-    call = ros.commands[0]
-    assert (call.command, call.floor_code, call.direction) == (ElevatorCommand.CMD_HALL_CALL, 4, ElevatorCommand.DIR_UP)
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-                                           location=ElevatorBeacon.LOCATION_HALL, floor_code=4,
-                                           ack_sequence=call.sequence))
+    assert ros.spin(3., lambda: ros.requests)
+    call = ros.requests[0]
+    assert (call.kind, call.start_floor, call.target_floor, call.direction) == (
+        ElevatorRequest.KIND_CALL, '4F', '5F', ElevatorRequest.DIR_UP)
     assert ros.spin(2., lambda: ros.statuses[-1]['phase'] == 'WAIT_DOOR_OPEN')
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(3., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
     assert ros.calls['localization/suspend'] == [True] and ros.calls['navigation/maneuver_lease'][0] is True
-    assert not any(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands)  # button off by default
     cancel = handle.cancel_goal_async()
     assert ros.spin(2., cancel.done)
     result = handle.get_result_async()
@@ -247,10 +271,7 @@ def test_manual_takeover_aborts_boarding_and_blocks_new_missions(ros):
     ros.spin(.3)
     handle = send(ros, '5F', '502')
     keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
-    assert ros.spin(3., lambda: ros.commands)
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-                                           location=ElevatorBeacon.LOCATION_HALL, floor_code=4,
-                                           ack_sequence=ros.commands[0].sequence))
+    assert ros.spin(3., lambda: ros.requests)
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(4., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
     ros.pubs.mode.publish(String(data='MANUAL'))
@@ -270,9 +291,8 @@ def test_manual_takeover_aborts_boarding_and_blocks_new_missions(ros):
     assert ros.spin(3., lambda: len(ros.navigation_goals) > goals)
 
 
-@pytest.mark.parametrize('button', [False, True])
-def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros, button):
-    node = manager(ros, require_estop=True, use_door_open_button=button)
+def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros):
+    node = manager(ros, require_estop=True)
     publisher = ros.peer.create_publisher(String, 'estop/status', LATCHED)
     estop = {'state': 'ARMING', 'epoch': 0, 'sequence': 0}
 
@@ -292,20 +312,10 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros, button):
     handle = send(ros, '5F', '502')
     assert handle.accepted
     keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
-    assert ros.spin(3., lambda: ros.commands)
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-                                           location=ElevatorBeacon.LOCATION_HALL, floor_code=4,
-                                           ack_sequence=ros.commands[0].sequence))
+    assert ros.spin(3., lambda: ros.requests)
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(4., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
-    if button:
-        door = [c for c in ros.commands if c.command == ElevatorCommand.CMD_DOOR_OPEN]
-        assert [c.repeat for c in door] == [6]  # One command holds the door while boarding.
-        # Unacknowledged: pressed again with a new sequence and the same repeat count.
-        assert ros.spin(2., lambda: sum(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands) == 2)
-        door = [c for c in ros.commands if c.command == ElevatorCommand.CMD_DOOR_OPEN]
-        assert door[1].repeat == 6 and door[1].sequence != door[0].sequence
-    # The robot has now reached the doorway, restoring the repeat-15 premise.
+    # The robot has now reached the doorway.
     geometry = node.geometry('4F')
     doorway = PoseStamped()
     doorway.header.frame_id = 'map'
@@ -313,21 +323,16 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros, button):
     doorway.pose.position.y = sum(p[1] for p in geometry.car_door) / 2
     doorway.pose.orientation.z, doorway.pose.orientation.w = math.sin(math.pi/2), math.cos(math.pi/2)
     ros.pubs.pose.publish(doorway)
-    assert ros.spin(1., node.in_doorway)
-    sent = len(ros.commands)
+    assert ros.spin(1., lambda: node.pose is not None and math.hypot(
+        node.pose[0] - doorway.pose.position.x, node.pose[1] - doorway.pose.position.y) < .001)
+    sent = len(ros.requests)
     estop.update(state='ESTOP', epoch=1)
     result = handle.get_result_async()
     assert ros.spin(3., result.done)
     keep_alive.cancel()
     assert result.result().status == GoalStatus.STATUS_ABORTED
     assert result.result().result.error_code == 'ESTOP'
-    if button:
-        # Stopped at the measured doorway pose: the car beacon holds the door for ~15 s.
-        assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_DOOR_OPEN and c.repeat == 15
-                                        for c in ros.commands[sent:]))
-    else:
-        ros.spin(1.)
-        assert not any(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands)
+    assert ros.spin(1., lambda: [c.kind for c in ros.requests[sent:]] == [ElevatorRequest.KIND_CANCEL])
     assert ros.calls['navigation/maneuver_lease'][-1] is False
     assert ros.statuses[-1]['phase'] == 'FAILED_SAFE'
     estop['state'] = 'ARMING'  # Released: the bridge re-arms by itself.
@@ -336,8 +341,7 @@ def test_estop_aborts_boarding_and_blocks_missions_until_ready(ros, button):
 
 
 def test_lost_floor_state_stops_the_mission(ros):
-    # A long ack_timeout keeps the unanswered hall call from failing first.
-    manager(ros, floor_state_timeout=1., ack_timeout=10.)
+    manager(ros, floor_state_timeout=1.)
     ros.floor_state()
     ros.spin(.3)
     handle = send(ros, '3F', '302')
@@ -365,80 +369,6 @@ def test_same_floor_goal_waits_for_localization_recovery(ros):
     assert result.result().status == GoalStatus.STATUS_SUCCEEDED and len(ros.navigation_goals) == 2
 
 
-def test_late_ack_of_an_earlier_press_is_accepted(ros):
-    manager(ros)
-    ros.floor_state()
-    ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
-    ros.spin(.3)
-    send(ros, '3F', '302')
-    keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
-    assert ros.spin(3., lambda: len([c for c in ros.commands if c.command == ElevatorCommand.CMD_HALL_CALL]) >= 2)
-    first = ros.commands[0]
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-                                           location=ElevatorBeacon.LOCATION_HALL, floor_code=4,
-                                           ack_sequence=first.sequence))  # answers the first press only
-    assert ros.spin(2., lambda: ros.statuses[-1]['phase'] == 'WAIT_DOOR_OPEN')
-    keep_alive.cancel()
-
-
-def test_rejected_hall_call_fails_at_once(ros):
-    node = manager(ros, ack_timeout=3.)
-    ros.floor_state()
-    ros.spin(.3)
-    handle = send(ros, '5F', '502')
-    keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
-    assert ros.spin(3., lambda: ros.commands)
-    call = ros.commands[0]
-    # RF_TIMEOUT only waits for the normal retry; DEVICE_REJECTED can never succeed.
-    ros.pubs.command_status.publish(ElevatorCommandStatus(
-        cmd_seq=call.sequence, status=ElevatorCommandStatus.STATUS_RF_TIMEOUT,
-        device_result=ElevatorCommandStatus.RESULT_NONE, target=0x44, attempts=2))
-    ros.spin(.3)
-    assert node.mission.phase == 'CALL_ELEVATOR'
-    ros.pubs.command_status.publish(ElevatorCommandStatus(
-        cmd_seq=call.sequence, status=ElevatorCommandStatus.STATUS_DEVICE_REJECTED,
-        device_result=ElevatorCommandStatus.RESULT_UNSUPPORTED, target=0x44, attempts=1))
-    result = handle.get_result_async()
-    assert ros.spin(1.5, result.done)  # Well before ack_timeout x ack_attempts.
-    keep_alive.cancel()
-    assert result.result().result.error_code == 'HALL_REJECTED'
-    assert 'UNSUPPORTED' in result.result().result.message
-    assert sum(c.command == ElevatorCommand.CMD_HALL_CALL for c in ros.commands) == 1
-
-
-def test_slow_exit_rearms_the_door_open_repeats(ros):
-    from rclpy.task import Future
-    from amr_elevator.mission_node import Mission, PendingAck
-
-    node = manager(ros, use_door_open_button=True, door_open_rearm_s=1., door_open_rearm_max=1)
-    building = load_floor_config()
-    geometry = building.elevator_geometry('3F', 'E1')
-    # finished keeps the node's own tick away; only the re-arm rule runs here.
-    node.mission = Mission(None, Future(), '3F', (0., 0., 0.), '', '4F', phase='ALIGHTING',
-                           finished=True)
-    node.pose = geometry.car_pose  # Still in the car: the door is needed.
-    node.door_pending = PendingAck(9, ElevatorBeacon.LOCATION_CAR, (ElevatorCommand.CMD_DOOR_OPEN, 0, 0),
-                                   node.now() - 2., 1, sequences={9}, repeat=10, acked=True,
-                                   acked_at=node.now() - .5)
-    node.rearm_door_open(geometry)
-    assert not ros.spin(.2, lambda: ros.commands)  # Repeats still running.
-    node.door_pending.acked_at = node.now() - 1.5
-    node.rearm_door_open(geometry)
-    assert ros.spin(1., lambda: ros.commands)
-    assert (ros.commands[0].command, ros.commands[0].repeat) == (ElevatorCommand.CMD_DOOR_OPEN, 10)
-    node.door_pending.acked, node.door_pending.acked_at = True, node.now() - 5.
-    node.rearm_door_open(geometry)  # door_open_rearm_max reached.
-    ros.spin(.3)
-    assert len(ros.commands) == 1
-    node.mission.counters['_door_rearms'] = 0
-    exit_pose = building.floor('3F').elevators['E1'].hall_exit_pose
-    node.pose = exit_pose  # Clear of the threshold: nothing to hold.
-    node.rearm_door_open(geometry)
-    ros.spin(.3)
-    assert len(ros.commands) == 1
-    node.mission = None
-
-
 def test_clearance_uses_the_laser_frame_from_tf(ros):
     node = manager(ros)
     n = 360
@@ -461,7 +391,7 @@ def test_clearance_uses_the_laser_frame_from_tf(ros):
 
 
 def wait_at_open_door(ros, **overrides):
-    """Reach WAIT_DOOR_OPEN with fake ACK, live floor state and valid sensors."""
+    """Reach WAIT_DOOR_OPEN with a request, live floor state and valid sensors."""
     node = manager(ros, **overrides)
     ros.floor_state()
     ros.spin(.3)
@@ -476,11 +406,7 @@ def wait_at_open_door(ros, **overrides):
                 f'fake_goals={len(ros.navigation_goals)}, '
                 f'nav_ready={node.nav_client.server_is_ready()}, localization={node.localization}')
     assert ros.spin(max(0., deadline - time.monotonic()), lambda: ros.navigation_goals), navigation_state()
-    assert ros.spin(max(0., deadline - time.monotonic()), lambda: ros.commands), navigation_state()
-    call = ros.commands[0]
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-                                          location=ElevatorBeacon.LOCATION_HALL, floor_code=4,
-                                          ack_sequence=call.sequence))
+    assert ros.spin(max(0., deadline - time.monotonic()), lambda: ros.requests), navigation_state()
     assert ros.spin(2., lambda: node.mission.phase == 'WAIT_DOOR_OPEN')
     assert ros.spin(1., lambda: node.pose is not None and node.laser_pose is not None)
     return node
@@ -561,6 +487,30 @@ def test_door_closes_while_space_occupied_relocalizes_and_recalls(ros):
     assert not any(a['key'] == 'board_start' for a in ros.announcements)
 
 
+def test_unverified_hall_pose_is_rechecked_before_global_search(ros):
+    """2026-11-02 5F: an open car door spoiled the hall check; the same pose passes once it closes."""
+    node = wait_at_open_door(ros, relocalize_reseed_period=.3, relocalize_reseeds=2)
+    publish_point(ros, car_point_in_base(node))
+    assert ros.spin(1., lambda: len(node._scan_points) == 1)
+    ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    assert ros.spin(2., lambda: any(a['key'] == 'board_space' for a in ros.announcements))
+    ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.CLOSING))
+    assert ros.spin(3., lambda: node.mission.phase == 'RELOCALIZE')
+    assert ros.spin(1., lambda: node.mission.counters.get('_relocalize') == 'seed')
+    ros.pubs.localization.publish(String(data=json.dumps({'state': 'WAITING_INITIAL_POSE', 'ready': False})))
+    assert ros.spin(1., lambda: node.mission.counters.get('_relocalize') == 'verify')
+    seeds = len(ros.initial_poses)
+    ros.pubs.localization.publish(String(data=json.dumps({'state': 'VERIFYING', 'ready': False})))
+    assert ros.spin(2., lambda: node.mission.counters.get('relocalize_reseeds') == 2)
+    assert ros.spin(1., lambda: len(ros.initial_poses) >= seeds + 2)
+    first, last = ros.initial_poses[seeds - 1].pose.pose.position, ros.initial_poses[-1].pose.pose.position
+    assert (first.x, first.y) == (last.x, last.y)        # the same hall pose, not a new guess
+    ros.spin(.8)
+    assert node.mission.counters['relocalize_reseeds'] == 2  # bounded; then the old TIM fallback
+    ros.pubs.localization.publish(String(data=json.dumps({'state': 'READY', 'ready': True})))
+    assert ros.spin(1., lambda: node.mission.phase == 'CALL_ELEVATOR')
+
+
 def test_continuously_blocked_boarding_backs_out(ros):
     node = wait_at_open_door(ros, board_block_timeout=.2, clear_confirm_s=.05, announce_period=.1,
                              obstacle_announce_delay=0.)
@@ -599,22 +549,18 @@ def test_return_retry_reuses_loaded_map_and_clears_arrival_timers(ros):
 
     node = wait_at_open_door(ros)
     node.pose = node.geometry('3F').car_pose
-    node.mission.counters.update(_loaded_map='3F', _last_transit=-100., _assumed_since=-100., _assumed_hold=True)
+    node.mission.counters.update(_loaded_map='3F', _car_request_since=-100.)
     node.set_phase('RETURN_TO_CAR')
     node.maneuver = LineManeuver(node.pose)
     node.maneuver.phase = DONE
     node.mission.counters['_return_wait_since'] = node.now() - 16.
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
     assert ros.spin(1., lambda: node.mission.phase == 'SELECT_FLOOR')
-    assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_CAR_FLOOR and c.floor_code == 3
-                                   for c in ros.commands))
-    press = next(c for c in reversed(ros.commands) if c.command == ElevatorCommand.CMD_CAR_FLOOR)
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-                                          location=ElevatorBeacon.LOCATION_CAR, floor_code=3,
-                                          ack_sequence=press.sequence))
+    assert ros.spin(1., lambda: any(c.kind == ElevatorRequest.KIND_CAR_FLOOR and c.target_floor == '3F'
+                                   for c in ros.requests))
     assert ros.spin(1., lambda: node.mission.phase == 'RIDING')
-    assert all(k not in node.mission.counters for k in ('_last_transit', '_assumed_since', '_assumed_hold'))
-    node.on_floor_state(FloorState(floor='3F', zone=FloorState.ZONE_IN_ELEVATOR, confidence='BEACON'))
+    assert all(k not in node.mission.counters for k in ('_car_request_since',))
+    node.on_floor_state(FloorState(floor='3F', zone=FloorState.ZONE_IN_ELEVATOR, confidence='VERIFIED'))
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     node.phase_riding()
     assert node.mission.phase == 'SWITCH_MAP'
@@ -666,6 +612,7 @@ def test_occupied_exit_returns_to_car_and_shares_attempt_limit(ros):
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     publish_point(ros, (.6, 0.))
     assert ros.spin(1., lambda: len(node._scan_points) == 1)
+    set_test_floor(ros, node)
     node.start_alighting()
     ros.twists.clear()
     assert ros.spin(1., lambda: node.mission.phase == 'RETURN_TO_CAR')
@@ -674,6 +621,7 @@ def test_occupied_exit_returns_to_car_and_shares_attempt_limit(ros):
     assert ros.spin(1., lambda: 'alight_cancel' in {a['key'] for a in ros.announcements})
     assert not any(a['key'] == 'alight_start' for a in ros.announcements)
     # Same counter is consumed by a subsequent door-closing cancellation.
+    set_test_floor(ros, node)
     node.start_alighting()
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
     node.phase_alighting()
@@ -753,7 +701,7 @@ def test_failure_completes_even_if_announcement_transport_raises(ros, monkeypatc
 
 def test_failure_inside_car_keeps_localization_suspended(ros):
     node = occupied_wait(ros)
-    node.on_floor_state(FloorState(floor='4F', zone=FloorState.ZONE_IN_ELEVATOR, confidence='BEACON'))
+    node.on_floor_state(FloorState(floor='4F', zone=FloorState.ZONE_IN_ELEVATOR, confidence='CONFIRMED'))
     node.fail('TEST_FAILURE')
     ros.spin(.3)
     assert ros.calls['localization/suspend'] == [True]
@@ -791,11 +739,11 @@ def freeze_phase_timer(node):
 def test_deep_boarding_cannot_back_out_through_closed_door(ros, monkeypatch):
     from amr_elevator.maneuver import LineManeuver
 
-    node = wait_at_open_door(ros, use_door_open_button=True)
+    node = wait_at_open_door(ros)
     freeze_phase_timer(node)
     geometry = node.geometry('4F')
     node.pose = geometry.car_pose
-    node.on_floor_state(FloorState(floor='4F', zone=FloorState.ZONE_IN_ELEVATOR, confidence='BEACON'))
+    node.on_floor_state(FloorState(floor='4F', zone=FloorState.ZONE_IN_ELEVATOR, confidence='CONFIRMED'))
     node.set_phase('BOARDING')
     node.maneuver = LineManeuver(geometry.car_pose, final_yaw=geometry.car_pose[2])
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
@@ -807,8 +755,6 @@ def test_deep_boarding_cannot_back_out_through_closed_door(ros, monkeypatch):
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert node.back_out('turn timeout')
     assert node.mission.phase == 'BACKING_OUT' and node.maneuver.reverse
-    assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_DOOR_OPEN and c.repeat == 6
-                                   for c in ros.commands))
 
 
 @pytest.mark.parametrize('front_in_car', [False, True])
@@ -818,10 +764,13 @@ def test_door_closing_during_retreat_stops_and_bounds_or_aligns(ros, front_in_ca
     geometry = node.geometry('4F')
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert node.back_out('test retreat')
-    # Use the hall door plane or car door plane to straddle the corresponding edge.
+    # Straddle the car door plane, or the hall door plane with the front bumper
+    # still short of the car's inner wall (threshold 0.32 m = HALF_LENGTH: back off 0.1 m).
+    yaw = node.stop_geometry('4F').car_inward_yaw
     door = geometry.car_door if front_in_car else geometry.hall_door
-    node.pose = (sum(p[0] for p in door)/2, sum(p[1] for p in door)/2,
-                 node.stop_geometry('4F').car_inward_yaw)
+    setback = 0. if front_in_car else .1
+    node.pose = (sum(p[0] for p in door)/2 - setback * math.cos(yaw),
+                 sum(p[1] for p in door)/2 - setback * math.sin(yaw), yaw)
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.CLOSING))
     twists = []
     monkeypatch.setattr(node, 'publish_twist', lambda linear=0., angular=0.: twists.append((linear, angular)))
@@ -837,10 +786,10 @@ def test_door_closing_during_retreat_stops_and_bounds_or_aligns(ros, front_in_ca
 
 
 @pytest.mark.parametrize('total_timeout', [False, True])
-def test_return_to_car_blocked_or_phase_timeout_fails_and_holds_door(ros, total_timeout):
+def test_return_to_car_blocked_or_phase_timeout_fails_and_cancels_request(ros, total_timeout):
     from amr_elevator.maneuver import LineManeuver, DRIVE
 
-    node = wait_at_open_door(ros, use_door_open_button=True, alight_block_timeout=.2,
+    node = wait_at_open_door(ros, alight_block_timeout=.2,
                              obstacle_announce_delay=0.)
     freeze_phase_timer(node)
     geometry = node.geometry('3F')
@@ -860,8 +809,7 @@ def test_return_to_car_blocked_or_phase_timeout_fails_and_holds_door(ros, total_
         node.mission.counters['_blocked_since'] = node.now() - .3
     node.phase_return_to_car()
     assert node.mission.finished and 'RETURN_BLOCKED' in node.mission.detail
-    assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_DOOR_OPEN and c.repeat == 15
-                                   for c in ros.commands))
+    assert ros.spin(1., lambda: sum(c.kind == ElevatorRequest.KIND_CANCEL for c in ros.requests) == 1)
 
 
 @pytest.mark.parametrize('open_on_start_floor', [False, True])
@@ -886,7 +834,7 @@ def test_alignment_phase_bound_survives_block_flicker(ros, open_on_start_floor):
         assert node.mission.finished and 'ALIGN_TIMEOUT' in node.mission.detail
 
 
-def test_canceled_exit_repress_uses_ack_retries_and_does_not_repeat_board_announcements(ros):
+def test_canceled_exit_requests_target_and_does_not_repeat_board_announcements(ros):
     from amr_elevator.maneuver import LineManeuver, DONE
 
     node = wait_at_open_door(ros)
@@ -900,14 +848,12 @@ def test_canceled_exit_repress_uses_ack_retries_and_does_not_repeat_board_announ
     node.mission.counters['_return_wait_since'] = node.now() - 16.
     previous = node.sequence
     assert ros.spin(1., lambda: node.mission.phase == 'SELECT_FLOOR')
-    assert ros.spin(3., lambda: node.mission.finished)
-    assert 'NO_CAR_ACK' in node.mission.detail
-    def retries():
-        return [c for c in ros.commands if c.command == ElevatorCommand.CMD_CAR_FLOOR and c.sequence > previous]
-    assert ros.spin(1., lambda: len(retries()) == node.p['ack_attempts'])
-    presses = retries()
-    assert len(presses) == node.p['ack_attempts']
-    assert len({c.sequence for c in presses}) == len(presses)
+    assert ros.spin(1., lambda: node.mission.phase == 'RIDING')
+    assert not node.mission.finished
+    assert ros.spin(1., lambda: any(c.kind == ElevatorRequest.KIND_CAR_FLOOR and c.sequence > previous
+                                   for c in ros.requests))
+    requests = [c for c in ros.requests if c.kind == ElevatorRequest.KIND_CAR_FLOOR and c.sequence > previous]
+    assert len(requests) == 1 and requests[0].target_floor == '3F'
     assert sum(a['key'] == 'board_done' for a in ros.announcements) == 1
     assert sum(a['key'] == 'alight_floor' for a in ros.announcements) == 1
 
@@ -916,6 +862,7 @@ def test_clear_exit_has_no_obstacle_announcement_on_entry_or_confirmation(ros):
     node = wait_at_open_door(ros, clear_confirm_s=.15)
     node.pose = node.geometry('3F').car_pose
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    set_test_floor(ros, node)
     node.start_alighting()
     assert ros.spin(1., lambda: 'alight_start' in {a['key'] for a in ros.announcements})
     assert not any(a['key'] == 'obstacle' for a in ros.announcements)
@@ -949,34 +896,27 @@ def test_closing_door_before_threshold_retreats_relocalizes_and_recalls(ros):
     assert ros.spin(1., lambda: node.mission.counters.get('_relocalize') == 'verify')
     ros.pubs.localization.publish(String(data=json.dumps({'state': 'READY', 'ready': True})))
     assert ros.spin(1., lambda: node.mission.phase == 'CALL_ELEVATOR')
-    assert ros.spin(1., lambda: sum(c.command == ElevatorCommand.CMD_HALL_CALL for c in ros.commands) == 2)
+    assert ros.spin(1., lambda: sum(c.kind == ElevatorRequest.KIND_CALL for c in ros.requests) == 2)
     assert node.mission.counters['boarding_aborts'] == node.mission.counters['boarding_attempts'] == 1
 
 
-def test_return_arrival_allows_two_door_represses_then_floor_selection_beyond_drive_timeout(ros):
+def test_return_arrival_selects_floor_after_wait_beyond_drive_timeout(ros):
     from amr_elevator.maneuver import LineManeuver, DONE
 
-    node = wait_at_open_door(ros, use_door_open_button=True)
+    node = wait_at_open_door(ros)
     freeze_phase_timer(node)
     node.pose = node.geometry('3F').car_pose
     node.set_phase('RETURN_TO_CAR')
     node.maneuver = LineManeuver(node.pose, reverse=True)
     node.maneuver.phase = DONE
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
-    for attempt in (1, 2):
-        node.mission.phase_since = node.now() - 40. * attempt
-        node.mission.counters['_return_wait_since'] = node.now() - 16.
-        node.phase_return_to_car()
-        assert node.mission.phase == 'RETURN_TO_CAR' and not node.mission.finished
-        assert node.mission.counters['return_open_press'] == attempt
-        assert ros.spin(1., lambda: sum(c.command == ElevatorCommand.CMD_DOOR_OPEN and c.repeat == 10
-                                       for c in ros.commands) == attempt)
+    node.mission.phase_since = node.now() - 40.
     node.mission.counters['_return_wait_since'] = node.now() - 16.
     node.phase_return_to_car()
     assert node.mission.phase == 'SELECT_FLOOR'
     node.phase_select_floor()
-    assert ros.spin(1., lambda: any(c.command == ElevatorCommand.CMD_CAR_FLOOR and c.floor_code == 3
-                                   for c in ros.commands))
+    assert ros.spin(1., lambda: any(c.kind == ElevatorRequest.KIND_CAR_FLOOR and c.target_floor == '3F'
+                                   for c in ros.requests))
 
 
 def test_flickering_exit_space_has_total_wait_bound_and_cancels_without_driving(ros, monkeypatch):
@@ -986,6 +926,7 @@ def test_flickering_exit_space_has_total_wait_bound_and_cancels_without_driving(
     freeze_phase_timer(node)
     node.pose = node.geometry('3F').car_pose
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    set_test_floor(ros, node)
     node.start_alighting()
     drive = Mock(side_effect=AssertionError('no drive before exit clearance or while already returned'))
     monkeypatch.setattr(node, 'drive', drive)
@@ -1014,6 +955,7 @@ def test_alighting_drive_bound_starts_when_the_exit_drive_starts(ros):
     freeze_phase_timer(node)
     node.pose = node.geometry('3F').car_pose
     node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    set_test_floor(ros, node)
     node.start_alighting()
     # A long wait for a clear exit must not eat the drive's own time bound.
     node.mission.phase_since = node.now() - 10.
@@ -1026,17 +968,19 @@ def test_alighting_drive_bound_starts_when_the_exit_drive_starts(ros):
 
 
 @pytest.mark.parametrize('already_in_car', [True, False])
-def test_exit_cancel_holds_the_door_only_from_the_doorway(ros, already_in_car):
-    node = wait_at_open_door(ros, use_door_open_button=True)
+def test_exit_cancel_returns_to_car_without_new_request(ros, already_in_car):
+    node = wait_at_open_door(ros)
     freeze_phase_timer(node)
     node.pose = node.geometry('3F').car_pose
+    set_test_floor(ros, node)
     node.start_alighting()
-    ros.commands.clear()
+    ros.requests.clear()
     node.return_to_car('test cancel', already_in_car=already_in_car)
     assert node.mission.phase == 'RETURN_TO_CAR'
-    held = ros.spin(.5, lambda: any(c.command == ElevatorCommand.CMD_DOOR_OPEN for c in ros.commands))
-    # From the car centre the door must close so SELECT_FLOOR can press the target again.
-    assert held is (not already_in_car)
+    ros.spin(.5)
+    assert not ros.requests
+    assert bool(node.mission.counters.get('_return_arrived')) is already_in_car
+    assert (node.maneuver is None) is already_in_car
 
 
 def test_stale_scan_holds_rotation_and_space_until_new_receive(ros):
@@ -1099,16 +1043,14 @@ def test_operator_hold_cancels_boarding_and_rejects_new_missions(ros):
     handle = send(ros, '5F', '502')
     assert handle.accepted
     keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
-    assert ros.spin(3., lambda: ros.commands)
-    ros.pubs.beacon.publish(ElevatorBeacon(event=ElevatorBeacon.EVENT_BUTTON_ACK,
-        location=ElevatorBeacon.LOCATION_HALL, floor_code=4, ack_sequence=ros.commands[0].sequence))
+    assert ros.spin(3., lambda: ros.requests)
     ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
     assert ros.spin(4., lambda: ros.statuses[-1]['phase'] == 'BOARDING')
     publisher.publish(String(data=json.dumps(dict(held=True, reason='central', stamp=time.time(), sequence=1))))
     result = handle.get_result_async()
     assert ros.spin(3., result.done)
     # Topic cancellation has no action CANCELING transition, so the transport aborts;
-    # mission cleanup, door protection and terminal phase follow action cancel.
+    # mission cleanup and terminal phase follow action cancel.
     assert result.result().status == GoalStatus.STATUS_ABORTED
     assert result.result().result.error_code == 'CANCELED'
     assert node.held and ros.statuses[-1]['phase'] == 'CANCELED'
@@ -1120,3 +1062,151 @@ def test_operator_hold_cancels_boarding_and_rejects_new_missions(ros):
     assert node.mission.finished
     assert send(ros, '4F', '402').accepted
     keep_alive.cancel()
+
+
+def test_arrival_confirmation_rejects_first_stop_and_accepts_second(ros):
+    from amr_elevator.door_detector import CLOSED, OPEN
+    from amr_elevator.floor_state import FloorStateMachine
+
+    node = wait_at_open_door(ros)
+    freeze_phase_timer(node)
+    machine = FloorStateMachine(load_floor_config(), initial_floor='4F')
+    machine.set_floor('4F', stationary=True)
+    machine.on_door(OPEN, 1.)
+    machine.on_position(True, False, True, 2.)
+    ros.fake_floor.machine = machine
+    node.set_phase('SELECT_FLOOR')
+    node.phase_select_floor()
+    assert node.mission.phase == 'RIDING'
+    assert ros.spin(1., lambda: machine.car_target == '3F')  # fake car reacts to /elevator/request
+    machine.on_door(CLOSED, 3.)
+    machine.tick(4.)
+    machine.on_door(OPEN, 8.)
+    machine.tick(9.)
+    ros.fake_floor.now = 9.
+    ros.floor_state()
+    ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    assert ros.spin(1., lambda: node.floor_state.awaiting_confirm and node.door_state() == ElevatorDoorState.OPEN)
+    node.phase_riding()
+    assert node.mission.phase == 'RIDING' and not node.mission.finished
+    assert ros.spin(1., lambda: ros.pubs.confirm.get_subscription_count() > 0)
+
+    ros.pubs.confirm.publish(FloorArrivalConfirm(source=FloorArrivalConfirm.SOURCE_OPERATOR,
+                                               floor='3F', candidate_id=node.floor_state.candidate_id, accepted=False, score=1.))
+    assert ros.spin(1., lambda: node.floor_state.confidence == 'TRANSIT')
+    node.phase_riding()
+    assert node.mission.phase == 'RIDING'
+    machine.on_door(OPEN, 10.)
+    machine.tick(20.)
+    assert machine.state.confidence == 'TRANSIT'  # same open door cannot propose again
+    machine.on_door(CLOSED, 21.)
+    machine.on_door(OPEN, 25.)
+    machine.tick(26.)
+    ros.fake_floor.now = 26.
+    ros.floor_state()
+    assert ros.spin(1., lambda: node.floor_state.awaiting_confirm)
+    ros.pubs.confirm.publish(FloorArrivalConfirm(source=FloorArrivalConfirm.SOURCE_SIM,
+                                               floor='3F', candidate_id=node.floor_state.candidate_id, accepted=True, score=1.))
+    assert ros.spin(1., lambda: node.floor_state.confidence == 'VERIFIED')
+    assert not node.floor_state.awaiting_confirm
+    node.phase_riding()
+    assert node.mission.phase == 'SWITCH_MAP'
+
+
+def set_test_floor(ros, node, floor='3F', confidence='VERIFIED', awaiting_confirm=False):
+    """Keep the fake monitor's periodic publications consistent with a staged arrival."""
+    ros.fake_floor.state = FloorState(floor=floor, confidence=confidence, awaiting_confirm=awaiting_confirm,
+                                      zone=FloorState.ZONE_IN_ELEVATOR)
+    node.on_floor_state(ros.fake_floor.state)
+    ros.floor_state()
+
+
+@pytest.mark.parametrize('phase', ['RETURN_TO_CAR', 'SWITCH_MAP', 'ALIGHTING'])
+def test_departure_before_exit_returns_to_riding(ros, phase):
+    node = wait_at_open_door(ros)
+    freeze_phase_timer(node)
+    node.set_phase(phase)
+    node.pose = node.geometry('3F').car_pose
+    node.mission.counters.update(_loaded_map='3F', alighting_attempts=1, _return_arrived=True)
+    set_test_floor(ros, node, floor='', confidence='TRANSIT')
+    node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    getattr(node, 'phase_' + phase.lower())()
+    assert node.mission.phase == 'RIDING' and node.maneuver is None
+    assert node.mission.detail == 'arrival no longer confirmed'
+    assert node.mission.counters['_loaded_map'] == '3F'
+    assert node.mission.counters['alighting_attempts'] == 1
+    assert ros.spin(1., lambda: ros.twists)
+    assert all(t.linear.x == 0. and t.angular.z == 0. for t in ros.twists)
+
+
+def test_rejected_stop_with_open_door_republishes_target_after_twenty_seconds(ros):
+    node = wait_at_open_door(ros)
+    freeze_phase_timer(node)
+    node.set_phase('RIDING')
+    set_test_floor(ros, node, floor='', confidence='TRANSIT')
+    node.on_door(ElevatorDoorState(state=ElevatorDoorState.OPEN))
+    node.mission.phase_since = node.now() - 30.
+    node.door_open_since = node.now() - 19.
+    previous = node.sequence
+    node.phase_riding()
+    assert node.sequence == previous
+    node.door_open_since = node.now() - 21.
+    node.phase_riding()
+    assert ros.spin(1., lambda: any(c.kind == ElevatorRequest.KIND_CAR_FLOOR and c.sequence > previous
+                                   for c in ros.requests))
+    assert node.mission.counters['car_repress'] == 1
+    assert node.mission.phase == 'RIDING'
+    node.phase_riding()
+    assert node.sequence == previous + 1  # bounded retries, not one per tick
+
+
+def test_debug_is_volatile_idle_silent_and_explains_closed_door(ros):
+    node = manager(ros)
+    debug = []
+    ros.peer.create_subscription(String, 'floor_mission/debug',
+                                 lambda msg: debug.append(json.loads(msg.data)), 5)
+    ros.floor_state()
+    ros.pubs.door.publish(ElevatorDoorState(state=ElevatorDoorState.CLOSED))
+    ros.spin(.5)
+    assert node.mission is None and not debug
+    handle = send(ros, '3F')
+    assert handle.accepted
+    keep_alive = ros.peer.create_timer(.5, lambda: ros.floor_state())
+    assert ros.spin(3., lambda: any(d['phase'] == 'WAIT_DOOR_OPEN'
+                                   and d['hold'] == 'door_not_open' for d in debug))
+    wait = [d for d in debug if d['phase'] == 'WAIT_DOOR_OPEN'][-1]
+    assert wait['cmd_v'] == wait['cmd_w'] == 0.
+    assert wait['door'] == 'CLOSED'
+    assert wait['maneuver_phase'] is None
+    assert {'clear_fwd', 'lidar_fwd', 'depth_fwd', 'scan_age', 'depth_age', 'space_clear'} <= wait.keys()
+    assert all(b['t'] - a['t'] >= .099 for a, b in zip(debug, debug[1:]))
+    canceled = handle.cancel_goal_async()
+    assert ros.spin(2., canceled.done)
+    assert ros.spin(2., lambda: node.mission.finished)
+    ros.spin(.2)  # drain already queued volatile samples
+    count = len(debug)
+    ros.spin(.4)
+    assert len(debug) == count
+    # A late subscriber must not receive a latched active-mission sample.
+    late = []
+    ros.peer.create_subscription(String, 'floor_mission/debug', late.append, 5)
+    ros.spin(.3)
+    assert not late
+    keep_alive.cancel()
+
+
+@pytest.mark.parametrize('name,value', [
+    ('maneuver_speed', .81), ('maneuver_max_turn', .61), ('maneuver_accel', 0.),
+    ('maneuver_decel', -1.), ('maneuver_turn_gain', float('nan')),
+    ('maneuver_heading_tolerance', float('inf')), ('maneuver_min_clearance', 0.),
+    ('maneuver_min_clearance', .05), ('maneuver_min_turn', .6),
+])
+def test_invalid_maneuver_parameters_rejected_at_startup(ros, name, value):
+    # Capture the partially constructed node so the shared fixture can destroy
+    # its ROS handles even when parameter validation raises from __init__.
+    node = FloorMissionManager.__new__(FloorMissionManager)
+    try:
+        with pytest.raises(ValueError, match=name):
+            node.__init__(building=load_floor_config(), parameter_overrides=[Parameter(name, value=value)])
+    finally:
+        node.destroy_node()

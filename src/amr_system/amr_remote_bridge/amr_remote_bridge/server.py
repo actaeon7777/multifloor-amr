@@ -1,4 +1,4 @@
-"""Stdlib central console: small robot summaries and three explicit commands."""
+"""Stdlib central console: small robot summaries and explicit operator commands."""
 import argparse
 import base64
 from collections import OrderedDict
@@ -8,15 +8,18 @@ import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 from .common import (COMMANDS, MAX_COMMAND, MAX_MESSAGE, MAX_SUMMARY, PROTOCOL_VERSION,
-                     REQUEST_ID, dumps, identifier, loads, positive, read_token)
+                     REQUEST_ID, valid_command_payload, dumps, identifier, loads, positive, read_token)
 from .slack_notify import SlackNotifier
+from .events import EventStore
+from .common import MAX_EVENT, MAX_EVENT_IMAGE, MAX_EVENT_BATCH, event_id, validate_event
 
 
 class ApiError(Exception):
@@ -40,6 +43,8 @@ SUMMARY_SCHEMA = {
     'hold': {'held': bool, 'since': 'number', 'reason': str, 'pending': bool},
     'goal': dict.fromkeys(('request_id', 'kind', 'status', 'floor', 'room', 'origin', 'error_message', 'phase'), str),
     'floor_mission': {'phase': str, 'detail': str},
+    'patrol': {'active': bool, 'route': str, 'phase': str, 'index': int, 'total': int,
+               'detail': str, 'routes': [str], 'age': 'number'},
     'battery': {'soc': 'number', 'voltage': 'number', 'valid': bool, 'fresh': bool, 'charge_state': (int, str)},
     'localization': {'ready': bool, 'age': 'number'},
     'notice': {'request_id': str, 'status': str, 'detail': str},
@@ -67,6 +72,13 @@ def validate_summary(summary):
                 raise ApiError(400, f'Invalid summary field: {path}')
             for key, item in value.items():
                 check(item, schema[key], path + '.' + key)
+        elif isinstance(schema, list):
+            if not isinstance(value, list) or len(value) > 32:
+                raise ApiError(400, f'Invalid summary list: {path}')
+            for item in value:
+                if type(item) is not str or len(item) > 32:
+                    raise ApiError(400, f'Invalid summary list item: {path}')
+                check(item, schema[0], path + '[]')
         elif schema == 'number':
             if not _number(value) or (path.endswith(('.age', '.since')) and value < 0):
                 raise ApiError(400, f'Invalid summary number: {path}')
@@ -228,9 +240,9 @@ class Registry:
         if not isinstance(kind, str) or kind not in COMMANDS or not isinstance(payload, dict):
             raise ApiError(400, 'Invalid command')
         request_id = payload.get('request_id')
-        if (not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id) or
-                payload != {'request_id': request_id}):
-            raise ApiError(400, '요청 ID만 포함한 명령이 필요합니다.')
+        if not valid_command_payload(kind, payload):
+            raise ApiError(400, '명령에 필요한 요청 ID와 인자를 확인해 주세요.'
+                           if kind in ('patrol_start', 'patrol_stop') else '요청 ID만 포함한 명령이 필요합니다.')
         now = time.monotonic()
         with self.lock:
             robot = self.robots.get(robot_id)
@@ -280,7 +292,8 @@ class Registry:
             return result
 
 
-def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='amr-01', body_timeout=10):
+def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='amr-01', body_timeout=10,
+                  event_store=None):
     default_robot = identifier(default_robot)
     body_timeout = positive(body_timeout)
     assets = Path(__file__).resolve().parents[1] / 'web'
@@ -304,12 +317,13 @@ def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='a
             self.send_response(status)
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Cache-Control', (headers or {}).get('Cache-Control', 'no-store'))
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' blob: data:; "
                              "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
             for name, value in (headers or {}).items():
-                self.send_header(name, str(value))
+                if name != 'Cache-Control':
+                    self.send_header(name, str(value))
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -349,7 +363,23 @@ def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='a
                 return
             try:
                 robot_id, path = self.route()
-                if self.path.split('?')[0] == '/api/robots':
+                if path == '/api/events/latest_seq' and event_store is not None:
+                    self.respond(200, dict(latest_seq=event_store.latest_seq()))
+                elif path == '/api/events' and event_store is not None:
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if query.keys() - {'after', 'limit', 'robot', 'kind_prefix'} or any(len(v) != 1 for v in query.values()):
+                        raise ValueError('Invalid event query')
+                    self.respond(200, event_store.query(int(query.get('after', ['0'])[0]),
+                        int(query.get('limit', ['50'])[0]), query.get('robot', [None])[0],
+                        query.get('kind_prefix', [None])[0]))
+                elif path.startswith('/api/events/') and path.endswith('/image.jpg') and event_store is not None:
+                    id = event_id(path[len('/api/events/'):-len('/image.jpg')])
+                    try:
+                        body = event_store.image(id)
+                    except KeyError:
+                        raise ApiError(404, 'Image not found') from None
+                    self.respond(200, body, 'image/jpeg', {'Cache-Control': 'private, max-age=3600'})
+                elif self.path.split('?')[0] == '/api/robots':
                     self.respond(200, registry.roster())
                 elif self.path.split('?')[0] in ('/', '/console.js', '/console.css'):
                     name = 'console.html' if path == '/' else path[1:]
@@ -364,7 +394,10 @@ def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='a
                 self.respond(400, dict(error=str(exc)))
 
         def do_POST(self):
-            agent = urlsplit(self.path).path == '/api/agent/exchange'
+            path = urlsplit(self.path).path
+            image_upload = path.startswith('/api/agent/images/')
+            event_upload = path == '/api/agent/events'
+            agent = path == '/api/agent/exchange' or event_upload or image_upload
             if not self.authenticate(agent=agent):
                 return
             try:
@@ -373,16 +406,44 @@ def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='a
                     raise ApiError(403, '다른 웹사이트에서 보낸 명령은 허용하지 않습니다.')
                 if not agent and self.headers.get('X-AMR-Request') != '1':
                     raise ApiError(403, '명령 요청 헤더가 필요합니다.')
-                if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
-                    raise ApiError(415, 'JSON 요청이 필요합니다.')
+                if (event_upload or image_upload) and event_store is None:
+                    raise ApiError(503, 'Event store unavailable')
+                if image_upload:
+                    event_id(path[len('/api/agent/images/'):])
+                mime = 'image/jpeg' if image_upload else 'application/json'
+                if self.headers.get('Content-Type', '').split(';')[0] != mime:
+                    raise ApiError(415, 'Expected ' + mime)
                 size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= (MAX_MESSAGE if agent else MAX_COMMAND):
+                limit = MAX_EVENT_IMAGE if image_upload else MAX_EVENT_BATCH if event_upload else MAX_MESSAGE if agent else MAX_COMMAND
+                if self.headers.get('Transfer-Encoding') or not 0 < size <= limit:
                     raise ApiError(413, '요청 크기가 유효하지 않습니다.')
                 body = self.rfile.read(size)
                 if len(body) != size:
                     raise ApiError(400, 'Incomplete request body')
+                if image_upload:
+                    try:
+                        event_store.store_image(path[len('/api/agent/images/'):], body)
+                    except KeyError:
+                        raise ApiError(404, 'Event not found') from None
+                    self.respond(204, b'')
+                    return
                 message = loads(body)
-                if agent:
+                if event_upload:
+                    if not isinstance(message, dict) or message.keys() != {'protocol', 'robot_id', 'session_id', 'events'}:
+                        raise ApiError(400, 'Invalid events envelope')
+                    if type(message['protocol']) is not int or message['protocol'] != PROTOCOL_VERSION:
+                        raise ApiError(409, 'Unsupported agent protocol; protocol 2 is required')
+                    robot_id = identifier(message['robot_id'])
+                    event_id(message['session_id'])
+                    events = message['events']
+                    if not isinstance(events, list) or not 1 <= len(events) <= 20:
+                        raise ApiError(400, 'Expected 1-20 events')
+                    for event in events:
+                        if len(dumps(event)) > MAX_EVENT:
+                            raise ApiError(413, 'Event exceeds 64 KiB')
+                        validate_event(event)
+                    self.respond(200, event_store.insert(robot_id, events))
+                elif agent:
                     self.respond(200, registry.exchange(message))
                 else:
                     robot_id, path = self.route()
@@ -394,7 +455,7 @@ def create_server(registry, token, host='127.0.0.1', port=8081, default_robot='a
             except ApiError as exc:
                 self.close_connection = True
                 self.respond(exc.status, dict(error=str(exc)), headers={'Connection': 'close'})
-            except (ValueError, TypeError, KeyError) as exc:
+            except (ValueError, TypeError, KeyError, RecursionError, OverflowError) as exc:
                 self.close_connection = True
                 self.respond(400, dict(error=str(exc)), headers={'Connection': 'close'})
 
@@ -411,17 +472,25 @@ def main(args=None):
     parser.add_argument('--robot-id', default='amr-01')
     parser.add_argument('--stale-after', type=float, default=2)
     parser.add_argument('--command-timeout', type=float, default=3)
+    parser.add_argument('--data-dir', default=os.environ.get(
+        'AMR_DATA_DIR', str(Path(__file__).resolve().parents[4] / 'Control_Server/data')))
     parser.add_argument('--slack-env')
     parser.add_argument('--slack-rooms')
     options = parser.parse_args(args)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     notifier = None
+    event_store = None
     try:
         token = read_token(options.token_file)
         notifier = SlackNotifier(slack_env=options.slack_env, slack_rooms=options.slack_rooms)
         registry = Registry(options.stale_after, options.command_timeout, notifier=notifier)
-        server = create_server(registry, token, options.host, options.port, options.robot_id)
+        event_store = EventStore(options.data_dir, int(os.environ.get('AMR_MAX_EVENTS', '5000')),
+                                 int(os.environ.get('AMR_MAX_IMAGE_BYTES', str(1024**3))))
+        server = create_server(registry, token, options.host, options.port, options.robot_id,
+                               event_store=event_store)
     except (ValueError, OSError) as exc:
+        if event_store:
+            event_store.close()
         if notifier:
             notifier.close()
         parser.error(str(exc))
@@ -432,6 +501,7 @@ def main(args=None):
         pass
     finally:
         server.server_close()
+        event_store.close()
         notifier.close()
 
 

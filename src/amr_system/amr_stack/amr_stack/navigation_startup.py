@@ -110,7 +110,7 @@ class NavigationStartup(Node):
             # right pose. TIM, the automatic search and refinement keep min_match_ratio.
             manual_min_match_ratio=0.50,
             # The first /initialpose after an elevator resume carries a tight prior
-            # (beacon floor, car alignment, straight exit): admit it at this ratio.
+            # (confirmed arrival floor, car alignment, straight exit): admit it at this ratio.
             after_ride_min_match_ratio=0.50,
             initialization_max_beams=1080, tracking_max_beams=60,
             quality_max_beams=360, quality_max_range=30.0, tracking_quality_max_range=30.0,

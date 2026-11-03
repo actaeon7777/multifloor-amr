@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src/amr_system/amr_remote_bridge'))
 from amr_remote_bridge.server import Registry, create_server
+from amr_remote_bridge.events import EventStore
 from amr_remote_bridge.slack_notify import SlackNotifier
 from .config import Settings
 
@@ -18,10 +19,12 @@ def main():
     parser = argparse.ArgumentParser(description='AMR lightweight central console')
     parser.add_argument('--host', required=True)
     parser.add_argument('--port', type=int, default=int(os.environ.get('AMR_PORT', '8081')))
+    parser.add_argument('--data-dir', type=Path)
     parser.add_argument('--slack-env', type=Path)
     parser.add_argument('--slack-rooms', type=Path)
     args = parser.parse_args()
     notifier = None
+    event_store = None
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     try:
         address = ipaddress.ip_address(args.host)
@@ -30,6 +33,8 @@ def main():
         if not 1 <= args.port <= 65535:
             raise ValueError('Port must be between 1 and 65535')
         settings = Settings.from_env()
+        if args.data_dir:
+            settings = replace(settings, data_dir=args.data_dir.expanduser())
         if args.slack_env:
             settings = replace(settings, slack_env=args.slack_env.expanduser())
         if args.slack_rooms:
@@ -38,9 +43,12 @@ def main():
         notifier = SlackNotifier(slack_env=settings.slack_env, slack_rooms=settings.slack_rooms)
         registry = Registry(settings.stale_after, settings.command_timeout, settings.lease_timeout,
                             settings.max_robots, notifier=notifier)
+        event_store = EventStore(settings.data_dir, settings.max_events, settings.max_image_bytes)
         server = create_server(registry, token, args.host, args.port, settings.robot_id,
-                               body_timeout=settings.body_timeout)
+                               body_timeout=settings.body_timeout, event_store=event_store)
     except (ValueError, OSError) as exc:
+        if event_store:
+            event_store.close()
         if notifier:
             notifier.close()
         parser.error(str(exc))
@@ -54,6 +62,7 @@ def main():
         pass
     finally:
         server.server_close()
+        event_store.close()
         notifier.close()
 
 

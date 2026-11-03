@@ -50,11 +50,6 @@ def generate_launch_description():
             description='Shared /vehicle/status publisher (10 Hz, Python). Off: it took ~60 % of a '
                         'Jetson core and only feeds the web telemetry card (2026-10-23).'),
         DeclareLaunchArgument(
-            'start_elevator_link', default_value='false',
-            description='Elevator RF relay over CAN (0x210/0x310/0x311, ELEVATOR_CAN_PROTOCOL.md v1.1); '
-                        'firmware implemented, keep false until the integration test passes'),
-        DeclareLaunchArgument('elevator_link_dry_run', default_value='true'),
-        DeclareLaunchArgument(
             'start_camera', default_value='false',
             description='Gemini 2 depth camera (camera.launch.py): depth points for global/local costmaps '
                         '(STVL), JPEG color for the web, and a depth watch in time_health.'),
@@ -134,15 +129,6 @@ def generate_launch_description():
             parameters=[LaunchConfiguration('can_config'), {
                 'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool),
                 'dry_run': ParameterValue(LaunchConfiguration('can_dry_run'), value_type=bool),
-            }],
-            output='screen',
-        ),
-        Node(
-            package='amr_can_bridge', executable='elevator_can_link', name='elevator_can_link',
-            condition=IfCondition(LaunchConfiguration('start_elevator_link')),
-            parameters=[{
-                'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool),
-                'dry_run': ParameterValue(LaunchConfiguration('elevator_link_dry_run'), value_type=bool),
             }],
             output='screen',
         ),

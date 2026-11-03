@@ -33,10 +33,32 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     const {number, suffix} = splitRoomId(id);
     return number ? `${number}호${suffix ? ' '+suffix : ''}` : '';
   };
-  // Same-floor goals only need the loaded map; a startup floor stays ASSUMED until the hall beacon is heard.
-  const floorConfirmed = s => ['BEACON','CONFIRMED'].includes(s?.floor?.confidence);
+  // Same-floor goals need the loaded map; cross-floor goals require a confirmed floor.
+  const floorConfirmed = s => ['CONFIRMED','VERIFIED'].includes(s?.floor?.confidence);
+  function elevatorHint(s) {
+    if (!MISSION_ACTIVE.has(s?.floor_mission?.phase)) return '';
+    const r = s?.elevator_request;
+    if (r?.kind === 'CALL') return `엘리베이터 ${r.direction === 1 ? '▲ 위로' : '▼ 아래로'} 버튼을 눌러 주세요`;
+    if (r?.kind === 'CAR_FLOOR') return `엘리베이터 안에서 ${r.target_floor} 버튼을 눌러 주세요`;
+    return '';
+  }
+  const patrolActive = s => s?.patrol?.active === true && Number.isFinite(s.patrol.age) && s.patrol.age >= 0 && s.patrol.age < 3;
+  const patrolPhaseLabel = phase => ({NAV:'이동', DWELL:'관측', RETURN:'복귀'}[phase] || phase || '대기');
+  const patrolRoutes = s => Array.isArray(s?.patrol?.routes) ? s.patrol.routes.filter(r => typeof r === 'string') : [];
+  function patrolAdminControls(s, {online=false, busy=false, blocked=false}={}) {
+    return {start:Boolean(online && !busy && patrolRoutes(s).length && !patrolActive(s) &&
+      !blocked && !ACTIVE.has(s?.goal?.status) && !s?.hold?.held),
+      stop:Boolean(online && !busy && patrolActive(s))};
+  }
+  function patrolAdminStatus(s) {
+    const p = s?.patrol || {};
+    if (patrolActive(s)) return `${p.route || '—'} ${p.index ?? 0}/${p.total ?? 0} · ${patrolPhaseLabel(p.phase)}`;
+    if (p.phase === 'DONE') return '완료';
+    if (p.phase === 'ABORTED') return `중단: ${p.detail || '상세 정보 없음'}`;
+    return '대기';
+  }
   function readyForGoal(s) {
-    return Boolean(!s?.hold?.held && s?.mode === 'AUTO' && !(s.estop?.required && s.estop.error) && s.estop?.state !== 'ESTOP' &&
+    return Boolean(!patrolActive(s) && !s?.hold?.held && s?.mode === 'AUTO' && !(s.estop?.required && s.estop.error) && s.estop?.state !== 'ESTOP' &&
       !MISSION_ACTIVE.has(s.floor_mission?.phase) && s?.localization?.ready && (s.localization.age == null || s.localization.age < 2) &&
       s.action_ready && s.floor?.floor && (floorConfirmed(s) || s.floor.confidence === 'ASSUMED') && s.floor.zone !== 2 &&
       !s.tf_error && !s.localization_reset_pending && !s.pending_request);
@@ -53,6 +75,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     if ((s.estop?.required && s.estop.error) || s.estop?.state === 'ESTOP') return 'estop';
     if (s.mode === 'MANUAL') return 'manual';
     if (s.hold?.held) return 'held';
+    if (patrolActive(s)) return 'patrol';
     const active = ACTIVE.has(s.goal?.status);
     if (active && (s.goal.kind === 'floor_goal' || MISSION_ACTIVE.has(s.floor_mission?.phase))) return 'transit';
     if (active || startPending) return 'driving';
@@ -160,7 +183,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       cancelDelay(notify=false) { if (pending?.phase === 'delay') { if (notify) rejectStart(); else drop(); } },
     };
   }
-  window.AMRKiosk = {selectScreen, phaseToStep, PHASE_STEPS, readyForGoal, floorConfirmed, splitRoomId,
+  window.AMRKiosk = {elevatorHint,patrolAdminControls, patrolAdminStatus, patrolActive, patrolPhaseLabel, selectScreen, phaseToStep, PHASE_STEPS, readyForGoal, floorConfirmed, splitRoomId,
     roomLabel, updateProgress, formatETA, createDeliveryFlow, estopDeliveryRoom};
   if (typeof document === 'undefined') return;
 
@@ -178,8 +201,10 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   let admin = false, token = null, tokenUntil = 0, lastAdminInput = 0, pin = null, busy = false;
   let adminPose = null, adminFloor = null, gesture = null, adminRequest = null, adminRequestAt = 0;
   const adminRequests = new Set();
+  let patrolRoute = '';
   let pollTimer = null, polling = false, pollAbort = null, floorLoading = false, progress = null;
   let estopStartRoom = '';
+  let arrivalBusy = false, arrivalCandidate = null, arrivalError = '', arrivalPicking = false, arrivalFloors = [];
   let toastUntil = 0, drawFrame = null, mapSignature = '', mapCamera = null, lastNotice = '';
   const maps = new Map(), mapLoading = new Set(), started = new Map();
   const STORAGE = 'amr-kiosk-goals-v1';
@@ -214,7 +239,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       body = {...body, map_version:version};
     }
     const headers = {'Content-Type':'application/json', 'X-AMR-Request':'1', 'X-AMR-Client':'kiosk'};
-    const privileged = ['initialpose','relocalize','set_floor','kiosk/exit'].includes(kind);
+    const privileged = ['initialpose','relocalize','set_floor','kiosk/exit','patrol/start','patrol/stop'].includes(kind);
     if (privileged && state?.kiosk?.pin_required && token) headers['X-AMR-Kiosk-Token'] = token;
     const response = await fetch(`/api/${kind}`, {method:'POST', headers, body:JSON.stringify(body), signal:AbortSignal.timeout(5000)});
     const result = await response.json();
@@ -237,6 +262,11 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <span id="clock" class="clock"></span><span class="rid">AMR-01</span>
       <button id="admin-button" class="gear" data-action="admin" aria-label="관리 모드">${icon('gear')}</button></div></header>
     <main class="body"><div id="screen"></div><div id="sheet" class="scrim" hidden></div>
+      <div id="elevator-request-hint" class="elevator-request-hint" role="status" hidden></div>
+      <div id="arrival-confirm" class="scrim arrival-overlay" role="dialog" aria-modal="true" aria-labelledby="arrival-title" hidden><section class="arrival-card">
+        <h2 id="arrival-title"></h2><p id="arrival-source" class="arrival-source"></p><p>목적층으로 확인되면 로봇이 내립니다.</p>
+        <div id="arrival-actions" class="arrival-actions"><button id="arrival-yes" data-action="arrival-yes" class="btn primary"></button><button id="arrival-no" data-action="arrival-no" class="btn ghost">아니요</button></div>
+        <div id="arrival-picker" class="arrival-picker" hidden></div><p id="arrival-error" role="alert"></p></section></div>
       <div id="connection" class="scrim connection-overlay" role="status" hidden><div class="sheet"><h2>연결 대기</h2></div></div>
       <div id="toast" role="status" hidden></div></main>`;
   const stopButton = () => `<div id="stop-wrap" class="stopwrap"><button id="stop" data-action="stop" class="btn stop">${icon('stop')}정지</button><p>정지하면 배송이 취소됩니다</p></div>`;
@@ -263,7 +293,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <div class="notice">${icon('alert')}통로를 비워 주세요</div>${stopButton()}</aside></div>`,
     transit:() => `<div class="transit"><section id="steps" class="card steps"></section><div class="transit-main">
       <section class="card now-card"><div class="lift"><div id="lift-floor" class="disp"></div><div class="doors"><span></span><span></span></div><div class="bot"></div></div>
-      <div><div id="step-number" class="label"></div><h2 id="phase-title"></h2><p id="phase-detail"></p><div class="notice">${icon('lift')}호출 버튼은 로봇이 자동으로 누릅니다</div></div></section>
+      <div><div id="step-number" class="label"></div><h2 id="phase-title"></h2><p id="phase-detail"></p></div></section>
       <aside class="card side"><div><div id="transit-label" class="label accent">배송지</div><h1 id="transit-destination"></h1></div><div class="kv"><div><span>경과</span><b id="elapsed"></b></div></div>${stopButton()}</aside></div></div>`,
     arrived:() => `<div id="result" class="full ok"><div class="inner"><span id="result-icon" class="big"></span><div><div id="result-label" class="label"></div><h1 id="result-title"></h1>
       <p id="result-detail" class="one-line"></p><button id="ack" data-action="ack" class="btn ok"></button><div id="result-foot" class="foot"></div></div></div>`,
@@ -271,6 +301,8 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <ol><li>주변 안전 확인</li><li>비상 정지 버튼을 돌려서 해제</li><li>배송지 다시 선택</li></ol></div></div></div>`,
     held:() => `<div class="full warn held"><div class="inner"><span class="big">${icon('hand')}</span><div><div class="label">관리자 정지</div><h1>관리자 정지 중</h1>
       <p>관리자가 로봇을 잠시 정지했습니다. 해제될 때까지 기다려 주세요.</p></div></div></div>`,
+    patrol:() => `<div class="full warn patrol"><div class="inner"><span class="big">${icon('route')}</span><div><div class="label">야간 순찰</div><h1>야간 순찰 중</h1>
+      <p id="patrol-progress"></p><p>순찰이 끝날 때까지 배송을 받지 않습니다.</p></div></div></div>`,
     manual:() => `<div class="full warn"><div class="inner"><span class="big">${icon('hand')}</span><div><div class="label">수동 조작</div><h1>수동 조작 중</h1>
       <p>관리자가 조이스틱으로 조작하고 있습니다.<br>진행 중이던 배송은 취소되었습니다.</p><div class="foot">수동 조작이 끝나면 배송지를 선택할 수 있습니다</div></div></div></div>`,
     admin:() => `<div class="admin-grid"><section class="card mapcard"><div class="head"><span><b>위치 지정</b> · 누른 곳이 위치, 끈 방향이 로봇 방향</span><span id="map-floor"></span></div>${mapStage()}
@@ -279,6 +311,9 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <div class="block"><h3>지정 위치 적용</h3><p>지도에서 지정한 위치·방향으로 위치를 다시 잡습니다.</p><button id="apply-pose" data-action="apply-pose" class="btn primary">${icon('locate')}적용</button></div>
       <div class="block"><h3>마지막 위치로 시작</h3><p id="last-pose"></p><button id="apply-last" data-action="apply-last" class="btn ghost">${icon('history')}적용</button></div>
       <div class="block"><h3>현재 층 변경</h3><p>층 정보가 실제와 다를 때만 변경하세요.</p><div id="admin-floors" class="seg"></div></div>
+      <div class="block patrol-admin"><h3>야간 순찰</h3><p id="patrol-admin-status"></p><div class="patrol-actions">
+        <select id="patrol-route" aria-label="순찰 경로"></select><button id="patrol-start" data-action="patrol-start" class="btn primary">순찰 시작</button><button id="patrol-stop" data-action="patrol-stop" class="btn ghost">순찰 정지</button>
+      </div></div>
       <div class="exits"><button id="close-kiosk" data-action="close-kiosk" class="exit">키오스크 닫기</button><button data-action="exit" class="exit">관리 모드 종료</button></div></aside></div>`,
   };
   function phaseHeadline(phase) {
@@ -289,9 +324,9 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       RELOCALIZE:'위치 확인 중', NAV_TO_GOAL:`${roomLabel(state.goal?.room)}로 배송 중`}[phase] || '승강장 이동 중';
   }
   function renderTop(base) {
-    const labels = {idle:'정상', arrived:'정상', driving:'배송 중', transit:'층간 이동', localizing:'준비 중', estop:'비상 정지', manual:'수동 조작', held:'관리자 정지'};
+    const labels = {idle:'정상', arrived:'정상', driving:'배송 중', transit:'층간 이동', localizing:'준비 중', estop:'비상 정지', manual:'수동 조작', held:'관리자 정지', patrol:'야간 순찰 중'};
     setText('status-label', ['driving','transit'].includes(base) && state.goal?.origin === 'return_home' ? '관리자 호출로 복귀 중' : labels[base] || '준비 중');
-    setClass('status-pill', `pill ${base === 'estop' ? 'bad' : ['manual','held','localizing'].includes(base) ? 'warn' : ''}`);
+    setClass('status-pill', `pill ${base === 'estop' ? 'bad' : ['manual','held','patrol','localizing'].includes(base) ? 'warn' : ''}`);
     const location = base === 'arrived' && state.goal?.status === 'SUCCEEDED' ? `${roomLabel(state.goal.room)} 앞` :
       base === 'transit' ? '엘리베이터 앞' : base === 'localizing' ? '위치 확인 중' : base === 'driving' ? '복도' : '현재 위치';
     setText('where', `${floorLabel(currentFloor())} · ${location}`);
@@ -309,9 +344,34 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     if (percent !== null) { setText('battery-percent', `${percent}%`); setWidth('battery-fill', `${percent}%`); }
     setHidden('admin-tag', !admin); setClass('app', `app${admin ? ' admin' : ''}`);
   }
+  function renderArrival() {
+    const floor = online() && state?.floor?.awaiting_confirm ? state.floor.floor : null;
+    const candidateId = floor ? state.floor.candidate_id : null;
+    if (floor !== (arrivalCandidate?.floor ?? null) || candidateId !== (arrivalCandidate?.candidate_id ?? null)) {
+      arrivalCandidate = floor ? {floor, candidate_id:candidateId} : null;
+      arrivalBusy = false; arrivalError = ''; arrivalPicking = false;
+    }
+    setHidden('arrival-confirm', !floor);
+    setText('arrival-title', `엘리베이터가 ${floor}에 도착했나요?`);
+    setText('arrival-yes', `네, ${floor}입니다`);
+    setText('arrival-source', {VISION:'카메라 판단', TARGET:'목적층'}[state?.floor?.candidate_source] || '');
+    setHidden('arrival-actions', arrivalPicking);
+    setHidden('arrival-picker', !arrivalPicking);
+    if (arrivalPicking) setHTML('arrival-picker',
+      arrivalFloors.filter(f => f.name !== floor).map(f => `<button class="btn ghost" data-action="arrival-pick" data-actual-floor="${esc(f.name)}" ${arrivalBusy ? 'disabled' : ''}>${esc(f.name)}</button>`).join('') +
+      `<button class="btn ghost" data-action="arrival-pick" data-actual-floor="" ${arrivalBusy ? 'disabled' : ''}>모르겠음</button><button class="btn ghost" data-action="arrival-back" ${arrivalBusy ? 'disabled' : ''}>뒤로</button>`);
+    setText('arrival-error', arrivalError);
+    setDisabled('arrival-yes', arrivalBusy || !floor);
+    setDisabled('arrival-no', arrivalBusy || !floor);
+    const hint = online() ? elevatorHint(state) : '';
+    setHidden('elevator-request-hint', !hint);
+    setText('elevator-request-hint', hint);
+    setClass('screen', hint ? 'with-elevator-hint' : '');
+  }
   function render() {
     if (document.hidden) return;
-    if (!state?.hold?.held && ACTIVE.has(state?.goal?.status) && (admin || pin !== null)) {
+    renderArrival();
+    if (!state?.hold?.held && !patrolActive(state) && ACTIVE.has(state?.goal?.status) && (admin || pin !== null)) {
       admin = false; token = null; tokenUntil = 0; pin = null; adminPose = null; gesture = null;
     }
     const base = selectScreen(state, {fetchFailed, stateAgeMs:now()-lastStateAt, startPending:Boolean(flow.pending), ownedRequestIds:owned});
@@ -371,6 +431,9 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
         (state.notice?.request_id === goal.request_id ? state.notice.detail : '') || title);
       setClass('ack', `btn ${success ? 'ok' : 'primary'}`); setText('ack', success ? '수령 확인' : '확인');
       setText('result-foot', success ? '수령 확인 전까지 이 화면이 유지됩니다' : '');
+    } else if (screen === 'patrol') {
+      const p = state.patrol;
+      setText('patrol-progress', `${p.route || '—'} · ${p.index ?? 0}/${p.total ?? 0} · ${patrolPhaseLabel(p.phase)}`);
     } else if (screen === 'estop') {
       const room = estopDeliveryRoom(state, owned, flow.pending?.payload.room || estopStartRoom);
       setText('estop-detail', `비상 정지 버튼이 눌려 있습니다.${room ? ' '+roomLabel(room)+' 배송은 취소되었습니다.' : ''}`);
@@ -381,6 +444,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       const time = saved && Number.isFinite(saved.getTime()) ? `${String(saved.getMonth()+1).padStart(2,'0')}-${String(saved.getDate()).padStart(2,'0')} ${String(saved.getHours()).padStart(2,'0')}:${String(saved.getMinutes()).padStart(2,'0')} 저장` : '';
       setText('last-pose', last ? [floorLabel(cf), time].filter(Boolean).join(' · ') : '—');
       setHTML('admin-floors', floorButtons(true));
+      renderPatrolAdmin();
     }
     renderSheet(); updateControls(); requestDraw();
   }
@@ -400,6 +464,20 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       <div class="actions"><button class="btn ghost" data-action="dismiss">취소</button><button id="depart" class="btn primary" data-action="depart">${icon('arrow')}출발</button></div></div>`);
     setHidden('sheet', false);
   }
+  function renderPatrolAdmin() {
+    const select = $('patrol-route'), routes = patrolRoutes(state);
+    const options = routes.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join('');
+    if (htmlValues.get(select) !== options) {
+      const selected = select.value || patrolRoute;
+      setHTML('patrol-route', options);
+      select.value = routes.includes(selected) ? selected : routes[0] || '';
+      patrolRoute = select.value;
+    }
+    setText('patrol-admin-status', patrolAdminStatus(state));
+  }
+  function patrolControls() {
+    return patrolAdminControls(state, {online:online(), busy, blocked:adminBlocked()});
+  }
   function adminBlocked() {
     return !online() || busy || Boolean(state?.pending_request || adminRequest || flow.pending) ||
       ACTIVE.has(state?.goal?.status) || state?.mode === 'MANUAL' || state?.localization_reset_pending ||
@@ -408,11 +486,15 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
   function updateControls() {
     document.querySelectorAll('[data-room]').forEach(b => { const disabled = !canStart(); if (b.disabled !== disabled) b.disabled = disabled; });
     setDisabled('depart', !canStart());
-    setDisabled('admin-button', !online() || busy || (!state?.hold?.held && ACTIVE.has(state?.goal?.status)) || Boolean(flow.pending));
+    setDisabled('admin-button', !online() || busy || (!state?.hold?.held && !patrolActive(state) && ACTIVE.has(state?.goal?.status)) || Boolean(flow.pending));
     setDisabled('stop', !online() || flow.stopping || flow.pending?.stopRequested || (!flow.pending &&
       (!ACTIVE.has(state?.goal?.status) || state?.goal?.status === 'CANCELING')));
     setDisabled('ack', !online() || busy);
     setDisabled('close-kiosk', !online() || busy);
+    const patrol = patrolControls();
+    setDisabled('patrol-start', !patrol.start);
+    setDisabled('patrol-stop', !patrol.stop);
+    setDisabled('patrol-route', !online() || busy || !patrolRoutes(state).length);
     const info = floorInfo(currentFloor())?.map, bitmap = maps.get(currentFloor());
     const mapReady = info && bitmap?.version === info.version && state?.map_version != null;
     setDisabled('apply-pose', adminBlocked() || !adminPose || !mapReady || adminPose.map_version !== info?.version);
@@ -428,6 +510,23 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
     catch (e) { adminRequest = null; toast(e.message); }
     finally { busy = false; render(); void poll(); }
   }
+  async function patrolCommand(start) {
+    if (!admin || !patrolControls()[start ? 'start' : 'stop']) return;
+    const route = $('patrol-route').value;
+    if (start && !patrolRoutes(state).includes(route)) return;
+    const id = requestId(); adminRequest = id; adminRequestAt = now(); adminRequests.add(id); busy = true; render();
+    try {
+      await post(start ? 'patrol/start' : 'patrol/stop', {request_id:id, ...(start ? {route} : {})});
+      if (start) leaveAdmin();
+    } catch (e) { adminRequest = null; toast(e.message); }
+    finally { busy = false; render(); void poll(); }
+  }
+  $('app').addEventListener('change', event => {
+    if (event.target.id === 'patrol-route') {
+      patrolRoute = event.target.value;
+      lastAdminInput = now();
+    }
+  });
   $('app').addEventListener('click', async event => {
     const button = event.target.closest('button');
     if (!button || button.disabled) return;
@@ -446,6 +545,24 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       renderSheet(); return;
     }
     switch (button.dataset.action) {
+      case 'arrival-no':
+        if (online() && !arrivalBusy && arrivalCandidate) { arrivalPicking = true; renderArrival(); }
+        break;
+      case 'arrival-back':
+        if (!arrivalBusy) { arrivalPicking = false; renderArrival(); }
+        break;
+      case 'arrival-yes':
+      case 'arrival-pick': {
+        if (!online() || arrivalBusy || !arrivalCandidate) break;
+        const candidate = arrivalCandidate;
+        arrivalBusy = true; arrivalError = ''; renderArrival();
+        const accepted = button.dataset.action === 'arrival-yes';
+        try { await post('floor/arrival_confirm', {...candidate, accepted,
+          ...(accepted ? {} : {actual_floor:button.dataset.actualFloor || ''})}); }
+        catch (error) { if (candidate === arrivalCandidate) arrivalError = error.message; }
+        finally { if (candidate === arrivalCandidate) { arrivalBusy = false; renderArrival(); } }
+        break;
+      }
       case 'dismiss': selection = null; render(); break;
       case 'depart': {
         if (!selection || !canStart()) break;
@@ -464,7 +581,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
         break;
       }
       case 'admin':
-        if (!online() || busy || (!state?.hold?.held && ACTIVE.has(state?.goal?.status)) || flow.pending) break;
+        if (!online() || busy || (!state?.hold?.held && !patrolActive(state) && ACTIVE.has(state?.goal?.status)) || flow.pending) break;
         selection = null; lastAdminInput = now();
         if (state.kiosk?.pin_required && !token) pin = '';
         else admin = true;
@@ -483,6 +600,8 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
         finally { busy = false; render(); }
         break;
       }
+      case 'patrol-start': await patrolCommand(true); break;
+      case 'patrol-stop': await patrolCommand(false); break;
       case 'exit': leaveAdmin(); break;
       case 'close-kiosk':
         if (!online() || busy) break;
@@ -519,6 +638,7 @@ const icon = (n, cls = 'i') => `<svg class="${cls}" viewBox="0 0 24 24">${ICON[n
       const response = await fetch('/api/floors', {signal:AbortSignal.timeout(2500)});
       if (!response.ok) throw new Error('층 정보 조회 실패');
       const value = await response.json(); floors = value.floors || []; floorsAt = now();
+      arrivalFloors = [...floors, ...(value.pass_floors || [])].sort((a,b) => a.level-b.level);
       if (!floorInfo(viewFloor)) viewFloor = currentFloor() || value.current_floor || floors[0]?.name;
       if (selection) {
         const f = floorInfo(selection.floor), r = f?.rooms.find(x => x.id === selection.room);

@@ -90,6 +90,13 @@ def launch_camera(context):
                      'min_height': .06, 'max_height': 1., 'max_range': 3.,
                      'frames': 3, 'cell_size': .05, 'neighbor_cells': 1}],
         output='screen',
+    ), Node(
+        # Fixed colour exposure for the floor-recognition frames (camera_settings.py):
+        # 4167 us / gain 16 gave mean 106/255 in the lab where auto exposure chose 116,
+        # leaving headroom for brighter halls; no light flicker at short exposures.
+        package='amr_stack', executable='camera_settings', name='camera_settings',
+        parameters=[{'exposure_us': 4167, 'gain': 16, 'white_balance_k': 5000}],
+        output='screen',
     )]
 
 

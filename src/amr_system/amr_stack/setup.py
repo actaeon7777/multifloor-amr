@@ -25,6 +25,7 @@ setup(
     description='Launch and configuration for the AMR.',
     license='TODO',
     entry_points={'console_scripts': [
+        'camera_settings = amr_stack.camera_settings:main',
         'joy_autoselect = amr_stack.joy_autoselect:main',
         'navigation_manager = amr_stack.navigation_manager:main',
         'navigation_startup = amr_stack.navigation_startup:main',

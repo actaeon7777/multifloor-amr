@@ -375,12 +375,20 @@ class NavigationManager(Node):
         return response
 
     def on_maneuver_command(self, message):
-        if self.lease_active() and valid_command(
+        lease = self.lease_active()
+        if lease and valid_command(
                 message, self.settings['max_linear_speed'], self.settings['max_angular_speed']):
             self.maneuver_command = message  # fresh object per callback; no copy needed
             self.maneuver_time = monotonic()
         else:
             self.maneuver_command = None
+            if lease:
+                # Dropped, not clamped: the robot stops while the sender believes it moves.
+                self.get_logger().warning(
+                    f'Dropping maneuver command v={message.linear.x:.3f} w={message.angular.z:.3f}: '
+                    f'outside max_linear_speed {self.settings["max_linear_speed"]} / '
+                    f'max_angular_speed {self.settings["max_angular_speed"]} or not planar',
+                    throttle_duration_sec=2.)
 
     def on_goal(self, goal):
         if self.held:

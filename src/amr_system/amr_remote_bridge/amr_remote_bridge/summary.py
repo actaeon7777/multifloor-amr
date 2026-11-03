@@ -12,6 +12,21 @@ def _subset(value, keys):
     return {key: deepcopy(value.get(key)) for key in keys.split()}
 
 
+def _patrol(value):
+    value = _dict(value)
+    result = dict(active=False, route=None, phase='IDLE', index=None, total=None,
+                  detail=None, routes=[], age=None)
+    for key, kind in dict(active=bool, route=str, phase=str, index=int, total=int, detail=str).items():
+        if type(value.get(key)) is kind:
+            result[key] = value[key][:300] if kind is str else value[key]
+    age = value.get('age')
+    if type(age) in (int, float) and 0 <= age < float('inf'):
+        result['age'] = age
+    if isinstance(value.get('routes'), list):
+        result['routes'] = [v for v in value['routes'] if isinstance(v, str) and len(v) <= 32][:32]
+    return result
+
+
 def summarize(state: dict) -> dict:
     state = _dict(state)
     floor = _dict(state.get('floor'))
@@ -30,6 +45,7 @@ def summarize(state: dict) -> dict:
         hold=_subset(state.get('hold'), 'held since reason pending') or {'held': False},
         goal=_subset(state.get('goal'), 'request_id kind status floor room origin error_message phase'),
         floor_mission=_subset(state.get('floor_mission'), 'phase detail'),
+        patrol=_patrol(state.get('patrol')),
         battery=_subset(_dict(state.get('telemetry')).get('battery'), 'soc voltage valid fresh charge_state'),
         localization=dict(ready=localization.get('ready', False), age=localization.get('age')),
         notice=_subset(state.get('notice'), 'request_id status detail'),

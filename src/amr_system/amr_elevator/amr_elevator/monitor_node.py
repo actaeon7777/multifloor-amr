@@ -2,7 +2,7 @@
 
 Shared by the real vehicle and the simulation; it only reads the real AMR
 interfaces (/scan, /odometry/filtered, TF, /localization/status) and the
-elevator topics (/elevator/beacon, /elevator/command).
+elevator topics (/elevator/request, /floor/arrival_confirm).
 
 Inside the car AMCL cannot be trusted, so the robot position is the last pose
 verified by localization outside the car carried forward by odometry
@@ -16,7 +16,7 @@ import math
 import numpy as np
 
 from amr_elevator_interfaces.msg import (
-    ElevatorBeacon, ElevatorCommand, ElevatorDoorState, FloorEvent, FloorState,
+    ElevatorRequest, FloorArrivalConfirm, ElevatorDoorState, FloorEvent, FloorState, FloorVisionGuess,
 )
 from amr_elevator_interfaces.srv import SetCurrentFloor
 from geometry_msgs.msg import PoseStamped
@@ -39,7 +39,7 @@ def spin_executor():
     except ImportError:  # older rclpy
         from rclpy.executors import SingleThreadedExecutor
         return SingleThreadedExecutor()
-from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
@@ -49,6 +49,8 @@ from amr_elevator.car_matcher import car_wall_segments, fit_car
 from amr_elevator.door_detector import NAMES as DOOR_NAMES, DoorDetector, enclosure_ratio
 from amr_elevator.floor_state import ZONE_IN_ELEVATOR, FloorStateMachine
 from amr_elevator.geometry import compose, depth_beyond, inverse, point_in_polygon
+
+HALF_BODY = .328
 
 
 def yaw_of(q):
@@ -67,16 +69,25 @@ class ElevatorMonitor(Node):
         p = {k: self.declare_parameter(k, v).value for k, v in {
             'floors_config': '', 'elevator_id': 'E1', 'initial_floor': '',
             'map_frame': 'map', 'odom_frame': 'odom', 'base_frame': 'base_footprint',
-            'exit_margin': .37, 'enclosure_near': 3., 'enclosure_ratio': .75,
-            'stationary_speed': .05, 'publish_period': 1.,
+            'exit_margin': .37, 'fully_inside_margin': .05,
+            'enclosure_near': 3., 'enclosure_ratio': .75,
+            'stationary_speed': .05, 'publish_period': 1., 'arrival_settle_s': 1.,
+            'vision_wait_s': 0., 'vision_auto': False,
+            'vision_auto_min_score': .93, 'vision_auto_min_margin': .03,
             'car_wall_correction': True, 'car_correction_gain': .5,
+            'door_open_ratio': .7, 'door_closed_ratio': .2, 'door_confirm_scans': 2,
         }.items()}
         self.p = p
         self.building = building or load_floor_config(p['floors_config'] or None)
         self.elevator_id = p['elevator_id']
         self._geometry_cache = {}
-        self.machine = FloorStateMachine(self.building, p['initial_floor'] or None)
-        self.detector = DoorDetector()
+        self.machine = FloorStateMachine(
+            self.building, p['initial_floor'] or None, arrival_settle_s=p['arrival_settle_s'],
+            vision_wait_s=p['vision_wait_s'], vision_auto=p['vision_auto'],
+            vision_auto_min_score=p['vision_auto_min_score'], vision_auto_min_margin=p['vision_auto_min_margin'])
+        self.detector = DoorDetector(open_ratio=p['door_open_ratio'],
+                                     closed_ratio=p['door_closed_ratio'],
+                                     confirm_scans=p['door_confirm_scans'])
         self.tf = Buffer()
         self.tf_listener = TransformListener(self.tf, self, spin_thread=False)
         self.anchor = None          # map->odom on the map of anchor_floor
@@ -86,7 +97,6 @@ class ElevatorMonitor(Node):
         self.laser_offset = None    # base->laser
         self.enclosed = False
         self.ready = False
-        self.commands = {}          # sequence -> ElevatorCommand
         self.car_corrections = 0
         self.last_published = None
         self.next_publish = 0.
@@ -99,8 +109,12 @@ class ElevatorMonitor(Node):
         self.create_subscription(LaserScan, 'scan', self.on_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, 'odometry/filtered', self.on_odometry, 20)
         self.create_subscription(String, 'localization/status', self.on_localization, latched)
-        self.create_subscription(ElevatorBeacon, 'elevator/beacon', self.on_beacon, 50)
-        self.create_subscription(ElevatorCommand, 'elevator/command', self.on_command, 20)
+        requests = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(ElevatorRequest, '/elevator/request', self.on_request, requests)
+        self.create_subscription(FloorArrivalConfirm, '/floor/arrival_confirm', self.on_arrival_confirm, 10)
+        guesses = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.VOLATILE)
+        self.create_subscription(FloorVisionGuess, '/floor/vision_guess', self.on_vision_guess, guesses)
         self.create_service(SetCurrentFloor, 'floor/set_current', self.on_set_floor)
         self.create_timer(.1, self.tick)
         self.get_logger().info(f'Elevator monitor: {sorted(self.building.floors)}, '
@@ -113,7 +127,11 @@ class ElevatorMonitor(Node):
 
     def current_floor(self):
         s = self.machine.state
-        return s.floor or s.transit_from or self.machine.building.default_floor
+        # Pass floors have no map: retain the last mapped car frame while riding.
+        for floor in (s.floor, s.transit_from, self.anchor_floor):
+            if floor in self.building.floors:
+                return floor
+        return self.machine.building.default_floor
 
     def geometry(self, floor=None):
         key = (floor or self.current_floor(), self.elevator_id)
@@ -143,7 +161,7 @@ class ElevatorMonitor(Node):
     def follow_car(self):
         """Keep the pose relative to the car when the car changes floor."""
         floor = self.machine.state.floor
-        if self.anchor is None or not floor or floor == self.anchor_floor:
+        if self.anchor is None or floor not in self.building.floors or floor == self.anchor_floor:
             return
         old_car = self.geometry(self.anchor_floor).car_pose
         new_car = self.geometry(floor).car_pose
@@ -166,23 +184,27 @@ class ElevatorMonitor(Node):
         self.ready = status.get('state') == 'READY' and status.get('ready') is True
         self.machine.on_localization(self.ready, self.now())
 
-    def on_command(self, message):
-        self.commands[message.sequence] = message
-        if len(self.commands) > 64:
-            self.commands.pop(next(iter(self.commands)))
+    def on_request(self, message):
+        if message.kind != ElevatorRequest.KIND_CAR_FLOOR:
+            return
+        try:
+            self.machine.on_car_target(message.target_floor)
+        except ValueError as error:
+            self.get_logger().warning(f'Ignoring elevator request: {error}')
 
-    def on_beacon(self, message):
-        now = self.now()
-        stamp = Time.from_msg(message.header.stamp).nanoseconds * 1e-9
-        verdict = self.machine.on_beacon(message.event, message.location, message.floor_code,
-                                         message.sequence, stamp, message.rssi_dbm, now)
-        if (verdict == 'ok' and message.event == ElevatorBeacon.EVENT_BUTTON_ACK
-                and message.location == ElevatorBeacon.LOCATION_CAR):
-            command = self.commands.get(message.ack_sequence)
-            if command is not None and command.command == ElevatorCommand.CMD_CAR_FLOOR:
-                floor = self.building.floor_by_beacon_code(command.floor_code)
-                if floor is not None:
-                    self.machine.on_car_target(floor.name)
+    def on_arrival_confirm(self, message):
+        verdict = self.machine.on_arrival_confirm(
+            message.source, message.floor, message.candidate_id, message.accepted, self.now(),
+            actual_floor=message.actual_floor)
+        self.get_logger().info(f'Arrival confirmation {message.floor}: {verdict}')
+
+    def on_vision_guess(self, message):
+        # Frame time ties the evidence to the current opening, even after delivery delay.
+        stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+        verdict = self.machine.on_vision_guess(message.floor, stamp, message.score, message.margin,
+                                               message.reference_floors)
+        self.get_logger().info(f'Vision guess {message.floor}: {verdict} '
+                               f'score={message.score:.3f} margin={message.margin:.3f}')
 
     def on_scan(self, message):
         if self.laser_offset is None:
@@ -268,7 +290,9 @@ class ElevatorMonitor(Node):
             geometry = self.geometry()
             inside = point_in_polygon(base[0], base[1], geometry.car_polygon)
             past_hall = depth_beyond(base, geometry.hall_door, self.inward_yaw()) < -self.p['exit_margin']
-            self.machine.on_position(inside, past_hall, self.enclosed, now)
+            fully_inside = depth_beyond(base, geometry.car_door, self.inward_yaw()) >= (
+                HALF_BODY + self.p['fully_inside_margin'])
+            self.machine.on_position(inside, past_hall, self.enclosed, now, fully_inside=fully_inside)
         state = self.machine.tick(now)
         self.follow_car()
         for record in self.machine.drain_events():
@@ -278,7 +302,7 @@ class ElevatorMonitor(Node):
             self.event_pub.publish(message)
             text = f'{record.event} {record.from_floor}->{record.to_floor} {record.detail}'.strip()
             # rclpy forbids changing the severity of one call site, so keep two call sites.
-            if record.event in ('RULE_VIOLATION', 'FLOOR_CONFLICT', 'ARRIVAL_UNCONFIRMED'):
+            if record.event == 'RULE_VIOLATION':
                 self.get_logger().warning(text)
             else:
                 self.get_logger().info(text)
@@ -286,8 +310,8 @@ class ElevatorMonitor(Node):
             message = FloorState(
                 zone=state.zone, floor=state.floor, transit_from=state.transit_from,
                 transit_to=state.transit_to, confidence=state.confidence, last_event=state.last_event,
-                floor_conflict=state.floor_conflict, duplicate_count=state.duplicate_count,
-                out_of_order_count=state.out_of_order_count, stale_count=state.stale_count)
+                awaiting_confirm=state.awaiting_confirm, candidate_id=state.candidate_id,
+                candidate_source=state.candidate_source)
             message.header.stamp = self.get_clock().now().to_msg()
             message.header.frame_id = self.p['map_frame']
             self.state_pub.publish(message)

@@ -69,7 +69,7 @@
     }
   },
   "floor_scenarios": {
-    "_note": "world building (sim/building_G.usda). expect: success = destination room reached; safe_stop = mission ends in FAILED_SAFE with one of error_codes, robot stopped, 0 contacts. faults: /sim/elevator/inject at start; fault_at: injected when the mission enters that phase. Run with scripts/run_floor_suite.py.",
+    "_note": "world building (sim/building_G.usda). expect: success = destination room reached; safe_stop = mission ends in FAILED_SAFE with one of error_codes, robot stopped, 0 contacts. faults (stop_at_floor, hold_time_s, door_never_opens, button_fails = nobody presses the requested button): /sim/elevator/inject at start; fault_at: injected when the mission enters that phase. Run with scripts/run_floor_suite.py.",
     "4F_to_3F": {
       "start_floor": "4F",
       "floor": "3F",
@@ -88,92 +88,22 @@
       "room": "503",
       "expect": "success"
     },
-    "ack_lost_twice": {
-      "start_floor": "3F",
-      "floor": "5F",
-      "room": "505",
-      "expect": "success",
-      "faults": {
-        "drop_next_acks": 2
-      },
-      "_why": "car waits at 4F, so the hall call must be re-pressed before the door opens"
-    },
-    "ack_loss_50": {
-      "start_floor": "4F",
-      "floor": "3F",
-      "room": "305",
-      "expect": "success",
-      "faults": {
-        "drop_ack_probability": 0.5
-      }
-    },
-    "ack_delay_4s": {
-      "start_floor": "4F",
-      "floor": "5F",
-      "room": "505",
-      "expect": "success",
-      "faults": {
-        "ack_extra_delay_s": 4.0
-      }
-    },
-    "duplicate_reorder": {
-      "start_floor": "4F",
-      "floor": "3F",
-      "room": "305",
-      "expect": "success",
-      "faults": {
-        "duplicate_probability": 0.3,
-        "reorder_probability": 0.3
-      }
-    },
     "other_passenger_stop": {
       "start_floor": "3F",
       "floor": "5F",
       "room": "505",
       "expect": "success",
       "faults": {
-        "stop_at_floor_code": 4
+        "stop_at_floor": "4F"
       }
     },
-    "arrival_beacon_lost": {
+    "nobody_presses_call": {
       "start_floor": "4F",
       "floor": "3F",
       "room": "305",
       "expect": "safe_stop",
       "error_codes": [
-        "ARRIVAL_UNCONFIRMED"
-      ],
-      "fault_at": {
-        "RIDING": {
-          "faults": {
-            "drop_presence_probability": 1.0
-          }
-        }
-      }
-    },
-    "arrival_beacon_stale": {
-      "start_floor": "4F",
-      "floor": "5F",
-      "room": "505",
-      "expect": "safe_stop",
-      "error_codes": [
-        "ARRIVAL_UNCONFIRMED"
-      ],
-      "fault_at": {
-        "RIDING": {
-          "faults": {
-            "stamp_lag_s": 3.0
-          }
-        }
-      }
-    },
-    "button_device_dead": {
-      "start_floor": "4F",
-      "floor": "3F",
-      "room": "305",
-      "expect": "safe_stop",
-      "error_codes": [
-        "NO_HALL_ACK"
+        "DOOR_NOT_OPENED"
       ],
       "faults": {
         "button_fails": true

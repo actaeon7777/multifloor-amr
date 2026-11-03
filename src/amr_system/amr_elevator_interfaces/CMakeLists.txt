@@ -6,7 +6,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/ElevatorBeacon.msg" "msg/ElevatorCommand.msg" "msg/ElevatorCommandStatus.msg"
+  "msg/ElevatorRequest.msg" "msg/FloorArrivalConfirm.msg" "msg/FloorVisionGuess.msg"
   "msg/ElevatorDoorState.msg"
   "msg/FloorState.msg" "msg/FloorEvent.msg"
   "srv/SetCurrentFloor.srv"

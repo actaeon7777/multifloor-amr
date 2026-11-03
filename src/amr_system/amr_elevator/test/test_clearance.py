@@ -108,6 +108,21 @@ def test_boarding_from_the_wait_pose_covers_hall_approach_and_tunnel(geometry):
     assert offset.contains([(-2.3, .13)])[0] and not offset.contains([(-1.775, .55)])[0]
 
 
+def test_door_recess_walls_never_block_a_slanted_approach(geometry):
+    # Real E1 door: the hall door plane sits 0.37 m inside the hall wall face, with
+    # side walls along that recess. The recess belongs to the tunnel, not the hall.
+    recessed = SimpleNamespace(**vars(geometry), hall_entry=((-2.145, -.55), (-2.145, .55)))
+    recess_walls = [(x, side) for x in np.linspace(-2.14, -1.776, 12) for side in (-.55, .55)]
+    for pose in [(-2.775, 0., 0.), (-2.775, .2, 0.), (-2.775, .2, .15), (-2.775, -.2, -.15)]:
+        assert boarding_region(recessed, .1, approach_from=pose).contains(recess_walls).sum() == 0, pose
+    # The old tunnel (hall door plane only) is what let a slanted corridor hit them.
+    assert boarding_region(geometry, .1, approach_from=(-2.775, .2, .15)).contains(recess_walls).any()
+    # People in the recess still block, and the exit corridor uses the same tunnel.
+    assert boarding_region(recessed, .1, approach_from=(-2.775, .2, -.15)).contains([(-2., .1)])[0]
+    exit_corridor = exit_region(recessed, (-2.5, 0., math.pi), .1)
+    assert not exit_corridor.contains(recess_walls).any() and exit_corridor.contains([(-2., .1)])[0]
+
+
 def test_exit_includes_hall_and_excludes_car_walls(geometry):
     region = exit_region(geometry, (-2.5, 0., math.pi), .1)
     assert region.contains([(0., 0.), (-.8, 0.), (-1.5, 0.), (-2.4, .3)]).all()
@@ -188,17 +203,18 @@ def test_depth_message_cache_padding_transform_and_expiry_without_ros_node(big_e
 def test_space_confirmation_resets_on_occupancy_or_unknown_pose(geometry):
     from amr_elevator.mission_node import FloorMissionManager
 
-    clock, points = [0.], [np.empty((0, 2))]
+    clock = [0.]
     node = SimpleNamespace(p={'clear_confirm_s': .5}, pose=(0., 0., 0.), scan=object(),
-                           scan_fresh=lambda: True,
-                           laser_pose=(0., 0., 0.), obstacle_points=lambda: points[0],
+                           scan_fresh=lambda: True, depth_fresh=lambda: False,
+                           _scan_points=np.empty((0, 2)), _depth_points=np.empty((0, 2)),
+                           laser_pose=(0., 0., 0.),
                            mission=SimpleNamespace(counters={}), now=lambda: clock[0])
     region = boarding_region(geometry, .1)
     assert not FloorMissionManager.space_clear(node, region)
     clock[0] = .4
-    points[0] = np.array([[0., 0.]])
+    node._scan_points = np.array([[0., 0.]])
     assert not FloorMissionManager.space_clear(node, region)
-    points[0] = np.empty((0, 2))
+    node._scan_points = np.empty((0, 2))
     clock[0] = .5
     assert not FloorMissionManager.space_clear(node, region)
     clock[0] = 1.
@@ -351,3 +367,34 @@ def test_depth_is_dropped_before_accessing_cloud_outside_elevator_legs(phase):
     FloorMissionManager.on_depth(node, object())
     node.tf.lookup_transform.assert_not_called()
     assert node.depth_received == -math.inf
+
+
+def test_sill_band_covers_only_the_car_door_line_inside_the_door(geometry):
+    from amr_elevator.clearance import sill_band
+    (ax, ay), (bx, by) = geometry.car_door
+    cx, cy = (ax + bx) / 2, (ay + by) / 2
+    hx, hy = np.mean(geometry.hall_door, axis=0)
+    inward = np.array((cx - hx, cy - hy)) / math.hypot(cx - hx, cy - hy)
+    centre = np.array((cx, cy))
+    points = np.array([centre, centre + .07 * inward, centre - .07 * inward, centre + .12 * inward,
+                       centre - .3 * inward, np.array((ax, ay)) + .2 * (np.array((ax, ay)) - centre)])
+    assert sill_band(points, geometry).tolist() == [True, True, True, False, False, False]
+
+
+def test_space_check_ignores_low_depth_points_on_the_sill_only(geometry):
+    from amr_elevator.mission_node import FloorMissionManager
+    # As recorded on 3F (2026-11-02): 4 cm on the hall side of the car door line.
+    centre = np.mean(geometry.car_door, axis=0) - (.04, 0.)
+    node = SimpleNamespace(p={'clear_confirm_s': 0.}, pose=(0., 0., 0.), scan_fresh=lambda: True,
+                           depth_fresh=lambda: True, _scan_points=np.empty((0, 2)),
+                           _depth_points=np.array([centre]), _depth_heights=np.array([.08]),
+                           mission=SimpleNamespace(counters={}), now=lambda: 0.)
+    region = boarding_region(geometry, .1, approach_from=(-2.775, 0., 0.))
+    sill = SimpleNamespace(**vars(geometry), sill_ignore_height_m=.10)
+    assert not FloorMissionManager.space_clear(node, region, geometry)   # floor without a sill setting
+    assert FloorMissionManager.space_clear(node, region, sill)
+    node._depth_heights = np.array([.12])                                 # taller than the sill: a person
+    assert not FloorMissionManager.space_clear(node, region, sill)
+    node._scan_points, node._depth_points = np.array([centre]), np.empty((0, 2))  # LiDAR is never ignored
+    node._depth_heights = np.empty(0)
+    assert not FloorMissionManager.space_clear(node, region, sill)

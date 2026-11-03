@@ -22,7 +22,7 @@ Gemini 2 (start_camera:=true) → /camera/depth/points → depth_persistence_fil
 |---|---|
 | `amr_stack` | bringup·localization·navigation·experiment launch와 설정 YAML, 지도 |
 | `amr_control` | `control_mux`(수동/자율 선택, 바퀴 속도 제한), `time_health` |
-| `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(수신), `elevator_can_link`(층간 이동용, 기본 꺼짐) |
+| `amr_can_bridge` | `cmd_vel_to_can`(송신), `can_telemetry`(수신) |
 | `amr_description` | v80 URDF, 실물 `laser`·`imu_link`·`camera_link` 프레임 |
 | `orbbec_camera` (apt) | Gemini 2 드라이버(OrbbecSDK_ROS2 v2.10.6 .deb). `camera.launch.py`가 감싸며 기본 꺼짐 |
 | `teleop_tools` | F1TENTH 소스에서 복사한 `joy_teleop` (출처 `src/amr_system/teleop_tools/AMR_SOURCE.md`) |
@@ -447,8 +447,7 @@ AMR_REQUIRE_TIME_SYNC=1 ./scripts/experiment.sh real   # chrony 점검 실패 �
 | `start_can_telemetry` | `true` | 휠·IMU CAN 수신 |
 | `start_ekf` | `true` | EKF와 `odom → base_footprint` |
 | `can_dry_run` | `false` | `true`이면 CAN 송신 없이 미리보기 |
-| `start_elevator_link` / `elevator_link_dry_run` | `false` / `true` | 층간 이동 CAN 중계 |
-| `start_camera` | `false` | Gemini 2 깊이 카메라(`camera.launch.py`): 깊이 320×200·10 Hz → 전역·지역 costmap, 컬러 640×360 JPEG → 웹, `time_health` depth 감시. 실차 전용(sim은 강제 off) |
+| `start_camera` | `false` | Gemini 2 깊이 카메라(`camera.launch.py`): 깊이 320×200·10 Hz → 전역·지역 costmap, 컬러 640×360 JPEG → 웹, `time_health` depth 감시. 컬러는 `camera_settings` 노드가 서비스로 노출 4167 µs·게인 16·화이트밸런스 5000 K 고정(2026-11-02, 엘리베이터 도착 사진 과노출 방지; 드라이버 launch 인자로는 적용되지 않음). 실차 전용(sim은 강제 off) |
 
 ```bash
 # 차량·센서·EKF

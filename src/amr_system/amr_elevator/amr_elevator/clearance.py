@@ -27,6 +27,11 @@ def cloud_points_xy(xyz, transform, min_height=.06, max_height=1., max_range=3.)
     Filter height and horizontal range *after* transformation. The upstream
     persistence filter also passes floor, ceiling and distant points unchanged.
     """
+    return cloud_points_xyz(xyz, transform, min_height, max_height, max_range)[:, :2]
+
+
+def cloud_points_xyz(xyz, transform, min_height=.06, max_height=1., max_range=3.):
+    """Same filter as ``cloud_points_xy`` but keeps the base-frame height."""
     points = np.asarray(xyz, dtype=float).reshape(-1, 3)
     points = points[np.all(np.isfinite(points), axis=1)]
     translation, rotation = transform
@@ -34,7 +39,7 @@ def cloud_points_xy(xyz, transform, min_height=.06, max_height=1., max_range=3.)
     valid = (np.all(np.isfinite(points), axis=1)
              & (points[:, 2] >= min_height) & (points[:, 2] <= max_height)
              & (np.hypot(points[:, 0], points[:, 1]) <= max_range))
-    return points[valid, :2]
+    return points[valid]
 
 
 def strip_clearance(points, reverse, half_length=.328, half_width=.307):
@@ -134,6 +139,34 @@ class SpaceRegion:
         return corridor & allowed
 
 
+def sill_band(points_map, geometry, half_band=.08):
+    """Mask of map points within ``half_band`` of the car door line and inside the door width."""
+    points = np.asarray(points_map, dtype=float).reshape(-1, 2)
+    a, b = (np.asarray(p, dtype=float) for p in geometry.car_door)
+    centre, span = (a + b) / 2, b - a
+    half_width = np.linalg.norm(span) / 2
+    lateral_axis = span / (2 * half_width)
+    offset = points - centre
+    lateral = offset @ lateral_axis
+    normal = offset[:, 0] * lateral_axis[1] - offset[:, 1] * lateral_axis[0]
+    return (np.abs(normal) <= half_band) & (np.abs(lateral) <= half_width)
+
+
+def door_tunnel(geometry):
+    """(hall end, car-door centre, half-width) of the door passage with side walls.
+
+    The hall end is the hall wall face (``hall_entry``) when the door sits in a
+    recess; otherwise the hall door plane. Without it the recess side walls, 0.55 m
+    off the axis, enter a slanted approach corridor and block boarding for good.
+    """
+    hall_entry = getattr(geometry, 'hall_entry', None)
+    hall = np.mean(geometry.hall_door if hall_entry is None else hall_entry, axis=0)
+    car = np.mean(geometry.car_door, axis=0)
+    half_door = min(np.linalg.norm(np.subtract(*geometry.hall_door)),
+                    np.linalg.norm(np.subtract(*geometry.car_door))) / 2
+    return hall, car, half_door
+
+
 def boarding_region(geometry, margin, wall_margin=.12, approach_from=None):
     """Corridor to the car centre plus turning disc.
 
@@ -148,11 +181,8 @@ def boarding_region(geometry, margin, wall_margin=.12, approach_from=None):
                            geometry.car_polygon, .307 + margin, wall_margin, turn)
     x, y, yaw = approach_from
     bumper = (x + .348 * math.cos(yaw), y + .348 * math.sin(yaw))
-    hall, car = np.mean(geometry.hall_door, axis=0), np.mean(geometry.car_door, axis=0)
-    half_door = min(np.linalg.norm(np.subtract(*geometry.hall_door)),
-                    np.linalg.norm(np.subtract(*geometry.car_door))) / 2
     return SpaceRegion(bumper, geometry.car_pose[:2], geometry.car_polygon, .307 + margin,
-                       wall_margin, turn, include_hall=True, tunnel=(hall, car, half_door))
+                       wall_margin, turn, include_hall=True, tunnel=door_tunnel(geometry))
 
 
 def exit_region(geometry, hall_exit_pose, margin, wall_margin=.12):
@@ -161,8 +191,5 @@ def exit_region(geometry, hall_exit_pose, margin, wall_margin=.12):
     Tunnel jamb inset is at least wall_margin and 0.15 m (pose-error allowance).
     The same tunnel clip applies to the boarding region's hall approach.
     """
-    hall, car = np.mean(geometry.hall_door, axis=0), np.mean(geometry.car_door, axis=0)
-    half_door = min(np.linalg.norm(np.subtract(*geometry.hall_door)),
-                    np.linalg.norm(np.subtract(*geometry.car_door))) / 2
     return SpaceRegion(geometry.car_pose[:2], hall_exit_pose[:2], geometry.car_polygon,
-                       .307 + margin, wall_margin, include_hall=True, tunnel=(hall, car, half_door))
+                       .307 + margin, wall_margin, include_hall=True, tunnel=door_tunnel(geometry))

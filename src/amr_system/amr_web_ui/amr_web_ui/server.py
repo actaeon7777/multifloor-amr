@@ -33,29 +33,15 @@ KIOSK_STATE_KEYS = frozenset((
     'preview', 'connection_epoch', 'mode', 'navigation', 'action_ready', 'floor_action_ready',
     'floor', 'floor_mission', 'goal', 'notice', 'pending_request', 'localization',
     'localization_reset_pending', 'robot', 'global_path', 'tf_error', 'estop', 'telemetry',
-    'acknowledged_request', 'kiosk', 'map_version', 'hold', 'task'))
+    'elevator_request', 'acknowledged_request', 'kiosk', 'map_version', 'hold', 'task', 'patrol'))
 ESTOP_STATES = {'UNKNOWN', 'ESTOP', 'ARMING', 'READY', 'BYPASS'}
 ESTOP_STM32_KEYS = ('raw', 'debounced', 'latched', 'inhibit', 'odrv_idle', 'bus_off', 'odrv_hb_ok',
                     'drive_enabled', 'stopped', 'trip_count', 'release_count', 'reset_rejected', 'sequence')
-# /elevator/rf_status is published at 1 Hz (elevator_can_link); allow two misses.
-ELEVATOR_RF_TIMEOUT = 3.
-RF_LEVELS = {'OK', 'WARN', 'ERROR'}
-RF_LINK_KEYS = {'radio_ok': bool, 'rx_overflow': bool, 'tx_timeout': bool, 'rx_ok': int,
-                'rx_bad': int, 'tx_fail': int, 'pending': int}
-RF_BEACON_KEYS = {'node_id': int, 'label': str, 'role': str, 'floor_code': int,
-                  'presence_age': (int, float), 'rssi_dbm': int, 'battery_mv': int,
-                  'fw_version': int, 'device_age': (int, float)}
-# Floor transit view: beacon reception timeline (1 s bins) and the mission event log.
-TRANSIT_WINDOW = 60
 TRANSIT_EVENTS = 60
 # /elevator/door follows the scan (~10 Hz); a door state must hold this long to be logged.
 DOOR_TIMEOUT = 1.
 DOOR_SETTLE = .5
 MISSION_TEXT_KEYS = ('phase', 'detail', 'goal_floor', 'goal_room', 'start_floor', 'current_floor', 'confidence')
-COMMAND_STATUS_NAMES = {1: 'DELIVERED', 2: 'COMPLETED', 3: 'DEVICE_REJECTED', 4: 'RF_TIMEOUT',
-                        5: 'NO_RESULT', 6: 'NO_ROUTE', 7: 'BAD_FRAME', 8: 'REPLACED'}
-DEVICE_RESULT_NAMES = {0x00: 'PRESSED', 0x01: 'DUPLICATE', 0x81: 'WRONG_DEVICE', 0x82: 'UNSUPPORTED',
-                       0x83: 'BUTTON_FAULT', 0x84: 'BAD_REQUEST', 0xFF: 'NONE'}
 
 
 def delivery_announcement(goal, before):
@@ -85,6 +71,20 @@ HOLD_DEFER_PHASES = frozenset(('BOARDING', 'BACKING_OUT', 'IN_CAR_ALIGN', 'SELEC
                                'SWITCH_MAP', 'ALIGHTING', 'RETURN_TO_CAR', 'RELOCALIZE'))
 
 
+PATROL_PHASES = {'IDLE', 'NAV', 'DWELL', 'RETURN', 'DONE', 'ABORTED'}
+PATROL_LABELS = {'NAV': '이동', 'DWELL': '관측', 'RETURN': '복귀'}
+PATROL_DELIVERY_ERROR = '야간 순찰 중에는 배송을 받을 수 없습니다. 중앙 관제에서 순찰을 정지하세요.'
+
+
+def patrol_active(patrol):
+    if not isinstance(patrol, dict) or patrol.get('active') is not True:
+        return False
+    age = patrol.get('age')
+    if 'received_at' in patrol:
+        age = time.monotonic() - patrol['received_at']
+    return type(age) in (int, float) and 0 <= age < 3
+
+
 def task_summary(state):
     """One Korean task line, shared by the console and kiosk snapshots."""
     estop = state.get('estop') or {}
@@ -94,6 +94,11 @@ def task_summary(state):
         return '관리자 정지'
     if state.get('mode') == 'MANUAL':
         return '수동 조작'
+    patrol = state.get('patrol') or {}
+    if patrol_active(patrol):
+        text = (f"순찰 {patrol.get('route') or ''} {patrol.get('index', 0)}/{patrol.get('total', 0)}"
+                f" · {PATROL_LABELS.get(patrol.get('phase'), '이동')}")
+        return text + (' · 하차 후 정지 예정' if (state.get('hold') or {}).get('pending') else '')
     goal = state.get('goal') or {}
     status, room = goal.get('status'), goal.get('room')
     if status in ACTIVE_GOALS:
@@ -243,6 +248,7 @@ class SharedState:
         self.commands = queue.Queue(maxsize=32)
         # Safety commands must not be refused by the ordinary bounded queue.
         self.operator_commands = deque()
+        self.pending_patrol = {}  # request_id -> monotonic publish time
         self.hold_sequence = 0
         self.cancel_goal_ids = set()
         self.pending_return = None
@@ -264,17 +270,11 @@ class SharedState:
         # /estop/status from cmd_vel_to_can; a stale or missing lease blocks goals.
         self.estop = HealthLease()
         self.require_estop = False
-        # Elevator RF relay health (/elevator/rf_status) and the last command status.
-        self.elevator_rf = None
-        self.elevator_rf_received = -math.inf
-        self.elevator_command = None
-        # Floor transit view (/elevator/command, /elevator/beacon, /elevator/door, /floor/events).
         self.transit_events = deque(maxlen=TRANSIT_EVENTS)
-        self.beacon_history = {}  # ('car', 0) | ('hall', floor_code) -> deque[(monotonic, rssi)]
+        self.elevator_request = None
         self.door = None
         self.door_candidate = (None, -math.inf)
         self.door_logged = None
-        self.sent_command = None
         self.mission_phases = []
         self.mission_received = (-math.inf, -math.inf)  # (phase change, last status) monotonic
         self.connection_epoch = 0
@@ -289,7 +289,7 @@ class SharedState:
         # Latest JPEG from the depth camera's color stream (bytes, monotonic, width, height).
         # Encoded by the camera driver; this process never decodes or re-encodes images.
         self.camera = None
-        self.state = dict(hold=dict(held=False, since=None, reason='', pending=False), preview=preview, floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
+        self.state = dict(hold=dict(held=False, since=None, reason='', pending=False), preview=preview, patrol=dict(active=False, phase='IDLE', routes=[]), floor=None, floor_mission=None, floor_action_ready=False, navigation='UNKNOWN', mode='UNKNOWN',
                           action_ready=False, robot=None, amcl=None, scan=None,
                           global_path=None, local_path=None, footprint=None,
                           goal=None, notice=None, velocity=None, tf_error=None, pending_request=None,
@@ -344,11 +344,11 @@ class SharedState:
                     valid = False
                 if not valid:
                     raise ApiError(403, '키오스크에서는 등록된 호실로만 보낼 수 있습니다.')
-            elif kind in ('initialpose', 'relocalize', 'set_floor', 'kiosk/exit'):
+            elif kind in ('initialpose', 'relocalize', 'set_floor', 'kiosk/exit', 'patrol_start', 'patrol_stop'):
                 self._prune_kiosk_tokens(time.monotonic())
                 if self.kiosk_pin and token not in self.kiosk_tokens:
                     raise ApiError(403, '관리 모드 잠금을 먼저 해제하세요.')
-            elif kind not in ('cancel', 'acknowledge', 'kiosk/unlock'):
+            elif kind not in ('cancel', 'acknowledge', 'kiosk/unlock', 'arrival_confirm'):
                 raise ApiError(403, '키오스크에서 허용하지 않는 명령입니다.')
 
     def acknowledge(self, payload):
@@ -465,52 +465,61 @@ class SharedState:
                 self.estop.status = {}
             return accepted
 
-    def update_elevator_rf(self, text):
-        """Keep only typed, whitelisted fields; anything malformed is dropped."""
-        try:
-            value = json.loads(text, parse_constant=lambda _s: None)
-            if not isinstance(value, dict) or value.get('level') not in RF_LEVELS:
-                raise ValueError('invalid RF status')
-            link = value.get('link')
-            beacons = value.get('beacons') if isinstance(value.get('beacons'), list) else []
-            status = dict(
-                level=value['level'], live=value.get('live') is True,
-                problems=[str(p)[:200] for p in value.get('problems', [])[:16]
-                          if isinstance(p, str)] if isinstance(value.get('problems'), list) else [],
-                link=dict(_typed(link, RF_LINK_KEYS), age=link.get('age') if type(link.get('age')) in (int, float) else None)
-                if isinstance(link, dict) else None,
-                beacons=[])
-            for beacon in beacons[:32]:
-                if not isinstance(beacon, dict):
-                    continue
-                entry = _typed(beacon, RF_BEACON_KEYS)
-                flags = beacon.get('flags')
-                entry['flags'] = ([str(f)[:20] for f in flags[:8]] if isinstance(flags, list) else None)
-                if 'node_id' in entry and 'label' in entry:
-                    status['beacons'].append(entry)
-        except (ValueError, TypeError, AttributeError):
-            return False
-        with self.lock:
-            self.elevator_rf, self.elevator_rf_received = status, time.monotonic()
-        return True
-
-    def update_elevator_command(self, cmd_seq, status, device_result, target, attempts, source):
-        with self.lock:
-            self.elevator_command = dict(
-                cmd_seq=cmd_seq, status=COMMAND_STATUS_NAMES.get(status, str(status)),
-                device_result=DEVICE_RESULT_NAMES.get(device_result, f'0x{device_result:02X}'),
-                target=target, attempts=attempts, source=source[:8], received_at=time.monotonic())
-            name, result = self.elevator_command['status'], self.elevator_command['device_result']
-            sent = self.sent_command
-            if sent is not None and cmd_seq in sent['sequences']:
-                sent.update(status=name, device_result=result)
-            self.log_transit('status', cmd_seq=cmd_seq, status=name, device_result=result, target=target)
-
     def log_transit(self, kind, **fields):
         self.transit_events.append(dict(t=time.time(), kind=kind, **fields))
 
     def mission_active(self):
         return (self.state.get('floor_mission') or {}).get('phase') in FLOOR_MISSION_ACTIVE
+
+    def patrol_active(self):
+        return patrol_active(self.state.get('patrol'))
+
+    def update_patrol(self, text):
+        try:
+            value = json.loads(text, parse_constant=lambda _s: None)
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(value, dict):
+            return False
+        patrol = dict(active=False, phase='IDLE', routes=[])
+        patrol.update(_typed(value, dict(active=bool, route=str, floor=str, phase=str,
+            index=int, total=int, detail=str, started_at=(int, float), elapsed_s=(int, float),
+            stamp=(int, float))))
+        if patrol['phase'] not in PATROL_PHASES:
+            patrol['phase'] = 'IDLE'
+        for key in ('route', 'floor', 'started_at'):
+            patrol.setdefault(key, None)
+        if isinstance(value.get('detail'), str):
+            patrol['detail'] = value['detail'][:300]
+        if isinstance(value.get('routes'), list):
+            patrol['routes'] = [v for v in value['routes'] if isinstance(v, str)
+                                and re.fullmatch(r'[A-Za-z0-9_-]{1,32}', v)]
+        patrol['skipped'] = ([v for v in value['skipped'] if type(v) is int and v >= 0][:1024]
+                             if isinstance(value.get('skipped'), list) else [])
+        ack = value.get('last_command')
+        patrol['last_command'] = None
+        if isinstance(ack, dict) and isinstance(ack.get('request_id'), str) and type(ack.get('accepted')) is bool:
+            patrol['last_command'] = dict(request_id=ack['request_id'][:80], accepted=ack['accepted'],
+                detail=ack['detail'][:300] if isinstance(ack.get('detail'), str) else '')
+        patrol['received_at'] = time.monotonic()
+        with self.lock:
+            self.state['patrol'] = patrol
+        return True
+
+    def poll_patrol(self):
+        """Called on executor ticks; HTTP acceptance is not the node acknowledgement."""
+        with self.lock:
+            ack = (self.state.get('patrol') or {}).get('last_command') or {}
+            now = time.monotonic()
+            for request_id, started in list(self.pending_patrol.items()):
+                if ack.get('request_id') == request_id and type(ack.get('accepted')) is bool:
+                    self.complete(request_id, 'SUCCEEDED' if ack['accepted'] else 'FAILED',
+                                  ack.get('detail', ''))
+                elif now - started >= 3:
+                    self.complete(request_id, 'FAILED', '순찰 노드가 응답하지 않습니다.')
+                else:
+                    continue
+                del self.pending_patrol[request_id]
 
     def update_floor_mission(self, text):
         """/floor_mission/status; only typed, whitelisted fields reach the browser."""
@@ -535,10 +544,10 @@ class SharedState:
             phase = mission['phase']
             if phase != old.get('phase'):
                 if phase in FLOOR_MISSION_ACTIVE and old.get('phase') not in FLOOR_MISSION_ACTIVE:
-                    # A new mission: start a fresh log and button history.
+                    # A new mission starts a fresh event log.
                     self.transit_events.clear()
                     self.mission_phases = []
-                    self.sent_command = self.door_logged = None
+                    self.door_logged = None
                 self.mission_phases = (self.mission_phases + [phase])[-40:]
                 self.mission_received = (now, now)
                 self.log_transit('phase', phase=phase, detail=mission['detail'])
@@ -547,35 +556,48 @@ class SharedState:
             self.state['floor_mission'] = mission
         return True
 
-    def update_sent_command(self, command, floor_code, direction, sequence, repeat):
-        """An ElevatorCommand from the mission; a resend of the same press counts as a retry."""
-        now = time.monotonic()
-        key = (command, floor_code, direction, repeat)
+    def update_elevator_request(self, kind, start_floor, target_floor, direction, sequence):
         with self.lock:
-            last = self.sent_command
-            retry = last is not None and last['key'] == key and last['acked_at'] is None
-            self.sent_command = dict(
-                key=key, command=command, floor_code=floor_code, direction=direction, repeat=repeat,
-                sequence=sequence, sequences=(last['sequences'] if retry else set()) | {sequence},
-                attempt=last['attempt'] + 1 if retry else 1, sent_at=now, acked_at=None,
-                status=None, device_result=None)
-            self.log_transit('command', command=command, floor_code=floor_code, direction=direction,
-                             repeat=repeat, sequence=sequence, attempt=self.sent_command['attempt'])
+            self.elevator_request = dict(
+                kind={1: 'CALL', 2: 'CAR_FLOOR', 3: 'CANCEL'}.get(kind, str(kind)),
+                start_floor=start_floor, target_floor=target_floor, direction=direction,
+                sequence=sequence, received_at=time.monotonic())
+            self.log_transit('request', **{k: v for k, v in self.elevator_request.items()
+                                         if k not in ('kind', 'received_at')},
+                             request_kind=self.elevator_request['kind'])
 
-    def update_beacon(self, event, location, floor_code, ack_sequence, rssi):
-        now = time.monotonic()
+    def arrival_error(self, floor, candidate_id):
+        state = self.state.get('floor') or {}
+        if (state.get('awaiting_confirm') is not True or state.get('zone') != 2
+                or not isinstance(floor, str) or not floor or state.get('floor') != floor
+                or state.get('candidate_id') != candidate_id):
+            return '지금은 도착 층을 확인할 단계가 아닙니다.'
+        return None
+
+    def arrival_confirm(self, payload):
+        if type(payload.get('accepted')) is not bool:
+            raise ApiError(400, '도착 확인 응답은 true 또는 false여야 합니다.')
+        actual_floor = payload.get('actual_floor', '')
+        known = (set(self.building.floors) | set(getattr(self.building, 'pass_floors', {}))) if self.building else set()
+        if (not isinstance(actual_floor, str)
+                or ('actual_floor' in payload and payload['accepted'])
+                or (actual_floor and (actual_floor not in known or actual_floor == payload.get('floor')))):
+            raise ApiError(400, '실제 층은 아니요 응답에서 다른 등록 층 또는 빈 문자열이어야 합니다.')
+        candidate_id = payload.get('candidate_id')
+        if type(candidate_id) is not int or candidate_id < 0:
+            raise ApiError(400, '도착 후보 ID는 0 이상의 정수여야 합니다.')
         with self.lock:
-            if event == 1:  # PRESENCE
-                key = ('car', 0) if location == 1 else ('hall', floor_code)
-                samples = self.beacon_history.setdefault(key, deque())
-                samples.append((now, rssi))
-                while samples and now - samples[0][0] > TRANSIT_WINDOW:
-                    samples.popleft()
-            elif event == 2:  # BUTTON_ACK
-                sent = self.sent_command
-                if sent is not None and sent['acked_at'] is None and ack_sequence in sent['sequences']:
-                    sent['acked_at'] = now
-                self.log_transit('ack', location=location, floor_code=floor_code, ack_sequence=ack_sequence)
+            error = self.arrival_error(payload.get('floor'), candidate_id)
+            if error:
+                raise ApiError(409, error)
+            request_id = secrets.token_hex(16)
+            try:
+                self.commands.put_nowait(dict(kind='arrival_confirm', request_id=request_id,
+                                              pose=None, floor=payload['floor'], candidate_id=candidate_id,
+                                              accepted=payload['accepted'], actual_floor=actual_floor))
+            except queue.Full:
+                raise ApiError(429, '요청이 많습니다. 잠시 후 다시 시도해 주세요.')
+            return dict(kind='arrival_confirm', request_id=request_id, status='QUEUED')
 
     def update_door(self, state, open_ratio, valid_beams):
         now = time.monotonic()
@@ -602,12 +624,8 @@ class SharedState:
             mission = self.state.get('floor_mission')
             mission = dict(mission) if mission else None
             phases, (phase_at, status_at) = list(self.mission_phases), self.mission_received
-            history = {key: list(samples) for key, samples in self.beacon_history.items()}
-            expected = self.expected_beacons()
-            devices = {('car', 0) if b.get('role') == 'car' else ('hall', b.get('floor_code')): b
-                       for b in (self.elevator_rf or {}).get('beacons', [])}
             door = dict(self.door) if self.door else None
-            sent = dict(self.sent_command) if self.sent_command else None
+            sent = dict(self.elevator_request) if self.elevator_request else None
             events = list(self.transit_events)
         if mission:
             mission['phase_age'] = max(0., now - phase_at) if math.isfinite(phase_at) else None
@@ -617,70 +635,8 @@ class SharedState:
         if door:
             door['age'] = max(0., now - door.pop('received_at'))
         if sent:
-            for name in ('key', 'sequences'):
-                sent.pop(name)
-            sent['age'] = max(0., now - sent.pop('sent_at'))
-            acked = sent.pop('acked_at')
-            sent['ack_age'] = None if acked is None else max(0., now - acked)
-        rows = [(('car', 0) if row['role'] == 'car' else ('hall', row['floor_code']), row) for row in expected]
-        known = {key for key, _row in rows}
-        rows += [(key, dict(label=f'{key[1]}F' if key[1] > 0 else f'B{-key[1]}', role='hall',
-                            floor_code=key[1], mapped=False))  # Heard but not in floors.yaml.
-                 for key in sorted(set(history) - known) if key[0] == 'hall']
-        beacons = []
-        for key, row in rows:
-            samples = [(t, r) for t, r in history.get(key, ()) if 0 <= now - t < TRANSIT_WINDOW]
-            bins = [None] * TRANSIT_WINDOW
-            for t, rssi in samples:
-                index = TRANSIT_WINDOW - 1 - int(now - t)
-                bins[index] = rssi if bins[index] is None else max(bins[index], rssi)
-            device = devices.get(key, {})
-            beacons.append(dict(
-                label=row['label'], role=row['role'], floor_code=row.get('floor_code', 0),
-                mapped=row['mapped'], presence_age=now - samples[-1][0] if samples else None,
-                rssi=samples[-1][1] if samples else None, bins=bins,
-                **{k: device[k] for k in ('battery_mv', 'flags', 'device_age') if device.get(k) is not None}))
-        return dict(mission=mission, door=door, command=sent, events=events, beacons=beacons,
-                    window=TRANSIT_WINDOW, door_timeout=DOOR_TIMEOUT)
-
-    def expected_beacons(self):
-        """Every installed beacon: floors with a map, pass floors (no map) and the car."""
-        if self.building is None:
-            return []
-        rows = [dict(label=f.name, floor_code=f.beacon_floor_code, level=f.level, role='hall', mapped=mapped)
-                for floors, mapped in ((self.building.floors, True),
-                                       (getattr(self.building, 'pass_floors', {}), False))
-                for f in floors.values() if isinstance(getattr(f, 'beacon_floor_code', None), int)]
-        rows.sort(key=lambda r: r['level'])
-        cars = [dict(label=elevator, role='car', mapped=True)
-                for elevator in getattr(self.building, 'elevators', {})]
-        return cars + rows
-
-    def elevator_snapshot(self, now):
-        with self.lock:
-            rf, received = deepcopy(self.elevator_rf), self.elevator_rf_received
-            command = dict(self.elevator_command) if self.elevator_command else None
-            expected = self.expected_beacons()
-        if command is not None:
-            command['age'] = max(0., now - command.pop('received_at'))
-        if rf is None and command is None and not expected:
-            return None
-        fresh = rf is not None and 0 <= now - received < ELEVATOR_RF_TIMEOUT
-        heard = {}
-        for beacon in (rf or {}).get('beacons', []):
-            key = 'E1' if beacon.get('role') == 'car' else beacon.get('floor_code')
-            heard[key] = beacon
-        rows = []
-        for row in expected:
-            beacon = heard.pop('E1' if row['role'] == 'car' else row['floor_code'], None)
-            rows.append({**row, **(beacon or {}), 'label': row['label'], 'heard': beacon is not None})
-        rows += [{**b, 'mapped': False, 'heard': True} for b in heard.values()]  # Not in floors.yaml.
-        return dict(
-            received=rf is not None, fresh=fresh, timeout=ELEVATOR_RF_TIMEOUT,
-            age=max(0., now - received) if math.isfinite(received) else None,
-            live=bool(rf and rf['live']), level=rf['level'] if fresh else None,
-            problems=rf['problems'] if fresh else [], link=rf['link'] if fresh else None,
-            beacons=rows, last_command=command)
+            sent['age'] = max(0., now - sent.pop('received_at'))
+        return dict(mission=mission, door=door, request=sent, events=events, door_timeout=DOOR_TIMEOUT)
 
     def estop_live(self, now=None):
         """Latest bridge status while its lease is alive, else None."""
@@ -709,6 +665,11 @@ class SharedState:
         """Invalidate display/request state; never replay a command after restart."""
         with self.lock:
             self.cancel_pending_return(reason)
+            self.pending_patrol.clear()
+            self.operator_commands = deque(c for c in self.operator_commands
+                                           if c['kind'] not in ('patrol_start', 'patrol_stop'))
+            self.state['patrol'] = dict(active=False, phase='IDLE',
+                                       routes=list((self.state.get('patrol') or {}).get('routes', [])))
             self.connection_epoch += 1
             self.scan_stamp = None
             self.telemetry.reset()
@@ -722,8 +683,9 @@ class SharedState:
                     self.complete(request_id, 'FAILED', reason)
             self.state['pending_request'] = None
             self.localization_reset_baseline = None
-            # The log and beacon timeline stay; live door and button state must be re-heard.
-            self.door = self.sent_command = None
+            # Keep events, but reacquire live door and request state.
+            self.door = self.elevator_request = None
+            self.state['floor'] = None
             while True:
                 try:
                     self.commands.get_nowait()
@@ -783,7 +745,7 @@ class SharedState:
     def floors_info(self):
         with self.lock:
             if self.building is None:
-                return dict(floors=[], default_floor=None, current_floor=None, simulation=self.simulation, home=None)
+                return dict(floors=[], pass_floors=[], default_floor=None, current_floor=None, simulation=self.simulation, home=None)
             floors = []
             for floor in sorted(self.building.floors.values(), key=lambda f: f.level):
                 try:
@@ -796,7 +758,8 @@ class SharedState:
                     selectable=self.simulation or floor.real_enabled, map=layer,
                     rooms=[dict(id=r.room_id, x=r.goal[0], y=r.goal[1], yaw=r.goal[2])
                            for r in sorted(floor.rooms.values(), key=lambda r: r.room_id)]))
-            return dict(floors=floors, default_floor=self.building.default_floor,
+            return dict(floors=floors, pass_floors=[dict(name=f.name, level=f.level) for f in
+                        sorted(getattr(self.building, 'pass_floors', {}).values(), key=lambda f: f.level)], default_floor=self.building.default_floor,
                         current_floor=self.current_floor(), simulation=self.simulation,
                         home=(dict(floor=self.building.home.floor, room=self.building.home.room)
                               if getattr(self.building, 'home', None) else None))
@@ -815,6 +778,8 @@ class SharedState:
     def readiness_error(self, kind, request_id=None):
         """Shared admission check, repeated on the ROS executor before side effects."""
         with self.lock:
+            if kind in ('goal', 'floor_goal') and self.patrol_active():
+                return PATROL_DELIVERY_ERROR
             if self.state['preview']:
                 if kind in ('goal', 'floor_goal') and self.state['hold']['held']:
                     return '관리자가 원격으로 정지했습니다. 중앙 관제에서 해제해야 출발할 수 있습니다.'
@@ -853,7 +818,7 @@ class SharedState:
                 if not self.state.get('floor_action_ready'):
                     return '층간 이동 관리자에 연결되지 않았습니다.'
                 if (not floor or floor.get('zone') != 1
-                        or floor.get('confidence') not in ('BEACON', 'CONFIRMED')):
+                        or floor.get('confidence') not in ('CONFIRMED', 'VERIFIED')):
                     return '현재 층이 확인되지 않았습니다. 엘리베이터 밖에서 층 확인을 기다려 주세요.'
                 if (self.state.get('floor_mission') or {}).get('phase') in FLOOR_MISSION_ACTIVE:
                     return '진행 중인 층간 이동이 있습니다.'
@@ -918,6 +883,11 @@ class SharedState:
             live_map = self.grids.get('map')
             result['map_version'] = live_map.version if live_map is not None else None
             if not kiosk:
+                stops = ({**self.building.floors, **getattr(self.building, 'pass_floors', {})}
+                         if self.building else {})
+                result['arrival_floors'] = sorted(
+                    [dict(name=name, level=getattr(f, 'level', 0)) for name, f in stops.items()],
+                    key=lambda f: f['level'])
                 result['layers'] = {name: grid.metadata() for name, grid in self.grids.items()}
             result['telemetry'] = self.telemetry.snapshot()
         now = time.monotonic()
@@ -934,15 +904,21 @@ class SharedState:
                       if now-self.time_health.received >= self.time_health.timeout
                       else self.time_health.status.get('detail', '로봇 응답 대기'))
             result['tf_error'] = '시간·센서 상태 확인 필요: ' + detail
+        with self.lock:
+            result['elevator_request'] = ({k: v for k, v in self.elevator_request.items()
+                                           if k != 'received_at'} if self.elevator_request else None)
         result['estop'] = self.estop_snapshot(now)
         if not kiosk:
-            result['elevator'] = self.elevator_snapshot(now)
             result['transit'] = self.transit_snapshot(now)
             result['camera'] = self.camera_snapshot(now)
         for name in ('robot', 'amcl', 'scan', 'global_path', 'local_path', 'footprint', 'velocity', 'localization'):
             item = result.get(name)
             if item:
                 item['age'] = max(0, now-item.pop('received_at'))
+        patrol = result.get('patrol')
+        if patrol is not None:
+            received = patrol.pop('received_at', None)
+            patrol['age'] = max(0., now-received) if received is not None else patrol.get('age')
         localization = result.get('localization')
         if localization:
             localization['age'] = max(localization['age'], time.time()-localization.get('stamp', 0))
@@ -971,9 +947,13 @@ class SharedState:
             error=self.estop_error(now))
 
     def request(self, kind, payload):
+        if kind == 'arrival_confirm':
+            return self.arrival_confirm(payload)
         request_id = payload.get('request_id', '')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ApiError(400, '요청 ID가 필요합니다.')
+        if kind in ('patrol_start', 'patrol_stop'):
+            return self.patrol_request(kind, request_id, payload)
         if kind in ('stop', 'resume', 'return_home'):
             return self.operator_request(kind, request_id)
         if kind not in ('goal', 'initialpose', 'cancel', 'relocalize', 'set_floor'):
@@ -1083,6 +1063,56 @@ class SharedState:
                 self.cancel_goal_ids.add(goal['request_id'])
             return self.set_hold(True)
 
+    def patrol_start_error(self, request_id=None):
+        if self.patrol_active():
+            return '이미 순찰 중입니다.'
+        if (self.state.get('goal') or {}).get('status') in ACTIVE_GOALS:
+            return '진행 중인 목표를 취소한 뒤 순찰을 시작해 주세요.'
+        if self.mission_active():
+            return '진행 중인 층간 이동이 있습니다.'
+        return self.readiness_error('goal', request_id)
+
+    def patrol_request(self, kind, request_id, payload):
+        route = payload.get('route')
+        keys = {'request_id', 'route'} if kind == 'patrol_start' else {'request_id'}
+        if payload.keys() != keys or (kind == 'patrol_start' and
+                (not isinstance(route, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', route))):
+            raise ApiError(400, '순찰 요청 형식이 올바르지 않습니다.')
+        with self.lock:
+            signature = (kind, route)
+            old = self.requests.get(request_id)
+            if old:
+                if old['signature'] != signature:
+                    raise ApiError(409, '같은 요청 ID에 다른 명령을 사용할 수 없습니다.')
+                return dict(old['response'])
+            if kind == 'patrol_start':
+                if route not in (self.state.get('patrol') or {}).get('routes', []):
+                    raise ApiError(409, '등록되지 않은 순찰 경로입니다.')
+                error = self.patrol_start_error()
+                if error:
+                    raise ApiError(409, error)
+            elif not self.patrol_active():
+                raise ApiError(409, '진행 중인 순찰이 없습니다.')
+            response = dict(request_id=request_id)
+            self.requests[request_id] = dict(request_id=request_id, kind=kind, status='QUEUED',
+                                             signature=signature, response=response)
+            while len(self.requests) > 256:
+                self.requests.popitem(last=False)
+            self.state['pending_request'] = dict(request_id=request_id, kind=kind)
+            command = dict(command='start' if kind == 'patrol_start' else 'stop', request_id=request_id)
+            if kind == 'patrol_start':
+                command['route'] = route
+            if self.state['preview']:
+                self.state['patrol'] = dict(self.state['patrol'], active=kind == 'patrol_start',
+                    phase='NAV' if kind == 'patrol_start' else 'ABORTED',
+                    route=route if kind == 'patrol_start' else self.state['patrol'].get('route'),
+                    index=1, total=12, age=0)
+                self.state['patrol'].pop('received_at', None)
+                self.complete(request_id, 'PREVIEW')
+            else:
+                self.operator_commands.append(dict(kind=kind, request_id=request_id, patrol=command))
+            return dict(response)
+
     def operator_request(self, kind, request_id):
         with self.lock:
             signature = (kind,)
@@ -1095,6 +1125,7 @@ class SharedState:
             if kind == 'return_home' and home is None:
                 raise ApiError(404, '복귀 지점이 설정되지 않았습니다.')
             response = dict(request_id=request_id)
+            patrol_stop = kind in ('stop', 'return_home') and self.patrol_active()
             deferred = False
             if kind in ('stop', 'return_home'):
                 self.cancel_pending_return('새 관리자 명령으로 복귀를 취소했습니다.')
@@ -1133,6 +1164,8 @@ class SharedState:
                 self.requests.popitem(last=False)
             self.state['pending_request'] = dict(request_id=request_id, kind=kind)
             if self.state['preview']:
+                if patrol_stop:
+                    self.state['patrol'] = dict(self.state['patrol'], active=False, phase='ABORTED')
                 if kind == 'return_home':
                     pose = self.building.floor(home.floor).rooms[home.room].goal
                     goal_kind = 'goal' if self.current_floor() == home.floor else 'floor_goal'
@@ -1141,7 +1174,8 @@ class SharedState:
                     self.pending_return = None
                 self.complete(request_id, 'PREVIEW')
             else:
-                self.operator_commands.append(dict(kind=kind, request_id=request_id, hold=event))
+                self.operator_commands.append(dict(kind=kind, request_id=request_id, hold=event,
+                                                   patrol_stop=patrol_stop))
             return dict(response)
 
     def next_return_command(self, now=None):
@@ -1157,6 +1191,8 @@ class SharedState:
             # The hold release travels on a topic and the goal on an action: give the
             # managers time to see held=false, or they reject the goal.
             error = ('이전 목표의 종료를 기다리고 있습니다.' if goal.get('status') in ACTIVE_GOALS
+                     else '이전 주행의 정지 완료를 기다리고 있습니다.'
+                     if self.state.get('navigation') in ACTIVE_NAVIGATION
                      else '관리자 정지 해제를 기다리고 있습니다.'
                      if now - pending['started'] < .5 or self.state.get('navigation') == 'HELD'
                      else self.readiness_error(kind, request_id))
@@ -1311,10 +1347,11 @@ def create_http_server(shared, assets, host='127.0.0.1', port=8080):
                 payload = json.loads(raw)
                 if not isinstance(payload, dict):
                     raise ValueError('JSON object required')
-                kinds = {'/api/goal': 'goal', '/api/initialpose': 'initialpose',
+                kinds = {'/api/floor/arrival_confirm': 'arrival_confirm', '/api/goal': 'goal', '/api/initialpose': 'initialpose',
                          '/api/cancel': 'cancel', '/api/relocalize': 'relocalize',
                          '/api/set_floor': 'set_floor', '/api/acknowledge': 'acknowledge',
                          '/api/kiosk/unlock': 'kiosk/unlock', '/api/kiosk/exit': 'kiosk/exit',
+                         '/api/patrol/start': 'patrol_start', '/api/patrol/stop': 'patrol_stop',
                          '/api/stop': 'stop',
                          '/api/resume': 'resume', '/api/return_home': 'return_home'}
                 kind = kinds.get(self.path)

@@ -20,6 +20,5 @@ setup(
     entry_points={'console_scripts': [
         'cmd_vel_to_can = amr_can_bridge.cmd_vel_to_can:main',
         'can_telemetry = amr_can_bridge.can_telemetry:main',
-        'elevator_can_link = amr_can_bridge.elevator_can_link:main',
     ]},
 )

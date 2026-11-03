@@ -8,7 +8,7 @@ fail() {
 }
 # Real-stack CAN nodes started by hand (ssh); isolated tests set ROS_LOCALHOST_ONLY=1.
 manual_stack() {
-    for pid in $(pgrep -f 'lib/amr_[a-z_]+/(cmd_vel_to_can|control_mux|can_telemetry|elevator_can_link)' || true); do
+    for pid in $(pgrep -f 'lib/amr_[a-z_]+/(cmd_vel_to_can|control_mux|can_telemetry)' || true); do
         tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx 'ROS_LOCALHOST_ONLY=1' || echo "$pid"
     done
 }

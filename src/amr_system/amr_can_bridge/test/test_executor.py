@@ -5,10 +5,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from amr_can_bridge import can_telemetry, cmd_vel_to_can, elevator_can_link
+from amr_can_bridge import can_telemetry, cmd_vel_to_can
 
 
-@pytest.mark.parametrize('module', [cmd_vel_to_can, can_telemetry, elevator_can_link])
+@pytest.mark.parametrize('module', [cmd_vel_to_can, can_telemetry])
 @pytest.mark.parametrize('available', [True, False])
 def test_spin_executor_selects_events_when_importable(monkeypatch, module, available):
     experimental = ModuleType('rclpy.experimental')

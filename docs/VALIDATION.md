@@ -50,6 +50,7 @@
 | 195 | 공용 차량 상태, 엘리베이터 모니터 |
 | 196 | TIM 연동 |
 | 197 | 깊이 costmap, 합성 낮은 장애물 |
+| 198 | 현재 층 고정 경로 순찰·이동 장애물 감지/스풀 |
 
 테스트 도메인은 실제 로봇 운용에 쓰지 않는다. 격리 ROS 시험에는 `ROS_LOCALHOST_ONLY=1`을 붙인다.
 
@@ -109,10 +110,13 @@ python3 scripts/test_ros_integration.py
 | navigation_startup | `amr_stack/test/test_navigation_startup_ros.py` | `AMR_RUN_STARTUP_TESTS` | 194 | 초기 위치 검증, 빔 전환, suspend |
 | tim_localization | `amr_stack/test/test_tim_integration_ros.py` | `AMR_RUN_TIM_TESTS` | 196 | TIM → AMCL 합성 센서 연동 |
 | depth_costmap | `amr_stack/test/test_depth_costmap_ros.py` | `AMR_RUN_DEPTH_COSTMAP_TESTS` | 197 | 실제 STVL: 10·12 cm 박스·바닥 제외, 시야 안 사라진 박스 ~1.4초 만료·짧은 누락은 유지, 사각대 8 cm 물체는 복구(2 m 보존) 뒤에도 남았다가 10초 뒤 만료, 전체 지우기. 실제 Smac: 깊이 점군만으로 기존 경로 무효화·우회 경로 생성; `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`도 지정 |
+| patrol | `amr_patrol/test/test_patrol_ros.py`, `amr_patrol/test/test_detector_ros.py`(아래 직접 실행) | `AMR_RUN_PATROL_TESTS` | 198 | 가짜 NavigateToPose + 합성 floor·hold·E-stop·차량 상태: 상태 전이, 관측 begin/end, home 복귀, 관리자 정지와 늦은 목표 접수 취소, 명령 거부. 감지: 합성 map/costmap·TF·JPEG → 단일 security.motion·스풀·이미지, 비활성 구독 해제·순찰 이벤트 저장 |
 
 러너에 없는 시험:
 
 ```bash
+ROS_DOMAIN_ID=198 ROS_LOCALHOST_ONLY=1 AMR_RUN_PATROL_TESTS=1 \
+  python3 -m pytest -q src/amr_system/amr_patrol/test/test_detector_ros.py
 ROS_DOMAIN_ID=192 ROS_LOCALHOST_ONLY=1 colcon test --packages-select amr_nav2_plugins --return-code-on-test-failure
 ROS_DOMAIN_ID=194 ROS_LOCALHOST_ONLY=1 AMR_RUN_TIME_TESTS=1 python3 -m pytest -q tests/test_time_recovery_ros.py
 ROS_DOMAIN_ID=193 ROS_LOCALHOST_ONLY=1 AMR_RUN_ELEVATOR_TESTS=1 \
@@ -189,7 +193,7 @@ ros2 topic echo /localization/status --once --qos-durability transient_local
 | 펌웨어·구동 설정 | 장치 readback으로 STM32/ODrive 버전과 실제 제한값 |
 | E-stop | [ESTOP_CAN_PROTOCOL.md §10](ESTOP_CAN_PROTOCOL.md#10-검증-현황-2026-10-21) 1–7번: `0x202` 주기, 누름 → `ESTOP`·`0x201` 차단, 떼면 승인 없이 `(0,0)` → `READY` → 새 명령으로만 이동(이전 목표 재출발 없음), 짧은 누름, 300 ms 공백 뒤 재무장, 수신 끊김 정지. 추가: LB·스틱을 누른 채 지난 E-stop 뒤 READY에서 움직이지 않음, 디버거 MCU 리셋 뒤 목표 중단·재무장, 회전 중 E-stop 시 래치 동안 `/odometry/filtered` yaw 변화 기록 |
 | 깊이 카메라 (`start_camera:=true`) | 스택 내린 뒤 기준 `top -b -d 5 -n 12`(controller_server·time_health·web_ui·load avg) → 카메라만 `ros2 launch amr_stack camera.launch.py start_camera:=true`: `ros2 topic hz /camera/depth/points` 10±1 Hz, `/camera/color/image_raw/compressed` ≥2 Hz, 드라이버 CPU ≤35 % → 전체 스택: controller_server +≤30 %, time_health·web_ui 각 +≤3 %, load avg <6, 내부 갱신 전역 2 Hz·지역 10 Hz, DWB 20 Hz 유지(시각화 costmap 발행 전역 1 Hz·지역 2 Hz와 구분). 실제 10 cm 박스를 차체 앞 0.5·1·2 m에 놓아 양쪽 costmap 표시와 제거를 확인. 저속 주행에서는 점군 최초 관측·지도 반영·우회 경로 변경·감속 시작·최종 간격을 bag으로 기록하고, 사각 진입 시 장애물 표시가 유지되는지 확인. 전역 depth 추가에 따른 planner_server CPU 증분도 측정. USB 분리 → 1초 안에 `/system/time_health` `depth: missing or stale`, costmap "not current" 없음, 재연결 후 회복. 층간 이동 화면 카메라 카드 0.5초 갱신, 중앙 관제 `GET /robots/amr-01/api/camera.jpg` ≤300 KiB. 결과를 REAL_VEHICLE §9b에 기록 |
-| 엘리베이터 RF | `candump can0,310:7FE`로 0x310·0x311 수신, 카 PRESENCE에도 `invalid` 0, 4F 홀 호출 → `COMPLETED`·BUTTON_ACK, DOOR_OPEN repeat 10 실제 반복, 통과층 정차 뒤 계속 탑승, 문턱 E-stop 시 문 유지, 웹 "엘리베이터 RF" 패널 |
+| 엘리베이터 (RF 없음) | 시작 층 지정 → 호출 안내·키오스크 버튼 안내 → 사람이 누름 → 탑승·카 안 정렬 → 목표 층에서 "도착했나요?" 카드 → "네"로 하차·재위치, "아니요"(다른 층 정차)면 계속 탑승, 확인 없이 문 닫힘 시 계속 탑승, KIND_CANCEL 뒤 안내 사라짐 |
 
 ## 7. 기록 원칙
 
